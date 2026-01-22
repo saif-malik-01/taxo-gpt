@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-jose[cryptography]
+sentence-transformers
+faiss-cpu
+boto3
+python-dotenv
