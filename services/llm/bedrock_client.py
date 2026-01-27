@@ -15,6 +15,8 @@ bedrock = boto3.client(
 MODEL_ID = "qwen.qwen3-next-80b-a3b"
 
 
+from typing import Iterator
+
 def call_bedrock(prompt: str) -> str:
     """
     Call Qwen model on AWS Bedrock using converse()
@@ -36,3 +38,28 @@ def call_bedrock(prompt: str) -> str:
 
     # ✅ QWEN converse() response format
     return response["output"]["message"]["content"][0]["text"]
+
+
+def call_bedrock_stream(prompt: str) -> Iterator[str]:
+    """
+    Call Qwen model on AWS Bedrock using converse_stream()
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"text": prompt}
+            ]
+        }
+    ]
+
+    response = bedrock.converse_stream(
+        modelId=MODEL_ID,
+        messages=messages
+    )
+
+    stream = response.get("stream")
+    if stream:
+        for event in stream:
+            if "contentBlockDelta" in event:
+                yield event["contentBlockDelta"]["delta"]["text"]

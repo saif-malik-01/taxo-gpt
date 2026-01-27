@@ -87,13 +87,14 @@
 
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import json
 import uuid
 
-from services.chat.engine import chat
+from services.chat.engine import chat, chat_stream
 from services.vector.store import VectorStore
 from services.auth.deps import auth_guard
 from api.auth import router as auth_router
@@ -251,6 +252,60 @@ async def ask_gst(
         "sources": sources,
         "full_judgments": full_judgments if full_judgments else None
     } 
+
+
+@app.post("/chat/ask/stream")
+async def ask_gst_stream(
+    payload: ChatRequest,
+    background_tasks: BackgroundTasks,
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    # 1. Manage Session
+    session_id = payload.session_id or str(uuid.uuid4())
+    
+    # 2. Get User ID
+    email = user.get("sub")
+    result = await db.execute(select(User).where(User.email == email))
+    db_user = result.scalars().first()
+    if not db_user:
+         raise HTTPException(status_code=404, detail="User not found")
+    
+    user_id = db_user.id
+
+    # 3. Fetch Context
+    profile = await get_user_profile(user_id)
+    profile_summary = profile.dynamic_summary if profile else None
+    history = await get_session_history(session_id)
+
+    async def stream_generator():
+        full_answer = ""
+        # 4. Save User Query
+        await add_message(session_id, "user", payload.question, user_id)
+        
+        async for chunk in chat_stream(
+            query=payload.question,
+            store=vector_store,
+            all_chunks=ALL_CHUNKS,
+            history=history,
+            profile_summary=profile_summary
+        ):
+            if chunk["type"] == "content":
+                full_answer += chunk["delta"]
+            
+            # Send session_id with the first chunk (retrieval)
+            if chunk["type"] == "retrieval":
+                chunk["session_id"] = session_id
+
+            yield json.dumps(chunk) + "\n"
+
+        # 5. Save AI Response
+        await add_message(session_id, "assistant", full_answer, user_id)
+
+        # 6. Background Task
+        background_tasks.add_task(auto_update_profile, user_id, payload.question, full_answer)
+
+    return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
 @app.post("/chat/feedback")
 async def save_feedback(
