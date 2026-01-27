@@ -5,3 +5,10 @@ sentence-transformers
 faiss-cpu
 boto3
 python-dotenv
+sqlalchemy
+asyncpg
+redis
+alembic
+pydantic-settings
+passlib[bcrypt]
+multipart

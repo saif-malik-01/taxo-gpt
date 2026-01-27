@@ -186,7 +186,7 @@ def get_full_judgments(retrieved_chunks, all_chunks):
     return full_judgments
 
 
-def chat(query, store, all_chunks):
+async def chat(query, store, all_chunks, history=[], profile_summary=None):
     retrieved = retrieve(
         query=query,
         vector_store=store,
@@ -201,7 +201,9 @@ def chat(query, store, all_chunks):
     prompt = build_structured_prompt(
         query=query,
         primary=primary,
-        supporting=supporting
+        supporting=supporting,
+        history=history,
+        profile_summary=profile_summary
     )
 
     answer = call_bedrock(prompt)

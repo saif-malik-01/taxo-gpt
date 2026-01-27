@@ -1,13 +1,24 @@
-def build_structured_prompt(query, primary, supporting):
+def build_structured_prompt(query, primary, supporting, history=[], profile_summary=None):
     def render(chunks):
         return "\n\n".join(
             f"[{c.get('chunk_type', 'source').upper()} | {c.get('metadata', {}).get('source', '')}] {c['text']}"
             for c in chunks
         )
+    
+    def render_history(history):
+        if not history:
+            return "No previous context."
+        return "\n".join(f"{h['role'].upper()}: {h['content']}" for h in history[-10:])
 
     prompt = f"""
 You are a senior GST law expert advising another professional
 (Chartered Accountant / Advocate / Tax Manager).
+
+USER PROFILE (Tailor your response based on this):
+{profile_summary if profile_summary else "Unknown User"}
+
+CONVERSATION HISTORY:
+{render_history(history)}
 
 Answer exactly like a real GST practitioner would — thoughtful, precise,
 and grounded strictly in law.
