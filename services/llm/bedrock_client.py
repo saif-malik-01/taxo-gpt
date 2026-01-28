@@ -66,13 +66,17 @@ def call_bedrock_stream(prompt: str) -> Iterator[str]:
         }
     ]
 
-    response = bedrock.converse_stream(
-        modelId=MODEL_ID,
-        messages=messages
-    )
+    try:
+        response = bedrock.converse_stream(
+            modelId=MODEL_ID,
+            messages=messages
+        )
 
-    stream = response.get("stream")
-    if stream:
-        for event in stream:
-            if "contentBlockDelta" in event:
-                yield event["contentBlockDelta"]["delta"]["text"]
+        stream = response.get("stream")
+        if stream:
+            for event in stream:
+                if "contentBlockDelta" in event:
+                    yield event["contentBlockDelta"]["delta"]["text"]
+    except Exception as e:
+        logger.error(f"Bedrock stream failed: {str(e)}")
+        yield "\n[Error: Connection to AI lost. Please try again or check your parameters.]"

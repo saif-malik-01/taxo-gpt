@@ -230,7 +230,7 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     }
 
     # Step 5: Stream LLM response
-    async for chunk in call_bedrock_stream(prompt):
+    for chunk in call_bedrock_stream(prompt):
         await asyncio.sleep(0.01)
         yield {
             "type": "content",

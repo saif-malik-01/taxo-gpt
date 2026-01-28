@@ -1,9 +1,14 @@
 def build_structured_prompt(query, primary, supporting, history=[], profile_summary=None):
     def render(chunks):
-        return "\n\n".join(
-            f"[{c.get('chunk_type', 'source').upper()} | {c.get('metadata', {}).get('source', '')}] {c['text']}"
-            for c in chunks
-        )
+        rendered_list = []
+        for c in chunks:
+            if c.get("_is_complete_judgment"):
+                # Avoid double headers; complete chunks already have metadata prepended
+                rendered_list.append(c['text'])
+            else:
+                prefix = f"[{c.get('chunk_type', 'source').upper()} | {c.get('metadata', {}).get('source', '')}]"
+                rendered_list.append(f"{prefix} {c['text']}")
+        return "\n\n".join(rendered_list)
     
     def render_history(history):
         if not history:

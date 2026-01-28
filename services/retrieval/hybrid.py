@@ -25,12 +25,10 @@ def create_complete_judgment_chunk(match_info, all_chunks):
     """
     external_id = match_info["external_id"]
     
-    # Get ALL chunks for this judgment from original all_chunks
-    judgment_chunks = [
-        c for c in all_chunks
-        if c.get("chunk_type") == "judgment" and 
-           c.get("metadata", {}).get("external_id") == external_id
-    ]
+    # OPTIMIZED: Use pre-built index to avoid scanning 450MB
+    from services.retrieval.citation_matcher import get_index
+    index = get_index(all_chunks)
+    judgment_chunks = index.judgment_by_external_id.get(external_id, [])
     
     if not judgment_chunks:
         logger.warning(f"No chunks found for judgment {external_id}")
