@@ -1,47 +1,39 @@
 import re
+from services.retrieval.citation_matcher import get_index
 
 def exact_match(query, chunks):
+    index = get_index(chunks)
     q = query.lower()
 
     # SECTION + SUBSECTION
     sec = re.search(r"section\s+(\d+)\s*\(?\s*(\d+)\s*\)?", q)
     if sec:
-        return [
-            c for c in chunks
-            if c.get("section_number") == sec.group(1)
-            and str(c.get("subsection")) == sec.group(2)
-        ]
+        key = (sec.group(1), sec.group(2))
+        return index.by_section.get(key, [])
 
-    # SECTION ONLY
+    # SECTION ONLY (Matching all subsections for that section)
     sec_only = re.search(r"section\s+(\d+)", q)
     if sec_only:
-        return [
-            c for c in chunks
-            if c.get("section_number") == sec_only.group(1)
-        ]
+        # Collect all from by_section where section_number matches
+        results = []
+        for (s, ss), clist in index.by_section.items():
+            if s == sec_only.group(1):
+                results.extend(clist)
+        return results
 
     # RULE
     rule = re.search(r"rule\s+(\d+[a-z]?)", q)
     if rule:
-        return [
-            c for c in chunks
-            if c.get("rule_number") == rule.group(1)
-        ]
+        return index.by_rule.get(rule.group(1), [])
 
     # HSN
     hsn = re.search(r"hsn\s+(\d+)", q)
     if hsn:
-        return [
-            c for c in chunks
-            if c.get("metadata", {}).get("hsn_code") == hsn.group(1)
-        ]
+        return index.by_hsn.get(hsn.group(1), [])
 
     # SAC
     sac = re.search(r"sac\s+(\d+)", q)
     if sac:
-        return [
-            c for c in chunks
-            if c.get("metadata", {}).get("sac_code") == sac.group(1)
-        ]
+        return index.by_sac.get(sac.group(1), [])
 
     return []

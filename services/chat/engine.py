@@ -1,7 +1,9 @@
 import asyncio
 from services.retrieval.hybrid import retrieve
+from services.retrieval.citation_matcher import get_index
 from services.llm.bedrock_client import call_bedrock, call_bedrock_stream
 from services.chat.prompt_builder import build_structured_prompt
+from starlette.concurrency import run_in_threadpool
 
 
 def classify_query_intent(query: str) -> str:
@@ -70,12 +72,9 @@ def get_full_judgments(retrieved_chunks, all_chunks):
             continue
             
         if external_id not in full_judgments:
-            # Find ALL chunks belonging to this judgment (same external_id)
-            related_chunks = [
-                c for c in all_chunks 
-                if c.get("chunk_type") == "judgment" and 
-                   c.get("metadata", {}).get("external_id") == external_id
-            ]
+            # OPTIMIZED: Use index lookup instead of linear scan over 450MB
+            index = get_index(all_chunks)
+            related_chunks = index.judgment_by_external_id.get(external_id, [])
             
             if related_chunks:
                 # Combine all chunks into complete judgment text
@@ -111,7 +110,9 @@ def get_full_judgments(retrieved_chunks, all_chunks):
 
 
 async def chat(query, store, all_chunks, history=[], profile_summary=None):
-    retrieved = retrieve(
+    # Offload retrieval to thread pool
+    retrieved = await run_in_threadpool(
+        retrieve,
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
@@ -130,16 +131,19 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         profile_summary=profile_summary
     )
 
-    answer = call_bedrock(prompt)
+    # Offload Bedrock call
+    answer = await run_in_threadpool(call_bedrock, prompt)
     
-    # Get complete judgments (reassembled from all chunks)
-    full_judgments = get_full_judgments(retrieved, all_chunks)
+    # Offload reassembly to thread pool
+    full_judgments = await run_in_threadpool(get_full_judgments, retrieved, all_chunks)
 
     return answer, retrieved, full_judgments
 
 
 async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
-    retrieved = retrieve(
+    # Offload retrieval
+    retrieved = await run_in_threadpool(
+        retrieve,
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
@@ -157,8 +161,8 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         profile_summary=profile_summary
     )
 
-    # Get complete judgments
-    full_judgments = get_full_judgments(retrieved, all_chunks)
+    # Offload reassembly
+    full_judgments = await run_in_threadpool(get_full_judgments, retrieved, all_chunks)
 
     # Yield retrieved info first
     yield {

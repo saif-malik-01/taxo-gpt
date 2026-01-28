@@ -172,10 +172,10 @@ def retrieve(query, vector_store, all_chunks, k=25):
     
     # STEP 3b: Vector Search
     embedding = MODEL.encode(query, normalize_embeddings=True)
-    vector_hits = vector_store.search(embedding, top_k=50)
+    vector_hits = vector_store.search(embedding, top_k=50) # Now returns (chunk, score)
     
     vector_count = 0
-    for chunk in vector_hits:
+    for chunk, dist in vector_hits:
         chunk_id = chunk["id"]
         external_id = chunk.get("metadata", {}).get("external_id")
         
@@ -183,9 +183,11 @@ def retrieve(query, vector_store, all_chunks, k=25):
             continue
         
         if chunk_id not in scored_results:
-            chunk_embedding = MODEL.encode(chunk["text"], normalize_embeddings=True)
-            base_score = float(np.dot(embedding, chunk_embedding))
-            base_score = max(0.0, min(1.0, base_score))
+            # L2 distance conversion to similarity score (approximate)
+            # If using IndexFlatIP, dist is already similarity
+            # If using IndexFlatL2, we might want inverse or 1/(1+dist)
+            # Assuming IndexFlatL2 as per store.py:
+            base_score = 1 / (1 + dist) 
             
             boost = substring_weights.get(chunk_id, 0)
             scored_results[chunk_id] = (chunk, base_score + boost)
@@ -193,27 +195,9 @@ def retrieve(query, vector_store, all_chunks, k=25):
     
     logger.info(f"Added {vector_count} vector search results")
     
-    # ========== STEP 4: Add Semantic Score to Exact/Partial Matches ==========
-    for chunk_id, (chunk, current_score) in list(scored_results.items()):
-        external_id = chunk.get("metadata", {}).get("external_id")
-        
-        # If exact or partial match
-        if external_id in seen_external_ids and current_score in [1.0, 0.5]:
-            # Get original text for embedding (before enrichment)
-            if chunk.get("_enriched_for_llm"):
-                text_for_embedding = chunk.get("_original_text", chunk["text"])
-            else:
-                text_for_embedding = chunk["text"]
-            
-            # Calculate semantic similarity on original text
-            chunk_embedding = MODEL.encode(text_for_embedding, normalize_embeddings=True)
-            semantic_score = float(np.dot(embedding, chunk_embedding))
-            semantic_score = max(0.3, min(1.0, semantic_score))
-            
-            # Final score = semantic + match_boost
-            match_boost = current_score
-            final_score = semantic_score + match_boost
-            scored_results[chunk_id] = (chunk, final_score)
+    # ========== STEP 4: Scoring Adjustments ==========
+    # (Removed redundant re-encoding of matching chunks to save CPU/Event Loop)
+    pass
     
     # ========== STEP 5: Sort by Score ==========
     sorted_results = sorted(scored_results.values(), key=lambda x: x[1], reverse=True)

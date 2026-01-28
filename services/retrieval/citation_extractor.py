@@ -8,51 +8,7 @@ from botocore.config import Config
 logger = logging.getLogger(__name__)
 
 
-def get_bedrock_client():
-    """Initialize AWS Bedrock client"""
-    config = Config(
-        region_name=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'),
-        signature_version='v4',
-        retries={'max_attempts': 3, 'mode': 'standard'}
-    )
-    
-    client = boto3.client(
-        'bedrock-runtime',
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        config=config
-    )
-    
-    return client
-
-
-def call_bedrock_direct(prompt: str) -> str:
-    """Call AWS Bedrock with Qwen model"""
-    try:
-        client = get_bedrock_client()
-        model_id = "qwen.qwen3-next-80b-a3b"
-        
-        request_body = {
-            "max_tokens": 500,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0
-        }
-        
-        response = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(request_body)
-        )
-        
-        response_body = json.loads(response['body'].read())
-        content = response_body['choices'][0]['message']['content']
-        
-        logger.debug(f"Bedrock response: {content}")
-        return content
-        
-    except Exception as e:
-        logger.error(f"Bedrock API error: {e}")
-        raise
-
+from services.llm.bedrock_client import call_bedrock
 
 def extract_citation_from_query(query: str) -> dict:
     """
@@ -105,7 +61,7 @@ Output: {{"citation": "2017 Taxo.online 42", "case_number": null, "case_name": n
 
 Now extract from the given query. Return ONLY JSON, no other text."""
         
-        content = call_bedrock_direct(prompt)
+        content = call_bedrock(prompt)
         
         # Clean response
         content = content.strip()

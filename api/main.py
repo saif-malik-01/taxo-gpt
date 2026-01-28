@@ -135,6 +135,10 @@ vector_store = VectorStore(INDEX_PATH, CHUNKS_PATH)
 with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
     ALL_CHUNKS = json.load(f)
 
+# Build Metadata Index at startup (prevents slow first query)
+from services.retrieval.citation_matcher import get_index
+get_index(ALL_CHUNKS)
+
 # ---------------- SCHEMAS ---------------- #
 
 class ChatRequest(BaseModel):

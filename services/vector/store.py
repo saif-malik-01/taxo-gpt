@@ -14,4 +14,5 @@ class VectorStore:
             np.array([embedding]).astype("float32"),
             top_k
         )
-        return [self.chunks[i] for i in I[0]]
+        # Return list of (chunk, score) tuples
+        return [(self.chunks[i], float(D[0][j])) for j, i in enumerate(I[0])]
