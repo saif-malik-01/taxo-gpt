@@ -1,3 +1,179 @@
+# import asyncio
+# from services.retrieval.hybrid import retrieve
+# from services.llm.bedrock_client import call_bedrock, call_bedrock_stream
+# from services.chat.prompt_builder import build_structured_prompt
+
+
+# def classify_query_intent(query: str) -> str:
+#     q = query.lower()
+
+#     if "judgment" in q or "case law" in q or "court" in q:
+#         return "judgment"
+
+#     if "define" in q or "what is section" in q or "meaning of" in q:
+#         return "definition"
+
+#     if "rcm" in q or "reverse charge" in q:
+#         return "rcm"
+
+#     if "rate" in q or "gst rate" in q:
+#         return "rate"
+
+#     if "procedure" in q or "how to" in q:
+#         return "procedure"
+
+#     if "difference" in q or "vs" in q:
+#         return "comparison"
+
+#     return "general"
+
+
+# def split_primary_and_supporting(chunks, intent):
+#     primary = []
+#     supporting = []
+
+#     for ch in chunks:
+#         ctype = ch.get("chunk_type")
+
+#         if intent == "judgment" and ctype == "judgment":
+#             primary.append(ch)
+
+#         elif intent == "definition" and ctype in ("definition", "operative", "act"):
+#             primary.append(ch)
+
+#         elif intent == "procedure" and ctype == "rule":
+#             primary.append(ch)
+
+#         else:
+#             supporting.append(ch)
+
+#     if not primary:
+#         primary = chunks[:3]
+#         supporting = chunks[3:]
+
+#     return primary, supporting
+
+# # This function should remain unchanged in your engine.py
+
+# def get_full_judgments(retrieved_chunks, all_chunks):
+#     """
+#     Extract complete judgments by reassembling all chunks with same external_id
+#     Returns ORIGINAL text without LLM enrichment metadata
+#     """
+#     full_judgments = {}
+#     judgment_chunks_used = [c for c in retrieved_chunks if c.get("chunk_type") == "judgment"]
+    
+#     for jchunk in judgment_chunks_used:
+#         external_id = jchunk.get("metadata", {}).get("external_id")
+        
+#         if not external_id:
+#             continue
+            
+#         if external_id not in full_judgments:
+#             # Get chunks from ORIGINAL all_chunks (not enriched retrieved_chunks)
+#             related_chunks = [
+#                 c for c in all_chunks
+#                 if c.get("chunk_type") == "judgment" and 
+#                    c.get("metadata", {}).get("external_id") == external_id
+#             ]
+            
+#             if related_chunks:
+#                 # Combine ORIGINAL chunks (no metadata headers)
+#                 full_text = "\n\n".join(c["text"] for c in related_chunks)
+                
+#                 metadata = related_chunks[0].get("metadata", {})
+                
+#                 full_judgments[external_id] = {
+#                     "citation": metadata.get("citation", ""),
+#                     "title": metadata.get("title", ""),
+#                     "case_number": metadata.get("case_number", ""),
+#                     "court": metadata.get("court", ""),
+#                     "state": metadata.get("state", ""),
+#                     "year": metadata.get("year", ""),
+#                     "judge": metadata.get("judge", ""),
+#                     "petitioner": metadata.get("petitioner", ""),
+#                     "respondent": metadata.get("respondent", ""),
+#                     "decision": metadata.get("decision", ""),
+#                     "current_status": metadata.get("current_status", ""),
+#                     "law": metadata.get("law", ""),
+#                     "act_name": metadata.get("act_name", ""),
+#                     "section_number": metadata.get("section_number", ""),
+#                     "rule_name": metadata.get("rule_name", ""),
+#                     "rule_number": metadata.get("rule_number", ""),
+#                     "notification_number": metadata.get("notification_number", ""),
+#                     "case_note": metadata.get("case_note", ""),
+#                     "full_text": full_text,  # CLEAN ORIGINAL TEXT
+#                     "external_id": external_id
+#                 }
+    
+#     return full_judgments
+
+# async def chat(query, store, all_chunks, history=[], profile_summary=None):
+#     retrieved = retrieve(
+#         query=query,
+#         vector_store=store,
+#         all_chunks=all_chunks,
+#         k=25
+#     )
+
+#     intent = classify_query_intent(query)
+#     primary, supporting = split_primary_and_supporting(retrieved, intent)
+    
+#     # Build prompt (without judgment_citations parameter)
+#     prompt = build_structured_prompt(
+#         query=query,
+#         primary=primary,
+#         supporting=supporting,
+#         history=history,
+#         profile_summary=profile_summary
+#     )
+
+#     answer = call_bedrock(prompt)
+    
+#     # Get complete judgments (reassembled from all chunks)
+#     full_judgments = get_full_judgments(retrieved, all_chunks)
+
+#     return answer, retrieved, full_judgments
+
+
+# async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
+#     retrieved = retrieve(
+#         query=query,
+#         vector_store=store,
+#         all_chunks=all_chunks,
+#         k=25
+#     )
+
+#     intent = classify_query_intent(query)
+#     primary, supporting = split_primary_and_supporting(retrieved, intent)
+    
+#     prompt = build_structured_prompt(
+#         query=query,
+#         primary=primary,
+#         supporting=supporting,
+#         history=history,
+#         profile_summary=profile_summary
+#     )
+
+#     # Get complete judgments
+#     full_judgments = get_full_judgments(retrieved, all_chunks)
+
+#     # Yield retrieved info first
+#     yield {
+#         "type": "retrieval",
+#         "sources": retrieved,
+#         "full_judgments": full_judgments
+#     }
+
+#     # Stream chunks
+#     for chunk in call_bedrock_stream(prompt):
+#         await asyncio.sleep(0.01)  # Tiny delay to ensure it doesn't batch too much
+#         yield {
+#             "type": "content",
+#             "delta": chunk
+#         }
+
+
 import asyncio
 from services.retrieval.hybrid import retrieve
 from services.llm.bedrock_client import call_bedrock, call_bedrock_stream
@@ -29,12 +205,25 @@ def classify_query_intent(query: str) -> str:
 
 
 def split_primary_and_supporting(chunks, intent):
+    """
+    Split chunks into primary and supporting based on intent
+    
+    HANDLES COMPLETE JUDGMENT CHUNKS:
+    - Complete judgment chunks (with _is_complete_judgment=True) are always primary
+    - They already have metadata prepended in their text field
+    """
     primary = []
     supporting = []
 
     for ch in chunks:
         ctype = ch.get("chunk_type")
+        
+        # ✅ Complete judgment chunks are ALWAYS primary
+        if ch.get("_is_complete_judgment"):
+            primary.append(ch)
+            continue
 
+        # Regular chunk classification
         if intent == "judgment" and ctype == "judgment":
             primary.append(ch)
 
@@ -47,6 +236,7 @@ def split_primary_and_supporting(chunks, intent):
         else:
             supporting.append(ch)
 
+    # Fallback if no primary
     if not primary:
         primary = chunks[:3]
         supporting = chunks[3:]
@@ -56,32 +246,70 @@ def split_primary_and_supporting(chunks, intent):
 
 def get_full_judgments(retrieved_chunks, all_chunks):
     """
-    Extract complete judgments by reassembling all chunks with same external_id
-    Returns: dict mapping external_id -> complete judgment data
+    Extract complete judgments metadata for citation display
+    
+    HANDLES BOTH:
+    1. Complete judgment chunks (already assembled with metadata)
+    2. Regular judgment chunks (need assembly)
+    
+    Returns judgment metadata for display/citation purposes
     """
     full_judgments = {}
-    judgment_chunks_used = [c for c in retrieved_chunks if c.get("chunk_type") == "judgment"]
     
-    for jchunk in judgment_chunks_used:
-        # Use external_id to group all chunks of same judgment
-        external_id = jchunk.get("metadata", {}).get("external_id")
-        
-        if not external_id:
+    for chunk in retrieved_chunks:
+        # Skip non-judgment chunks
+        if chunk.get("chunk_type") != "judgment":
             continue
+        
+        # Case 1: Complete judgment chunk (already assembled)
+        if chunk.get("_is_complete_judgment"):
+            external_id = chunk.get("_external_id")
             
-        if external_id not in full_judgments:
-            # Find ALL chunks belonging to this judgment (same external_id)
+            if external_id and external_id not in full_judgments:
+                metadata = chunk.get("metadata", {})
+                
+                full_judgments[external_id] = {
+                    "citation": metadata.get("citation", ""),
+                    "title": metadata.get("title", ""),
+                    "case_number": metadata.get("case_number", ""),
+                    "court": metadata.get("court", ""),
+                    "state": metadata.get("state", ""),
+                    "year": metadata.get("year", ""),
+                    "judge": metadata.get("judge", ""),
+                    "petitioner": metadata.get("petitioner", ""),
+                    "respondent": metadata.get("respondent", ""),
+                    "decision": metadata.get("decision", ""),
+                    "current_status": metadata.get("current_status", ""),
+                    "law": metadata.get("law", ""),
+                    "act_name": metadata.get("act_name", ""),
+                    "section_number": metadata.get("section_number", ""),
+                    "rule_name": metadata.get("rule_name", ""),
+                    "rule_number": metadata.get("rule_number", ""),
+                    "notification_number": metadata.get("notification_number", ""),
+                    "case_note": metadata.get("case_note", ""),
+                    "full_text": chunk["text"],  # Already has metadata prepended
+                    "external_id": external_id,
+                    "_is_complete": True
+                }
+        
+        # Case 2: Regular judgment chunk (need to assemble)
+        else:
+            external_id = chunk.get("metadata", {}).get("external_id")
+            
+            if not external_id or external_id in full_judgments:
+                continue
+            
+            # Get all chunks for this judgment from original all_chunks
             related_chunks = [
-                c for c in all_chunks 
+                c for c in all_chunks
                 if c.get("chunk_type") == "judgment" and 
                    c.get("metadata", {}).get("external_id") == external_id
             ]
             
             if related_chunks:
-                # Combine all chunks into complete judgment text
+                # Combine original chunks (no metadata headers)
                 full_text = "\n\n".join(c["text"] for c in related_chunks)
                 
-                # Get metadata from first chunk
                 metadata = related_chunks[0].get("metadata", {})
                 
                 full_judgments[external_id] = {
@@ -103,14 +331,16 @@ def get_full_judgments(retrieved_chunks, all_chunks):
                     "rule_number": metadata.get("rule_number", ""),
                     "notification_number": metadata.get("notification_number", ""),
                     "case_note": metadata.get("case_note", ""),
-                    "full_text": full_text,
-                    "external_id": external_id
+                    "full_text": full_text,  # Clean original text
+                    "external_id": external_id,
+                    "_is_complete": False
                 }
     
     return full_judgments
 
 
 async def chat(query, store, all_chunks, history=[], profile_summary=None):
+    # Step 1: Retrieve (includes exact match handling)
     retrieved = retrieve(
         query=query,
         vector_store=store,
@@ -118,10 +348,13 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         k=25
     )
 
+    # Step 2: Classify and split
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
-    # Build prompt (without judgment_citations parameter)
+    # Step 3: Build prompt
+    # The prompt builder will receive complete judgment chunks in primary/supporting
+    # and will render them using chunk['text'] which already has metadata prepended
     prompt = build_structured_prompt(
         query=query,
         primary=primary,
@@ -130,15 +363,17 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         profile_summary=profile_summary
     )
 
+    # Step 4: Call LLM
     answer = call_bedrock(prompt)
     
-    # Get complete judgments (reassembled from all chunks)
+    # Step 5: Get complete judgments for display
     full_judgments = get_full_judgments(retrieved, all_chunks)
 
     return answer, retrieved, full_judgments
 
 
 async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
+    # Step 1: Retrieve
     retrieved = retrieve(
         query=query,
         vector_store=store,
@@ -146,9 +381,11 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         k=25
     )
 
+    # Step 2: Classify and split
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
+    # Step 3: Build prompt
     prompt = build_structured_prompt(
         query=query,
         primary=primary,
@@ -157,19 +394,19 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         profile_summary=profile_summary
     )
 
-    # Get complete judgments
+    # Step 4: Get complete judgments
     full_judgments = get_full_judgments(retrieved, all_chunks)
 
-    # Yield retrieved info first
+    # Yield retrieval info first
     yield {
         "type": "retrieval",
         "sources": retrieved,
         "full_judgments": full_judgments
     }
 
-    # Stream chunks
+    # Step 5: Stream LLM response
     for chunk in call_bedrock_stream(prompt):
-        await asyncio.sleep(0.01)  # Tiny delay to ensure it doesn't batch too much
+        await asyncio.sleep(0.01)
         yield {
             "type": "content",
             "delta": chunk
