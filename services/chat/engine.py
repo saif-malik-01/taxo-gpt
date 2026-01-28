@@ -31,12 +31,25 @@ def classify_query_intent(query: str) -> str:
 
 
 def split_primary_and_supporting(chunks, intent):
+    """
+    Split chunks into primary and supporting based on intent
+    
+    HANDLES COMPLETE JUDGMENT CHUNKS:
+    - Complete judgment chunks (with _is_complete_judgment=True) are always primary
+    - They already have metadata prepended in their text field
+    """
     primary = []
     supporting = []
 
     for ch in chunks:
         ctype = ch.get("chunk_type")
+        
+        # ✅ Complete judgment chunks are ALWAYS primary
+        if ch.get("_is_complete_judgment"):
+            primary.append(ch)
+            continue
 
+        # Regular chunk classification
         if intent == "judgment" and ctype == "judgment":
             primary.append(ch)
 
@@ -49,6 +62,7 @@ def split_primary_and_supporting(chunks, intent):
         else:
             supporting.append(ch)
 
+    # Fallback if no primary
     if not primary:
         primary = chunks[:3]
         supporting = chunks[3:]
@@ -58,29 +72,67 @@ def split_primary_and_supporting(chunks, intent):
 
 def get_full_judgments(retrieved_chunks, all_chunks):
     """
-    Extract complete judgments by reassembling all chunks with same external_id
-    Returns: dict mapping external_id -> complete judgment data
+    Extract complete judgments metadata for citation display
+    
+    HANDLES BOTH:
+    1. Complete judgment chunks (already assembled with metadata)
+    2. Regular judgment chunks (need assembly)
+    
+    Returns judgment metadata for display/citation purposes
     """
     full_judgments = {}
-    judgment_chunks_used = [c for c in retrieved_chunks if c.get("chunk_type") == "judgment"]
     
-    for jchunk in judgment_chunks_used:
-        # Use external_id to group all chunks of same judgment
-        external_id = jchunk.get("metadata", {}).get("external_id")
-        
-        if not external_id:
+    for chunk in retrieved_chunks:
+        # Skip non-judgment chunks
+        if chunk.get("chunk_type") != "judgment":
             continue
+        
+        # Case 1: Complete judgment chunk (already assembled)
+        if chunk.get("_is_complete_judgment"):
+            external_id = chunk.get("_external_id")
             
-        if external_id not in full_judgments:
+            if external_id and external_id not in full_judgments:
+                metadata = chunk.get("metadata", {})
+                
+                full_judgments[external_id] = {
+                    "citation": metadata.get("citation", ""),
+                    "title": metadata.get("title", ""),
+                    "case_number": metadata.get("case_number", ""),
+                    "court": metadata.get("court", ""),
+                    "state": metadata.get("state", ""),
+                    "year": metadata.get("year", ""),
+                    "judge": metadata.get("judge", ""),
+                    "petitioner": metadata.get("petitioner", ""),
+                    "respondent": metadata.get("respondent", ""),
+                    "decision": metadata.get("decision", ""),
+                    "current_status": metadata.get("current_status", ""),
+                    "law": metadata.get("law", ""),
+                    "act_name": metadata.get("act_name", ""),
+                    "section_number": metadata.get("section_number", ""),
+                    "rule_name": metadata.get("rule_name", ""),
+                    "rule_number": metadata.get("rule_number", ""),
+                    "notification_number": metadata.get("notification_number", ""),
+                    "case_note": metadata.get("case_note", ""),
+                    "full_text": chunk["text"],  # Already has metadata prepended
+                    "external_id": external_id,
+                    "_is_complete": True
+                }
+        
+        # Case 2: Regular judgment chunk (need to assemble)
+        else:
+            external_id = chunk.get("metadata", {}).get("external_id")
+            
+            if not external_id or external_id in full_judgments:
+                continue
+            
             # OPTIMIZED: Use index lookup instead of linear scan over 450MB
             index = get_index(all_chunks)
             related_chunks = index.judgment_by_external_id.get(external_id, [])
             
             if related_chunks:
-                # Combine all chunks into complete judgment text
+                # Combine original chunks (no metadata headers)
                 full_text = "\n\n".join(c["text"] for c in related_chunks)
                 
-                # Get metadata from first chunk
                 metadata = related_chunks[0].get("metadata", {})
                 
                 full_judgments[external_id] = {
@@ -102,8 +154,9 @@ def get_full_judgments(retrieved_chunks, all_chunks):
                     "rule_number": metadata.get("rule_number", ""),
                     "notification_number": metadata.get("notification_number", ""),
                     "case_note": metadata.get("case_note", ""),
-                    "full_text": full_text,
-                    "external_id": external_id
+                    "full_text": full_text,  # Clean original text
+                    "external_id": external_id,
+                    "_is_complete": False
                 }
     
     return full_judgments
@@ -119,10 +172,13 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         k=25
     )
 
+    # Step 2: Classify and split
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
-    # Build prompt (without judgment_citations parameter)
+    # Step 3: Build prompt
+    # The prompt builder will receive complete judgment chunks in primary/supporting
+    # and will render them using chunk['text'] which already has metadata prepended
     prompt = build_structured_prompt(
         query=query,
         primary=primary,
@@ -150,9 +206,11 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         k=25
     )
 
+    # Step 2: Classify and split
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
+    # Step 3: Build prompt
     prompt = build_structured_prompt(
         query=query,
         primary=primary,
@@ -164,16 +222,16 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     # Offload reassembly
     full_judgments = await run_in_threadpool(get_full_judgments, retrieved, all_chunks)
 
-    # Yield retrieved info first
+    # Yield retrieval info first
     yield {
         "type": "retrieval",
         "sources": retrieved,
         "full_judgments": full_judgments
     }
 
-    # Stream chunks
-    for chunk in call_bedrock_stream(prompt):
-        await asyncio.sleep(0.01)  # Tiny delay to ensure it doesn't batch too much
+    # Step 5: Stream LLM response
+    async for chunk in call_bedrock_stream(prompt):
+        await asyncio.sleep(0.01)
         yield {
             "type": "content",
             "delta": chunk
