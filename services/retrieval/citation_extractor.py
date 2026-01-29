@@ -96,7 +96,7 @@ Output: {{"citation": null, "case_numbers": [], "full_case_number": null, "case_
 Now extract from: {query}
 Return ONLY JSON."""
         
-        content = call_bedrock(prompt)
+        content = call_bedrock_direct(prompt)
         
         # Clean response
         content = content.strip()

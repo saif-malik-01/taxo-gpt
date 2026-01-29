@@ -10,12 +10,14 @@ SESSION_KEY = "session:{}:history"
 
 async def get_session_history(session_id: str, limit: int = 50):
     redis = await get_redis()
-    # Try Redis first
     key = SESSION_KEY.format(session_id)
-    cached_history = await redis.lrange(key, 0, -1)
-    
-    if cached_history:
-        return [json.loads(msg) for msg in cached_history]
+    try:
+        # Try Redis first
+        cached_history = await redis.lrange(key, 0, -1)
+        if cached_history:
+            return [json.loads(msg) for msg in cached_history]
+    except Exception as e:
+        logger.warning(f"Redis error in get_session_history: {e}")
     
     # Fallback to DB (and populate Redis)
     async with AsyncSessionLocal() as db:
@@ -33,8 +35,11 @@ async def get_session_history(session_id: str, limit: int = 50):
         
         # Populate Redis (Push all)
         if history:
-            await redis.rpush(key, *[json.dumps(m) for m in history])
-            await redis.expire(key, 3600) # 1 hour TTL
+            try:
+                await redis.rpush(key, *[json.dumps(m) for m in history])
+                await redis.expire(key, 3600) # 1 hour TTL
+            except Exception as e:
+                logger.warning(f"Failed to populate Redis: {e}")
             
         return history
 
@@ -58,19 +63,25 @@ async def add_message(session_id: str, role: str, content: str, user_id: int = N
         msg_id = new_msg.id
 
     # 2. Update Redis
-    redis = await get_redis()
-    key = SESSION_KEY.format(session_id)
-    msg_obj = {"id": msg_id, "role": role, "content": content}
-    await redis.rpush(key, json.dumps(msg_obj))
-    await redis.expire(key, 3600)
+    try:
+        redis = await get_redis()
+        key = SESSION_KEY.format(session_id)
+        msg_obj = {"id": msg_id, "role": role, "content": content}
+        await redis.rpush(key, json.dumps(msg_obj))
+        await redis.expire(key, 3600)
+    except Exception as e:
+        logger.warning(f"Redis error in add_message: {e}")
     
     return new_msg
 
 async def delete_session(session_id: str):
     # 1. Delete from Redis
-    redis = await get_redis()
-    key = SESSION_KEY.format(session_id)
-    await redis.delete(key)
+    try:
+        redis = await get_redis()
+        key = SESSION_KEY.format(session_id)
+        await redis.delete(key)
+    except Exception as e:
+        logger.warning(f"Redis error in delete_session: {e}")
     
     # 2. Delete from Postgres
     async with AsyncSessionLocal() as db:

@@ -4,6 +4,112 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class MetadataIndex:
+    def __init__(self, chunks):
+        self.by_section = {}
+        self.by_rule = {}
+        self.by_hsn = {}
+        self.by_sac = {}
+        self.by_citation = {}
+        self.by_case_num = {}
+        self.judgment_by_external_id = {}
+        self.judgments_unique = {}  # external_id -> first_chunk (for metadata search)
+        self._build(chunks)
+
+    def _build(self, chunks):
+        count = 0
+        judgments_count = 0
+        for chunk in chunks:
+            count += 1
+            chunk_type = chunk.get("chunk_type")
+            metadata = chunk.get("metadata", {})
+            
+            # 1. Statutory Indexing (Sections & Subsections)
+            sec = chunk.get("section_number") or metadata.get("section_number")
+            subsec = chunk.get("subsection") or metadata.get("subsection")
+            
+            if sec and isinstance(sec, (str, int)):
+                s = str(sec).strip()
+                ss = str(subsec).strip() if subsec else ""
+                if not ss or ss.lower() in ["none", "null"]:
+                    ss = ""
+                
+                key = (s, ss)
+                if key not in self.by_section:
+                    self.by_section[key] = []
+                self.by_section[key].append(chunk)
+
+            # 2. Rules Indexing
+            rule = chunk.get("rule_number") or metadata.get("rule_number")
+            if rule and isinstance(rule, (str, int)):
+                r = str(rule).strip()
+                if r not in self.by_rule:
+                    self.by_rule[r] = []
+                self.by_rule[r].append(chunk)
+
+            # 3. HSN/SAC Indexing
+            hsn = chunk.get("hsn_code") or metadata.get("hsn_code")
+            if hsn and isinstance(hsn, (str, int)):
+                h = str(hsn).strip()
+                if h not in self.by_hsn:
+                    self.by_hsn[h] = []
+                self.by_hsn[h].append(chunk)
+                
+            sac = chunk.get("sac_code") or metadata.get("sac_code")
+            if sac and isinstance(sac, (str, int)):
+                sa = str(sac).strip()
+                if sa not in self.by_sac:
+                    self.by_sac[sa] = []
+                self.by_sac[sa].append(chunk)
+
+            # 4. Judgment Indexing
+            if chunk_type == "judgment":
+                ext_id = metadata.get("external_id")
+                if ext_id:
+                    eid = str(ext_id).strip()
+                    
+                    # Group chunks by external_id
+                    if eid not in self.judgment_by_external_id:
+                        self.judgment_by_external_id[eid] = []
+                        self.judgments_unique[eid] = chunk  # Store first chunk for metadata
+                        judgments_count += 1
+                    self.judgment_by_external_id[eid].append(chunk)
+                    
+                    # Index by Citation
+                    citation = metadata.get("citation")
+                    if citation:
+                        cit_norm = normalize_citation(citation)
+                        if cit_norm:
+                            if cit_norm not in self.by_citation:
+                                self.by_citation[cit_norm] = []
+                            if eid not in [c.get("metadata", {}).get("external_id") for c in self.by_citation[cit_norm]]:
+                                self.by_citation[cit_norm].append(chunk)
+
+                    # Index by Case Number
+                    case_num = metadata.get("case_number")
+                    if case_num:
+                        cn_norm = extract_core_case_number(case_num)
+                        if cn_norm:
+                            if cn_norm not in self.by_case_num:
+                                self.by_case_num[cn_norm] = []
+                            if eid not in [c.get("metadata", {}).get("external_id") for c in self.by_case_num[cn_norm]]:
+                                self.by_case_num[cn_norm].append(chunk)
+
+        logger.info(f"🚀 Built MetadataIndex with {count} chunks")
+        logger.info(f"   Sections: {len(self.by_section)} | Rules: {len(self.by_rule)} | Judgments: {judgments_count}")
+        logger.info(f"   Citations: {len(self.by_citation)} | Case Numbers: {len(self.by_case_num)}")
+
+
+_INDEX_CACHE = None
+
+def get_index(chunks):
+    """Get or build the metadata index (singleton)"""
+    global _INDEX_CACHE
+    if _INDEX_CACHE is None:
+        _INDEX_CACHE = MetadataIndex(chunks)
+    return _INDEX_CACHE
+
+
 def normalize_citation(text: str) -> str:
     """Normalize citation for matching"""
     if not text:
@@ -129,25 +235,13 @@ def check_both_parties_match(party_names_norm: list, db_petitioner_norm: str,
 
 def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
     """
-    Find matching judgments with optimized logic
-    
-    NEW LOGIC:
-    1. If 2 party names extracted and BOTH match (one=petitioner, one=respondent) → EXACT (1.0)
-    2. Citation exact match → EXACT (1.0), skip partial for citation
-    3. Case number exact match (any individual number) → EXACT (1.0), skip partial for case_number
-    4. Party exact match → EXACT (1.0), skip partial for that party
-    5. Party partial match (only if no exact) → PARTIAL (0.65)
-    
-    Returns:
-    {
-        "exact_matches": [{score: 1.0, ...}],
-        "partial_matches": [{score: 0.65, ...}],
-        "substring_matches": [{score: 0.1, ...}]
-    }
+    Find matching judgments using pre-built index for speed
     """
-    
     exact_matches = {}
     partial_matches = {}
+    
+    # Get index
+    index = get_index(all_chunks)
     
     # Extract and normalize
     citation_norm = normalize_citation(extracted.get("citation", ""))
@@ -170,99 +264,91 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
         logger.info("No citation, case numbers, or party names extracted")
         return {"exact_matches": [], "partial_matches": [], "substring_matches": []}
     
-    logger.info(f"🔍 Searching - Citation: '{citation_norm}', "
+    logger.info(f"🔍 Searching using INDEX - Citation: '{citation_norm}', "
                 f"Case Numbers: {case_nums_norm}, Parties: {party_names_norm}")
     
     # Track what matched to skip partial matching
-    citation_exact_found = False
-    case_num_exact_found = False
     party_exact_found = False
-    
-    # ========== EXACT MATCHES ==========
-    
-    for chunk in all_chunks:
-        if chunk.get("chunk_type") != "judgment":
-            continue
-        
+
+    # helper to add to exact_matches
+    def add_exact_match(chunk, field_name, matched_value):
         metadata = chunk.get("metadata", {})
         external_id = metadata.get("external_id")
-        if not external_id:
-            continue
+        if not external_id or external_id in exact_matches:
+            return
         
-        db_citation = metadata.get("citation", "")
-        db_case_num = metadata.get("case_number", "")
+        exact_matches[external_id] = {
+            "external_id": external_id,
+            "matched_field": field_name,
+            "matched_value": matched_value,
+            "score": 1.0,
+            "chunks": [], # Will be populated at the end
+            "citation": metadata.get("citation", ""),
+            "case_number": metadata.get("case_number", ""),
+            "petitioner": metadata.get("petitioner", ""),
+            "respondent": metadata.get("respondent", ""),
+            "title": metadata.get("title", "")
+        }
+
+    # ========== 1. CITATION EXACT MATCH (via Index) ==========
+    if citation_norm:
+        matches = index.by_citation.get(citation_norm, [])
+        for chunk in matches:
+            add_exact_match(chunk, "citation", chunk.get("metadata", {}).get("citation"))
+
+    # ========== 2. CASE NUMBER EXACT MATCH (via Index) ==========
+    if case_nums_norm:
+        for cn_norm in case_nums_norm:
+            if not cn_norm: continue
+            matches = index.by_case_num.get(cn_norm, [])
+            for chunk in matches:
+                add_exact_match(chunk, "case_number", chunk.get("metadata", {}).get("case_number"))
+
+    # ========== 3. PARTY MATCHES (Scan unique judgments instead of all chunks) ==========
+    # This is much faster than scanning all_chunks
+    for external_id, chunk in index.judgments_unique.items():
+        if external_id in exact_matches:
+            continue
+            
+        metadata = chunk.get("metadata", {})
         db_petitioner = metadata.get("petitioner", "")
         db_respondent = metadata.get("respondent", "")
         
-        # === CITATION EXACT MATCH ===
-        if citation_norm:
-            db_citation_norm = normalize_citation(db_citation)
-            if citation_norm == db_citation_norm:
-                citation_exact_found = True
-                if external_id not in exact_matches:
-                    exact_matches[external_id] = {
-                        "external_id": external_id,
-                        "matched_field": "citation",
-                        "matched_value": db_citation,
-                        "score": 1.0,
-                        "chunks": [],
-                        "citation": db_citation,
-                        "case_number": db_case_num,
-                        "petitioner": db_petitioner,
-                        "respondent": db_respondent
-                    }
-                exact_matches[external_id]["chunks"].append(chunk)
-                logger.debug(f"✅ Citation exact match: {external_id}")
-        
-        # === CASE NUMBER EXACT MATCH (any individual number) ===
-        if case_nums_norm:
-            db_case_num_core = extract_core_case_number(db_case_num)
-            
-            # Check if ANY extracted case number matches
-            for case_norm in case_nums_norm:
-                if case_norm and case_norm == db_case_num_core:
-                    case_num_exact_found = True
-                    if external_id not in exact_matches:
-                        exact_matches[external_id] = {
-                            "external_id": external_id,
-                            "matched_field": "case_number",
-                            "matched_value": db_case_num,
-                            "score": 1.0,
-                            "chunks": [],
-                            "citation": db_citation,
-                            "case_number": db_case_num,
-                            "petitioner": db_petitioner,
-                            "respondent": db_respondent
-                        }
-                    exact_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"✅ Case number exact match: {external_id}")
-                    break
-        
-        # === BOTH PARTIES EXACT MATCH (2 names: one=petitioner, one=respondent) ===
+        db_petitioner_norm = normalize_party_name(db_petitioner)
+        db_respondent_norm = normalize_party_name(db_respondent)
+
+        # === BOTH PARTIES EXACT MATCH ===
         if len(party_names_norm) >= 2:
-            db_petitioner_norm = normalize_party_name(db_petitioner)
-            db_respondent_norm = normalize_party_name(db_respondent)
-            
             if check_both_parties_match(party_names_norm, db_petitioner_norm, db_respondent_norm):
                 party_exact_found = True
-                if external_id not in exact_matches:
-                    exact_matches[external_id] = {
-                        "external_id": external_id,
-                        "matched_field": "both_parties",
-                        "matched_value": f"{db_petitioner} vs {db_respondent}",
-                        "score": 1.0,
-                        "chunks": [],
-                        "citation": db_citation,
-                        "case_number": db_case_num,
-                        "petitioner": db_petitioner,
-                        "respondent": db_respondent
-                    }
-                exact_matches[external_id]["chunks"].append(chunk)
-                logger.debug(f"✅ Both parties exact match: {external_id}")
-                continue  # Skip single party check
-        
+                add_exact_match(chunk, "both_parties", f"{db_petitioner} vs {db_respondent}")
+                continue
+
         # === SINGLE PARTY EXACT MATCH ===
-        if party_names_norm and not party_exact_found:
+        if party_names_norm:
+            for party_norm in party_names_norm:
+                if not party_norm or len(party_norm) < 3:
+                    continue
+                
+                if party_norm == db_petitioner_norm:
+                    party_exact_found = True
+                    add_exact_match(chunk, "petitioner", db_petitioner)
+                    break
+                elif party_norm == db_respondent_norm:
+                    party_exact_found = True
+                    add_exact_match(chunk, "respondent", db_respondent)
+                    break
+
+    # ========== 4. PARTIAL MATCHES (Substring) ==========
+    if party_names_norm and not party_exact_found:
+        for external_id, chunk in index.judgments_unique.items():
+            if external_id in exact_matches or external_id in partial_matches:
+                continue
+                
+            metadata = chunk.get("metadata", {})
+            db_petitioner = metadata.get("petitioner", "")
+            db_respondent = metadata.get("respondent", "")
+            
             db_petitioner_norm = normalize_party_name(db_petitioner)
             db_respondent_norm = normalize_party_name(db_respondent)
             
@@ -270,132 +356,35 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
                 if not party_norm or len(party_norm) < 3:
                     continue
                 
-                # Exact match in petitioner
-                if party_norm == db_petitioner_norm:
-                    party_exact_found = True
-                    if external_id not in exact_matches:
-                        exact_matches[external_id] = {
-                            "external_id": external_id,
-                            "matched_field": "petitioner",
-                            "matched_value": db_petitioner,
-                            "score": 1.0,
-                            "chunks": [],
-                            "citation": db_citation,
-                            "case_number": db_case_num,
-                            "petitioner": db_petitioner,
-                            "respondent": db_respondent
-                        }
-                    exact_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"✅ Petitioner exact match: {external_id}")
+                # Substring match (but not exact - exact handled above)
+                if (party_norm in db_petitioner_norm) or (party_norm in db_respondent_norm):
+                    partial_matches[external_id] = {
+                        "external_id": external_id,
+                        "matched_field": "party_substring",
+                        "matched_value": f"{db_petitioner} / {db_respondent}",
+                        "score": 0.65,
+                        "chunks": [],
+                        "citation": metadata.get("citation", ""),
+                        "case_number": metadata.get("case_number", ""),
+                        "petitioner": db_petitioner,
+                        "respondent": db_respondent,
+                        "title": metadata.get("title", "")
+                    }
                     break
-                
-                # Exact match in respondent
-                if party_norm == db_respondent_norm:
-                    party_exact_found = True
-                    if external_id not in exact_matches:
-                        exact_matches[external_id] = {
-                            "external_id": external_id,
-                            "matched_field": "respondent",
-                            "matched_value": db_respondent,
-                            "score": 1.0,
-                            "chunks": [],
-                            "citation": db_citation,
-                            "case_number": db_case_num,
-                            "petitioner": db_petitioner,
-                            "respondent": db_respondent
-                        }
-                    exact_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"✅ Respondent exact match: {external_id}")
-                    break
-    
-    # ========== PARTIAL MATCHES (only if no exact match) ==========
-    
-    if party_names_norm and not party_exact_found:
-        for chunk in all_chunks:
-            if chunk.get("chunk_type") != "judgment":
-                continue
-            
-            metadata = chunk.get("metadata", {})
-            external_id = metadata.get("external_id")
-            
-            if not external_id or external_id in exact_matches:
-                continue
-            
-            meta = chunks[0].get("metadata", {})
-            petitioner_norm = normalize_party_name(meta.get("petitioner", ""))
-            respondent_norm = normalize_party_name(meta.get("respondent", ""))
-            
-            for party_norm in party_names_norm:
-                if not party_norm or len(party_norm) < 3:
-                    continue
-                
-                # Substring in petitioner (but NOT exact)
-                if party_norm in db_petitioner_norm and party_norm != db_petitioner_norm:
-                    if external_id not in partial_matches:
-                        partial_matches[external_id] = {
-                            "external_id": external_id,
-                            "matched_field": "petitioner",
-                            "matched_value": db_petitioner,
-                            "score": 0.65,
-                            "chunks": [],
-                            "citation": db_citation,
-                            "case_number": db_case_num,
-                            "petitioner": db_petitioner,
-                            "respondent": db_respondent
-                        }
-                    partial_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"⚠️  Partial petitioner match: {external_id}")
-                    break
-                
-                # Substring in respondent (but NOT exact)
-                if party_norm in db_respondent_norm and party_norm != db_respondent_norm:
-                    if external_id not in partial_matches:
-                        partial_matches[external_id] = {
-                            "external_id": external_id,
-                            "matched_field": "respondent",
-                            "matched_value": db_respondent,
-                            "score": 0.65,
-                            "chunks": [],
-                            "citation": db_citation,
-                            "case_number": db_case_num,
-                            "petitioner": db_petitioner,
-                            "respondent": db_respondent
-                        }
-                    partial_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"⚠️  Partial respondent match: {external_id}")
-                    break
-    
-    # ========== BUILD RESULTS ==========
-    
+
+    # ========== BUILD FINAL LISTS (Attach all chunks) ==========
     exact_match_list = []
-    for external_id, match_info in exact_matches.items():
-        # Get ALL chunks for this judgment
-        all_judgment_chunks = [
-            c for c in all_chunks
-            if c.get("chunk_type") == "judgment" and 
-               c.get("metadata", {}).get("external_id") == external_id
-        ]
-        
-        match_info["chunks"] = all_judgment_chunks
+    for eid, match_info in exact_matches.items():
+        match_info["chunks"] = index.judgment_by_external_id.get(eid, [])
         exact_match_list.append(match_info)
-        
-        logger.info(f"✅ EXACT (1.0) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', "
-                   f"ID={external_id}, chunks={len(all_judgment_chunks)}")
-    
+        logger.info(f"✅ EXACT (1.0) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', ID={eid}")
+
     partial_match_list = []
-    for external_id, match_info in partial_matches.items():
-        all_judgment_chunks = [
-            c for c in all_chunks
-            if c.get("chunk_type") == "judgment" and 
-               c.get("metadata", {}).get("external_id") == external_id
-        ]
-        
-        match_info["chunks"] = all_judgment_chunks
+    for eid, match_info in partial_matches.items():
+        match_info["chunks"] = index.judgment_by_external_id.get(eid, [])
         partial_match_list.append(match_info)
-        
-        logger.info(f"⚠️  PARTIAL (0.65) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', "
-                   f"ID={external_id}, chunks={len(all_judgment_chunks)}")
-    
+        logger.info(f"⚠️  PARTIAL (0.65) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', ID={eid}")
+
     return {
         "exact_matches": exact_match_list,
         "partial_matches": partial_match_list,

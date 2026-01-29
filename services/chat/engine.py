@@ -2,8 +2,9 @@ import asyncio
 from services.retrieval.hybrid import retrieve
 from services.retrieval.citation_matcher import get_index
 from services.llm.bedrock_client import call_bedrock, call_bedrock_stream
-from services.chat.prompt_builder import build_structured_prompt
+from services.chat.prompt_builder import build_structured_prompt, get_system_prompt
 from services.chat.response_citation_extractor import extract_and_attribute_citations
+from starlette.concurrency import run_in_threadpool
 import logging
 
 logger = logging.getLogger(__name__)
@@ -178,8 +179,10 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
-    # Step 3: Build prompt
-    prompt = build_structured_prompt(
+    # Step 3: Build prompt (SYSTEM + USER)
+    system_prompt = get_system_prompt(profile_summary)
+    
+    user_prompt = build_structured_prompt(
         query=query,
         primary=primary,
         supporting=supporting,
@@ -187,8 +190,12 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         profile_summary=profile_summary
     )
 
-    # Step 4: Call LLM
-    raw_answer = call_bedrock(prompt)
+    # Step 4: Call LLM (Inference Params: Temp=0)
+    raw_answer = call_bedrock(
+        prompt=user_prompt,
+        system_prompts=[system_prompt],
+        temperature=0.0
+    )
     
     logger.info("=" * 80)
     logger.info("RAW LLM RESPONSE (before citation attribution):")
@@ -228,8 +235,10 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
-    # Step 3: Build prompt
-    prompt = build_structured_prompt(
+    # Step 3: Build prompt (SYSTEM + USER)
+    system_prompt = get_system_prompt(profile_summary)
+    
+    user_prompt = build_structured_prompt(
         query=query,
         primary=primary,
         supporting=supporting,
@@ -249,7 +258,12 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
 
     # Step 5: Stream LLM response and collect full answer
     full_answer = ""
-    for chunk in call_bedrock_stream(prompt):
+    # Pass system prompts and temperature=0
+    for chunk in call_bedrock_stream(
+        prompt=user_prompt,
+        system_prompts=[system_prompt],
+        temperature=0.0
+    ):
         full_answer += chunk
         await asyncio.sleep(0.01)
         yield {
