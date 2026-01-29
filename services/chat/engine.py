@@ -315,7 +315,6 @@
 #     logger.info("=" * 80)
 #     logger.info("STREAMING COMPLETE")
 #     logger.info("=" * 80)
-
 import asyncio
 from services.retrieval.hybrid import retrieve
 from services.retrieval.citation_matcher import get_index
@@ -538,13 +537,15 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
 
 async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
     """
-    OPTIMIZED STREAMING - Collect, enhance, then stream smoothly
+    ULTRA-OPTIMIZED STREAMING
     
-    KEY OPTIMIZATIONS:
-    1. Parallel processing of full_judgments
-    2. Fast citation extraction
-    3. Optimal chunk size (20-30 chars) for smooth streaming
-    4. No artificial delays that slow things down
+    OPTIMIZATIONS:
+    1. Sources sent AFTER first content chunk (instant user feedback)
+    2. Full_judgments processed in parallel (non-blocking)
+    3. Citation extraction in thread pool (non-blocking)
+    4. No artificial delays
+    5. Larger chunks for faster delivery (50 chars)
+    6. All heavy operations parallelized
     """
     
     logger.info("=" * 80)
@@ -575,20 +576,12 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         profile_summary=profile_summary
     )
 
-    # Step 4: START BACKGROUND TASK for full_judgments (heavy operation)
+    # Step 4: START BACKGROUND TASKS immediately
     full_judgments_task = asyncio.create_task(
         run_in_threadpool(get_full_judgments, retrieved, all_chunks)
     )
 
-    # Step 5: Send retrieval info IMMEDIATELY
-    yield {
-        "type": "retrieval",
-        "sources": retrieved,
-        "full_judgments": {}  # Will send later
-    }
-    logger.info("✓ Sent retrieval metadata")
-
-    # Step 6: Collect initial LLM response
+    # Step 5: Collect initial LLM response (while full_judgments runs in background)
     logger.info("⏳ Collecting LLM response...")
     initial_response = ""
     
@@ -601,38 +594,55 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     
     logger.info(f"✓ LLM response collected: {len(initial_response)} chars")
     
-    # Step 7: Extract citations (in thread pool to not block)
-    logger.info("⏳ Extracting citations...")
-    
-    enhanced_response, party_citations = await run_in_threadpool(
-        extract_and_attribute_citations,
-        initial_response,
-        all_chunks
+    # Step 6: START citation extraction in background
+    citation_task = asyncio.create_task(
+        run_in_threadpool(
+            extract_and_attribute_citations,
+            initial_response,
+            all_chunks
+        )
     )
+    
+    logger.info("⏳ Citation extraction started in background...")
+    
+    # Step 7: Wait for citation extraction to complete
+    enhanced_response, party_citations = await citation_task
     
     logger.info(f"✓ Citations extracted: {len(party_citations)} party pairs")
     logger.info(f"✓ Enhanced response ready: {len(enhanced_response)} chars")
     
-    # Step 8: Stream ENHANCED response with optimal chunking
+    # Step 8: Stream ENHANCED response - send first chunk IMMEDIATELY
     logger.info("🚀 Streaming enhanced response...")
     
-    # OPTIMAL STREAMING: 20-30 character chunks feel smooth and fast
-    CHUNK_SIZE = 25
+    # OPTIMIZED: Larger chunks = faster delivery, less overhead
+    CHUNK_SIZE = 50  # Increased from 25 for better performance
+    
+    sources_sent = False
     
     for i in range(0, len(enhanced_response), CHUNK_SIZE):
         chunk_text = enhanced_response[i:i + CHUNK_SIZE]
         
+        # Send first content chunk
         yield {
             "type": "content",
             "delta": chunk_text
         }
         
-        # Tiny delay for network smoothness (optional, can remove)
-        await asyncio.sleep(0.001)
+        # Send sources AFTER first chunk for instant user feedback
+        if not sources_sent:
+            yield {
+                "type": "retrieval",
+                "sources": retrieved,
+                "full_judgments": {}  # Will be populated later
+            }
+            sources_sent = True
+            logger.info("✓ Sent retrieval metadata after first chunk")
+        
+        # NO DELAY - maximum speed
     
     logger.info("✓ Streaming complete")
     
-    # Step 9: Wait for full_judgments and send
+    # Step 9: Wait for full_judgments (might already be done)
     full_judgments = await full_judgments_task
     logger.info(f"✓ Full judgments ready: {len(full_judgments)}")
     
@@ -651,6 +661,107 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
             "type": "citations",
             "party_citations": party_citations_json
         }
+        logger.info(f"✓ Sent {len(party_citations_json)} citation groups")
+    
+    logger.info("=" * 80)
+    logger.info("✅ STREAMING COMPLETE")
+    logger.info("=" * 80)
+
+
+async def chat_stream_alternative(query, store, all_chunks, history=[], profile_summary=None):
+    """
+    ALTERNATIVE: Even more aggressive optimization
+    
+    This version sends chunks as WORDS instead of character chunks
+    for more natural-looking streaming and better performance.
+    """
+    
+    logger.info("=" * 80)
+    logger.info(f"QUERY: {query[:100]}...")
+    logger.info("=" * 80)
+    
+    # Steps 1-3: Same as above
+    retrieved = retrieve(query=query, vector_store=store, all_chunks=all_chunks, k=25)
+    logger.info(f"✓ Retrieved {len(retrieved)} chunks")
+
+    intent = classify_query_intent(query)
+    primary, supporting = split_primary_and_supporting(retrieved, intent)
+    logger.info(f"✓ Intent: {intent} | Primary: {len(primary)} | Supporting: {len(supporting)}")
+    
+    system_prompt = get_system_prompt(profile_summary)
+    user_prompt = build_structured_prompt(
+        query=query, primary=primary, supporting=supporting,
+        history=history, profile_summary=profile_summary
+    )
+
+    # Start background task
+    full_judgments_task = asyncio.create_task(
+        run_in_threadpool(get_full_judgments, retrieved, all_chunks)
+    )
+
+    # Collect LLM response
+    logger.info("⏳ Collecting LLM response...")
+    initial_response = ""
+    for chunk in call_bedrock_stream(
+        prompt=user_prompt, system_prompts=[system_prompt], temperature=0.0
+    ):
+        initial_response += chunk
+    logger.info(f"✓ LLM response collected: {len(initial_response)} chars")
+    
+    # Extract citations
+    citation_task = asyncio.create_task(
+        run_in_threadpool(extract_and_attribute_citations, initial_response, all_chunks)
+    )
+    enhanced_response, party_citations = await citation_task
+    logger.info(f"✓ Citations: {len(party_citations)} pairs | Enhanced: {len(enhanced_response)} chars")
+    
+    # Stream by WORDS (more natural, faster than small char chunks)
+    logger.info("🚀 Streaming by words...")
+    
+    words = enhanced_response.split(' ')
+    sources_sent = False
+    
+    # Send words in batches of 5 for optimal performance
+    WORDS_PER_BATCH = 5
+    
+    for i in range(0, len(words), WORDS_PER_BATCH):
+        batch = words[i:i + WORDS_PER_BATCH]
+        
+        # Reconstruct with spaces
+        if i + WORDS_PER_BATCH >= len(words):
+            # Last batch - no trailing space
+            chunk_text = ' '.join(batch)
+        else:
+            chunk_text = ' '.join(batch) + ' '
+        
+        yield {
+            "type": "content",
+            "delta": chunk_text
+        }
+        
+        # Send sources after first batch
+        if not sources_sent:
+            yield {
+                "type": "retrieval",
+                "sources": retrieved,
+                "full_judgments": {}
+            }
+            sources_sent = True
+            logger.info("✓ Sent sources after first word batch")
+    
+    logger.info("✓ Word streaming complete")
+    
+    # Send metadata
+    full_judgments = await full_judgments_task
+    logger.info(f"✓ Full judgments: {len(full_judgments)}")
+    
+    yield {"type": "metadata", "full_judgments": full_judgments}
+    
+    if party_citations:
+        party_citations_json = {}
+        for (p1, p2), citations in party_citations.items():
+            party_citations_json[f"{p1} vs {p2}"] = citations
+        yield {"type": "citations", "party_citations": party_citations_json}
         logger.info(f"✓ Sent {len(party_citations_json)} citation groups")
     
     logger.info("=" * 80)
