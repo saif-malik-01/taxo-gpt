@@ -538,26 +538,35 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
 
 async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
     """
-    Streaming chat with citation attribution
+    OPTIMIZED STREAMING - Collect, enhance, then stream smoothly
     
-    OPTIMIZED FOR FRONTEND - Sends larger chunks (50 chars at a time)
+    KEY OPTIMIZATIONS:
+    1. Parallel processing of full_judgments
+    2. Fast citation extraction
+    3. Optimal chunk size (20-30 chars) for smooth streaming
+    4. No artificial delays that slow things down
     """
     
-    # Step 1: Retrieve
+    logger.info("=" * 80)
+    logger.info(f"QUERY: {query[:100]}...")
+    logger.info("=" * 80)
+    
+    # Step 1: Retrieve chunks
     retrieved = retrieve(
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
         k=25
     )
+    logger.info(f"✓ Retrieved {len(retrieved)} chunks")
 
     # Step 2: Classify and split
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
+    logger.info(f"✓ Intent: {intent} | Primary: {len(primary)} | Supporting: {len(supporting)}")
     
-    # Step 3: Build prompt (SYSTEM + USER)
+    # Step 3: Build prompts
     system_prompt = get_system_prompt(profile_summary)
-    
     user_prompt = build_structured_prompt(
         query=query,
         primary=primary,
@@ -566,22 +575,23 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         profile_summary=profile_summary
     )
 
-    # Offload reassembly to thread pool
-    full_judgments = await run_in_threadpool(get_full_judgments, retrieved, all_chunks)
+    # Step 4: START BACKGROUND TASK for full_judgments (heavy operation)
+    full_judgments_task = asyncio.create_task(
+        run_in_threadpool(get_full_judgments, retrieved, all_chunks)
+    )
 
-    # Yield retrieval info first
+    # Step 5: Send retrieval info IMMEDIATELY
     yield {
         "type": "retrieval",
         "sources": retrieved,
-        "full_judgments": full_judgments
+        "full_judgments": {}  # Will send later
     }
+    logger.info("✓ Sent retrieval metadata")
 
-    # Step 4: Collect FULL initial response
-    logger.info("=" * 80)
-    logger.info("STREAMING: Collecting initial LLM response...")
-    logger.info("=" * 80)
-    
+    # Step 6: Collect initial LLM response
+    logger.info("⏳ Collecting LLM response...")
     initial_response = ""
+    
     for chunk in call_bedrock_stream(
         prompt=user_prompt,
         system_prompts=[system_prompt],
@@ -589,10 +599,10 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     ):
         initial_response += chunk
     
-    logger.info(f"Initial response collected: {len(initial_response)} chars")
+    logger.info(f"✓ LLM response collected: {len(initial_response)} chars")
     
-    # Step 5: Extract citations and re-attribute
-    logger.info("Extracting and attributing citations...")
+    # Step 7: Extract citations (in thread pool to not block)
+    logger.info("⏳ Extracting citations...")
     
     enhanced_response, party_citations = await run_in_threadpool(
         extract_and_attribute_citations,
@@ -600,14 +610,14 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         all_chunks
     )
     
-    logger.info(f"Enhanced response ready: {len(enhanced_response)} chars")
-    logger.info(f"Party citations found: {len(party_citations)}")
+    logger.info(f"✓ Citations extracted: {len(party_citations)} party pairs")
+    logger.info(f"✓ Enhanced response ready: {len(enhanced_response)} chars")
     
-    # Step 6: Stream the ENHANCED response in chunks of 50 characters
-    # This is much more efficient than char-by-char and works better with frontend
-    logger.info("Streaming enhanced response...")
+    # Step 8: Stream ENHANCED response with optimal chunking
+    logger.info("🚀 Streaming enhanced response...")
     
-    CHUNK_SIZE = 50  # Characters per chunk
+    # OPTIMAL STREAMING: 20-30 character chunks feel smooth and fast
+    CHUNK_SIZE = 25
     
     for i in range(0, len(enhanced_response), CHUNK_SIZE):
         chunk_text = enhanced_response[i:i + CHUNK_SIZE]
@@ -616,10 +626,23 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
             "type": "content",
             "delta": chunk_text
         }
+        
+        # Tiny delay for network smoothness (optional, can remove)
+        await asyncio.sleep(0.001)
     
-    # Step 7: Send citation metadata
+    logger.info("✓ Streaming complete")
+    
+    # Step 9: Wait for full_judgments and send
+    full_judgments = await full_judgments_task
+    logger.info(f"✓ Full judgments ready: {len(full_judgments)}")
+    
+    yield {
+        "type": "metadata",
+        "full_judgments": full_judgments
+    }
+    
+    # Step 10: Send citation metadata
     if party_citations:
-        # Convert tuple keys to string for JSON serialization
         party_citations_json = {}
         for (p1, p2), citations in party_citations.items():
             party_citations_json[f"{p1} vs {p2}"] = citations
@@ -628,7 +651,8 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
             "type": "citations",
             "party_citations": party_citations_json
         }
+        logger.info(f"✓ Sent {len(party_citations_json)} citation groups")
     
     logger.info("=" * 80)
-    logger.info("STREAMING COMPLETE")
+    logger.info("✅ STREAMING COMPLETE")
     logger.info("=" * 80)
