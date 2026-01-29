@@ -1,91 +1,3 @@
-# from fastapi import FastAPI, Depends
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-# from typing import List
-# import json
-
-# from services.chat.engine import chat
-# from services.vector.store import VectorStore
-# from services.auth.deps import auth_guard
-# from api.auth import router as auth_router
-
-# # ---------------- INIT ---------------- #
-
-# app = FastAPI(
-#     title="GST Expert API",
-#     version="1.1.0"
-# )
-
-# # ---------------- CORS ---------------- #
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],  # 🔒 change to specific domains in production
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # ---------------- ROUTERS ---------------- #
-
-# app.include_router(auth_router)
-
-# # ---------------- DATA ---------------- #
-
-# INDEX_PATH = "data/vector_store/faiss.index"
-# CHUNKS_PATH = "data/processed/all_chunks.json"
-
-# vector_store = VectorStore(INDEX_PATH, CHUNKS_PATH)
-
-# with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
-#     ALL_CHUNKS = json.load(f)
-
-# # ---------------- SCHEMAS ---------------- #
-
-# class ChatRequest(BaseModel):
-#     question: str
-
-
-# class SourceChunk(BaseModel):
-#     id: str
-#     chunk_type: str
-#     text: str
-#     metadata: dict
-
-
-# class ChatResponse(BaseModel):
-#     answer: str
-#     sources: List[SourceChunk]
-
-# # ---------------- ROUTES ---------------- #
-
-# @app.get("/health")
-# def health():
-#     return {"status": "ok"}
-
-
-# @app.get("/auth/me")
-# def me(user=Depends(auth_guard)):
-#     return {"user": user}
-
-
-# @app.post("/chat/ask", response_model=ChatResponse)
-# def ask_gst(
-#     payload: ChatRequest,
-#     user=Depends(auth_guard)
-# ):
-#     answer, sources = chat(
-#         query=payload.question,
-#         store=vector_store,
-#         all_chunks=ALL_CHUNKS
-#     )
-
-#     return {
-#         "answer": answer,
-#         "sources": sources
-#     }
-
-
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,7 +20,7 @@ from sqlalchemy import select
 
 app = FastAPI(
     title="GST Expert API",
-    version="2.0.0"
+    version="2.1.0"  # Updated version
 )
 
 # ---------------- CORS ---------------- #
@@ -169,11 +81,24 @@ class FullJudgment(BaseModel):
     full_text: str
     external_id: str
 
+class CitationInfo(BaseModel):
+    """Citation info for a party pair"""
+    citation: str
+    case_number: str
+    petitioner: str
+    respondent: str
+    external_id: str
+    court: str
+    year: str
+    decision: str
+
 class ChatResponse(BaseModel):
-    answer: str
+    answer: str  # Enhanced answer with citation attribution appended
     session_id: str
     sources: List[SourceChunk]
     full_judgments: Optional[Dict[str, FullJudgment]] = None
+    # NEW: Party citations extracted from response
+    party_citations: Optional[Dict[str, List[CitationInfo]]] = None
 
 class FeedbackRequest(BaseModel):
     message_id: int
@@ -202,7 +127,7 @@ async def ask_gst(
     # 1. Manage Session
     session_id = payload.session_id or str(uuid.uuid4())
     
-    # 2. Get User ID (using email from token)
+    # 2. Get User ID
     email = user.get("sub")
     if not email:
         raise HTTPException(status_code=401, detail="Invalid user")
@@ -210,19 +135,17 @@ async def ask_gst(
     result = await db.execute(select(User).where(User.email == email))
     db_user = result.scalars().first()
     if not db_user:
-         # Fallback or error? For now error. In real app might auto-register if token is valid from external auth.
-         raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found")
     
     user_id = db_user.id
 
     # 3. Fetch Context (Profile & History)
     profile = await get_user_profile(user_id)
     profile_summary = profile.dynamic_summary if profile else None
-    
     history = await get_session_history(session_id)
     
-    # 4. Generate Answer
-    answer, sources, full_judgments = await chat(
+    # 4. Generate Answer (with citation attribution)
+    answer, sources, full_judgments, party_citations_dict = await chat(
         query=payload.question,
         store=vector_store,
         all_chunks=ALL_CHUNKS,
@@ -230,28 +153,28 @@ async def ask_gst(
         profile_summary=profile_summary
     )
     
-    # 5. Save to Memory (Redis + DB)
-    # Save User Query
+    # Note: 'answer' now includes citation attribution appended at the end
+    
+    # 5. Save to Memory
     await add_message(session_id, "user", payload.question, user_id)
-    
-    # Save AI Response (wait for it to be saved to return ID? No, we just save it)
-    ai_msg = await add_message(session_id, "assistant", answer, user_id)
+    await add_message(session_id, "assistant", answer, user_id)
 
-    # 6. Automatic Long-term Memory Update (Background Task)
+    # 6. Background: Update Profile
     background_tasks.add_task(auto_update_profile, user_id, payload.question, answer)
-
     
-    # Note: We might want to return the message ID of the AI response for feedback purposes.
-    # The current ChatResponse structure doesn't include message_id, but the user might need it.
-    # I'll rely on the client fetching history or I can add it to response if needed. 
-    # For now, keeping it simple as per schema.
+    # 7. Format party citations for response (convert tuple keys to string)
+    party_citations_formatted = {}
+    for (p1, p2), citations in party_citations_dict.items():
+        key = f"{p1} vs {p2}"
+        party_citations_formatted[key] = citations
 
     return {
-        "answer": answer,
+        "answer": answer,  # Includes citation attribution
         "session_id": session_id,
         "sources": sources,
-        "full_judgments": full_judgments if full_judgments else None
-    } 
+        "full_judgments": full_judgments if full_judgments else None,
+        "party_citations": party_citations_formatted if party_citations_formatted else None
+    }
 
 
 @app.post("/chat/ask/stream")
@@ -269,7 +192,7 @@ async def ask_gst_stream(
     result = await db.execute(select(User).where(User.email == email))
     db_user = result.scalars().first()
     if not db_user:
-         raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User not found")
     
     user_id = db_user.id
 
@@ -280,9 +203,11 @@ async def ask_gst_stream(
 
     async def stream_generator():
         full_answer = ""
+        
         # 4. Save User Query
         await add_message(session_id, "user", payload.question, user_id)
         
+        # 5. Stream response
         async for chunk in chat_stream(
             query=payload.question,
             store=vector_store,
@@ -290,22 +215,24 @@ async def ask_gst_stream(
             history=history,
             profile_summary=profile_summary
         ):
+            # Collect full answer from content chunks
             if chunk["type"] == "content":
                 full_answer += chunk["delta"]
             
-            # Send session_id with the first chunk (retrieval)
+            # Add session_id to first chunk
             if chunk["type"] == "retrieval":
                 chunk["session_id"] = session_id
 
             yield json.dumps(chunk) + "\n"
 
-        # 5. Save AI Response
+        # 6. Save AI Response
         await add_message(session_id, "assistant", full_answer, user_id)
 
-        # 6. Background Task
+        # 7. Background Task
         background_tasks.add_task(auto_update_profile, user_id, payload.question, full_answer)
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+
 
 @app.post("/chat/feedback")
 async def save_feedback(
@@ -313,8 +240,6 @@ async def save_feedback(
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
-    # Verify message ownership?
-    # Simple insert
     new_feedback = Feedback(
         message_id=payload.message_id, 
         rating=payload.rating, 
@@ -324,6 +249,7 @@ async def save_feedback(
     await db.commit()
     return {"status": "recorded"}
 
+
 @app.get("/chat/history")
 async def get_history(
     session_id: str,
@@ -332,21 +258,22 @@ async def get_history(
     history = await get_session_history(session_id, limit=50)
     return history
 
+
 @app.delete("/chat/session")
 async def delete_chat(
     session_id: str,
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
-    # Verify ownership
     email = user.get("sub")
-    res = await db.execute(
-        select(User).where(User.email == email)
-    )
+    res = await db.execute(select(User).where(User.email == email))
     db_user = res.scalars().first()
     
     res = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == db_user.id)
+        select(ChatSession).where(
+            ChatSession.id == session_id, 
+            ChatSession.user_id == db_user.id
+        )
     )
     session = res.scalars().first()
     
@@ -357,4 +284,3 @@ async def delete_chat(
     await delete_session(session_id)
     
     return {"status": "deleted"}
-

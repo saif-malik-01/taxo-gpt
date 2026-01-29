@@ -10,9 +10,12 @@ def normalize_citation(text: str) -> str:
         return ""
     
     text = text.lower()
-    noise_words = ['no', 'number', 'of']
-    for word in noise_words:
+    
+    # Remove noise words
+    for word in ['no', 'number', 'of']:
         text = re.sub(r'\b' + word + r'\b', '', text)
+    
+    # Remove special characters
     text = re.sub(r'[^\w\s]', '', text)
     text = re.sub(r'\s+', '', text)
     
@@ -20,32 +23,48 @@ def normalize_citation(text: str) -> str:
 
 
 def extract_core_case_number(text: str) -> str:
-    """Extract core case number by removing date and normalizing"""
+    """
+    Extract core case number by removing date and normalizing
+    Also removes "& ORS." and similar suffixes
+    """
     if not text:
         return ""
     
+    # Remove "& ORS." and variations
+    text = re.sub(r'\s*[&,]\s*ors\.?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*&\s*others?', '', text, flags=re.IGNORECASE)
+    
+    # Remove date patterns
     date_patterns = [
         r'\s+dated\s+\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}.*$',
         r'\s+dt\.?\s+\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}.*$',
         r'\s+on\s+\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}.*$',
     ]
     
-    text_without_date = text
     for pattern in date_patterns:
-        text_without_date = re.sub(pattern, '', text_without_date, flags=re.IGNORECASE)
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
     
-    return normalize_citation(text_without_date)
+    return normalize_citation(text)
 
 
 def normalize_party_name(name: str) -> str:
     """
-    Normalize party name for matching
-    Removes titles, legal suffixes, extra whitespace
+    Normalize party name - removes titles, suffixes, & ORS., Pvt Ltd, etc.
+    
+    Examples:
+    "Safari Retreat Pvt. Ltd." → "safari retreat"
+    "Mr. Sharma & Ors." → "sharma"
+    "ABC Private Limited" → "abc"
     """
     if not name:
         return ""
     
     name = name.lower()
+    
+    # Remove "& ORS." and variations
+    name = re.sub(r'\s*[&,]\s*ors\.?', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s*&\s*others?', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s*and\s+others?', '', name, flags=re.IGNORECASE)
     
     # Remove titles
     titles = [
@@ -59,12 +78,14 @@ def normalize_party_name(name: str) -> str:
     for title in titles:
         name = re.sub(title, '', name, flags=re.IGNORECASE)
     
-    # Remove legal suffixes
+    # Remove legal suffixes (including variations)
     suffixes = [
-        r'\bpvt\.?\s*ltd\.?\b', r'\bprivate\s+limited\b',
+        r'\bpvt\.?\s*ltd\.?', r'\bprivate\s+limited\b',
         r'\bltd\.?\b', r'\blimited\b',
-        r'\binc\.?\b', r'\bllc\.?\b', r'\bllp\.?\b',
-        r'\bco\.?\b', r'\bcorp\.?\b',
+        r'\binc\.?\b', r'\bincorporated\b',
+        r'\bllc\.?\b', r'\bllp\.?\b',
+        r'\bco\.?\b', r'\bcompany\b',
+        r'\bcorp\.?\b', r'\bcorporation\b',
     ]
     
     for suffix in suffixes:
@@ -72,76 +93,108 @@ def normalize_party_name(name: str) -> str:
     
     # Clean up
     name = re.sub(r'[^\w\s]', ' ', name)
-    name = re.sub(r'\s+', ' ', name)
-    name = name.strip()
+    name = re.sub(r'\s+', ' ', name).strip()
     
     return name
 
 
+def check_both_parties_match(party_names_norm: list, db_petitioner_norm: str, 
+                              db_respondent_norm: str) -> bool:
+    """
+    Check if BOTH extracted party names match (one as petitioner, one as respondent)
+    
+    This is for cases like: "Safari Retreat vs State of Karnataka"
+    Where we extract 2 names and both should match
+    """
+    if len(party_names_norm) < 2:
+        return False
+    
+    # Get first 2 names
+    name1 = party_names_norm[0]
+    name2 = party_names_norm[1]
+    
+    if not name1 or not name2 or len(name1) < 3 or len(name2) < 3:
+        return False
+    
+    # Check if name1=petitioner AND name2=respondent
+    if name1 == db_petitioner_norm and name2 == db_respondent_norm:
+        return True
+    
+    # Check if name1=respondent AND name2=petitioner
+    if name1 == db_respondent_norm and name2 == db_petitioner_norm:
+        return True
+    
+    return False
+
+
 def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
     """
-    Find judgments matching citation, case number, OR party names in METADATA
+    Find matching judgments with optimized logic
     
-    ALL MATCHING HAPPENS IN METADATA FIELDS:
-    - metadata.citation
-    - metadata.case_number
-    - metadata.petitioner
-    - metadata.respondent
-    
-    UPDATED PARTY MATCHING LOGIC:
-    - ANY exact party name match → EXACT (1.0)
-    - Only substring match (not exact) → PARTIAL (0.5)
+    NEW LOGIC:
+    1. If 2 party names extracted and BOTH match (one=petitioner, one=respondent) → EXACT (1.0)
+    2. Citation exact match → EXACT (1.0), skip partial for citation
+    3. Case number exact match (any individual number) → EXACT (1.0), skip partial for case_number
+    4. Party exact match → EXACT (1.0), skip partial for that party
+    5. Party partial match (only if no exact) → PARTIAL (0.65)
     
     Returns:
     {
-        "exact_matches": [{...}],     # Score 1.0
-        "partial_matches": [{...}],   # Score 0.5
-        "substring_matches": [{...}]  # Score 0.1 (not used)
+        "exact_matches": [{score: 1.0, ...}],
+        "partial_matches": [{score: 0.65, ...}],
+        "substring_matches": [{score: 0.1, ...}]
     }
     """
     
     exact_matches = {}
     partial_matches = {}
-    substring_chunk_ids = {}
     
     # Extract and normalize
-    extracted_citation = extracted.get("citation", "")
-    extracted_case_num = extracted.get("case_number", "")
+    citation_norm = normalize_citation(extracted.get("citation", ""))
+    
+    # Handle multiple case numbers
+    case_numbers = extracted.get("case_numbers", [])
+    full_case_number = extracted.get("full_case_number", "")
+    
+    # Normalize all case numbers
+    case_nums_norm = []
+    if case_numbers:
+        case_nums_norm = [extract_core_case_number(cn) for cn in case_numbers if cn]
+    elif full_case_number:
+        case_nums_norm = [extract_core_case_number(full_case_number)]
+    
     party_names = extracted.get("party_names", [])
+    party_names_norm = [normalize_party_name(p) for p in party_names if p]
     
-    citation_norm = normalize_citation(extracted_citation)
-    case_num_core = extract_core_case_number(extracted_case_num) if extracted_case_num else ""
-    party_names_norm = [normalize_party_name(name) for name in party_names if name]
-    
-    if not citation_norm and not case_num_core and not party_names_norm:
-        logger.info("No citation, case number, or party names extracted")
+    if not citation_norm and not case_nums_norm and not party_names_norm:
+        logger.info("No citation, case numbers, or party names extracted")
         return {"exact_matches": [], "partial_matches": [], "substring_matches": []}
     
-    logger.info(f"🔍 Searching METADATA - Citation: '{citation_norm}', Case#: '{case_num_core}', "
-                f"Parties: {party_names_norm} (count: {len(party_names_norm)})")
+    logger.info(f"🔍 Searching - Citation: '{citation_norm}', "
+                f"Case Numbers: {case_nums_norm}, Parties: {party_names_norm}")
     
-    # Track exact matches found
+    # Track what matched to skip partial matching
     citation_exact_found = False
     case_num_exact_found = False
+    party_exact_found = False
     
-    # ========== FIRST PASS: EXACT MATCHES IN METADATA ==========
+    # ========== EXACT MATCHES ==========
+    
     for chunk in all_chunks:
         if chunk.get("chunk_type") != "judgment":
             continue
         
         metadata = chunk.get("metadata", {})
         external_id = metadata.get("external_id")
-        
         if not external_id:
             continue
         
-        # Get metadata fields (NOT chunk text)
         db_citation = metadata.get("citation", "")
         db_case_num = metadata.get("case_number", "")
         db_petitioner = metadata.get("petitioner", "")
         db_respondent = metadata.get("respondent", "")
         
-        # === CITATION EXACT MATCH (metadata.citation) ===
+        # === CITATION EXACT MATCH ===
         if citation_norm:
             db_citation_norm = normalize_citation(db_citation)
             if citation_norm == db_citation_norm:
@@ -159,65 +212,39 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
                         "respondent": db_respondent
                     }
                 exact_matches[external_id]["chunks"].append(chunk)
+                logger.debug(f"✅ Citation exact match: {external_id}")
         
-        # === CASE NUMBER EXACT MATCH (metadata.case_number) ===
-        if case_num_core:
+        # === CASE NUMBER EXACT MATCH (any individual number) ===
+        if case_nums_norm:
             db_case_num_core = extract_core_case_number(db_case_num)
-            if case_num_core == db_case_num_core and len(case_num_core) > 0:
-                case_num_exact_found = True
-                if external_id not in exact_matches:
-                    exact_matches[external_id] = {
-                        "external_id": external_id,
-                        "matched_field": "case_number",
-                        "matched_value": db_case_num,
-                        "score": 1.0,
-                        "chunks": [],
-                        "citation": db_citation,
-                        "case_number": db_case_num,
-                        "petitioner": db_petitioner,
-                        "respondent": db_respondent
-                    }
-                exact_matches[external_id]["chunks"].append(chunk)
+            
+            # Check if ANY extracted case number matches
+            for case_norm in case_nums_norm:
+                if case_norm and case_norm == db_case_num_core:
+                    case_num_exact_found = True
+                    if external_id not in exact_matches:
+                        exact_matches[external_id] = {
+                            "external_id": external_id,
+                            "matched_field": "case_number",
+                            "matched_value": db_case_num,
+                            "score": 1.0,
+                            "chunks": [],
+                            "citation": db_citation,
+                            "case_number": db_case_num,
+                            "petitioner": db_petitioner,
+                            "respondent": db_respondent
+                        }
+                    exact_matches[external_id]["chunks"].append(chunk)
+                    logger.debug(f"✅ Case number exact match: {external_id}")
+                    break
         
-        # === PARTY NAMES EXACT MATCH (metadata.petitioner & metadata.respondent) ===
-        # NEW LOGIC: ANY exact party name match = EXACT (1.0)
-        
-        if party_names_norm:
+        # === BOTH PARTIES EXACT MATCH (2 names: one=petitioner, one=respondent) ===
+        if len(party_names_norm) >= 2:
             db_petitioner_norm = normalize_party_name(db_petitioner)
             db_respondent_norm = normalize_party_name(db_respondent)
             
-            # Track what matched
-            matched_both = False
-            matched_petitioner = False
-            matched_respondent = False
-            
-            # Check if BOTH parties match (for 2+ names)
-            if len(party_names_norm) >= 2:
-                matched_count = 0
-                for party_norm in party_names_norm:
-                    if not party_norm or len(party_norm) < 3:
-                        continue
-                    if party_norm == db_petitioner_norm or party_norm == db_respondent_norm:
-                        matched_count += 1
-                
-                if matched_count >= 2:
-                    matched_both = True
-            
-            # If not both, check individual exact matches
-            if not matched_both:
-                for party_norm in party_names_norm:
-                    if not party_norm or len(party_norm) < 3:
-                        continue
-                    
-                    if party_norm == db_petitioner_norm:
-                        matched_petitioner = True
-                        break
-                    elif party_norm == db_respondent_norm:
-                        matched_respondent = True
-                        break
-            
-            # Add to EXACT matches (score 1.0)
-            if matched_both:
+            if check_both_parties_match(party_names_norm, db_petitioner_norm, db_respondent_norm):
+                party_exact_found = True
                 if external_id not in exact_matches:
                     exact_matches[external_id] = {
                         "external_id": external_id,
@@ -231,44 +258,59 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
                         "respondent": db_respondent
                     }
                 exact_matches[external_id]["chunks"].append(chunk)
-                logger.debug(f"✅ BOTH parties exact match in judgment {external_id}")
+                logger.debug(f"✅ Both parties exact match: {external_id}")
+                continue  # Skip single party check
+        
+        # === SINGLE PARTY EXACT MATCH ===
+        if party_names_norm and not party_exact_found:
+            db_petitioner_norm = normalize_party_name(db_petitioner)
+            db_respondent_norm = normalize_party_name(db_respondent)
             
-            elif matched_petitioner:
-                if external_id not in exact_matches:
-                    exact_matches[external_id] = {
-                        "external_id": external_id,
-                        "matched_field": "petitioner",
-                        "matched_value": db_petitioner,
-                        "score": 1.0,
-                        "chunks": [],
-                        "citation": db_citation,
-                        "case_number": db_case_num,
-                        "petitioner": db_petitioner,
-                        "respondent": db_respondent
-                    }
-                exact_matches[external_id]["chunks"].append(chunk)
-                logger.debug(f"✅ Petitioner exact match in judgment {external_id}")
-            
-            elif matched_respondent:
-                if external_id not in exact_matches:
-                    exact_matches[external_id] = {
-                        "external_id": external_id,
-                        "matched_field": "respondent",
-                        "matched_value": db_respondent,
-                        "score": 1.0,
-                        "chunks": [],
-                        "citation": db_citation,
-                        "case_number": db_case_num,
-                        "petitioner": db_petitioner,
-                        "respondent": db_respondent
-                    }
-                exact_matches[external_id]["chunks"].append(chunk)
-                logger.debug(f"✅ Respondent exact match in judgment {external_id}")
+            for party_norm in party_names_norm:
+                if not party_norm or len(party_norm) < 3:
+                    continue
+                
+                # Exact match in petitioner
+                if party_norm == db_petitioner_norm:
+                    party_exact_found = True
+                    if external_id not in exact_matches:
+                        exact_matches[external_id] = {
+                            "external_id": external_id,
+                            "matched_field": "petitioner",
+                            "matched_value": db_petitioner,
+                            "score": 1.0,
+                            "chunks": [],
+                            "citation": db_citation,
+                            "case_number": db_case_num,
+                            "petitioner": db_petitioner,
+                            "respondent": db_respondent
+                        }
+                    exact_matches[external_id]["chunks"].append(chunk)
+                    logger.debug(f"✅ Petitioner exact match: {external_id}")
+                    break
+                
+                # Exact match in respondent
+                if party_norm == db_respondent_norm:
+                    party_exact_found = True
+                    if external_id not in exact_matches:
+                        exact_matches[external_id] = {
+                            "external_id": external_id,
+                            "matched_field": "respondent",
+                            "matched_value": db_respondent,
+                            "score": 1.0,
+                            "chunks": [],
+                            "citation": db_citation,
+                            "case_number": db_case_num,
+                            "petitioner": db_petitioner,
+                            "respondent": db_respondent
+                        }
+                    exact_matches[external_id]["chunks"].append(chunk)
+                    logger.debug(f"✅ Respondent exact match: {external_id}")
+                    break
     
-    # ========== SECOND PASS: PARTIAL MATCHES (0.5) IN METADATA ==========
-    # Only SUBSTRING matches (not exact)
+    # ========== PARTIAL MATCHES (only if no exact match) ==========
     
-    if party_names_norm:
+    if party_names_norm and not party_exact_found:
         for chunk in all_chunks:
             if chunk.get("chunk_type") != "judgment":
                 continue
@@ -276,7 +318,6 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
             metadata = chunk.get("metadata", {})
             external_id = metadata.get("external_id")
             
-            # Skip if already exact matched
             if not external_id or external_id in exact_matches:
                 continue
             
@@ -287,7 +328,6 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
             db_petitioner_norm = normalize_party_name(db_petitioner)
             db_respondent_norm = normalize_party_name(db_respondent)
             
-            # Check for SUBSTRING matches (not exact)
             for party_norm in party_names_norm:
                 if not party_norm or len(party_norm) < 3:
                     continue
@@ -299,7 +339,7 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
                             "external_id": external_id,
                             "matched_field": "petitioner",
                             "matched_value": db_petitioner,
-                            "score": 0.5,
+                            "score": 0.65,
                             "chunks": [],
                             "citation": db_citation,
                             "case_number": db_case_num,
@@ -307,17 +347,17 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
                             "respondent": db_respondent
                         }
                     partial_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"⚠️  Substring match in metadata.petitioner for judgment {external_id}")
+                    logger.debug(f"⚠️  Partial petitioner match: {external_id}")
                     break
                 
                 # Substring in respondent (but NOT exact)
-                elif party_norm in db_respondent_norm and party_norm != db_respondent_norm:
+                if party_norm in db_respondent_norm and party_norm != db_respondent_norm:
                     if external_id not in partial_matches:
                         partial_matches[external_id] = {
                             "external_id": external_id,
                             "matched_field": "respondent",
                             "matched_value": db_respondent,
-                            "score": 0.5,
+                            "score": 0.65,
                             "chunks": [],
                             "citation": db_citation,
                             "case_number": db_case_num,
@@ -325,10 +365,10 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
                             "respondent": db_respondent
                         }
                     partial_matches[external_id]["chunks"].append(chunk)
-                    logger.debug(f"⚠️  Substring match in metadata.respondent for judgment {external_id}")
+                    logger.debug(f"⚠️  Partial respondent match: {external_id}")
                     break
     
-    # ========== BUILD FINAL RESULTS ==========
+    # ========== BUILD RESULTS ==========
     
     exact_match_list = []
     for external_id, match_info in exact_matches.items():
@@ -342,12 +382,11 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
         match_info["chunks"] = all_judgment_chunks
         exact_match_list.append(match_info)
         
-        logger.info(f"✅ EXACT MATCH (1.0) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', "
-                   f"external_id={external_id}, chunks={len(all_judgment_chunks)}")
+        logger.info(f"✅ EXACT (1.0) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', "
+                   f"ID={external_id}, chunks={len(all_judgment_chunks)}")
     
     partial_match_list = []
     for external_id, match_info in partial_matches.items():
-        # Get ALL chunks for this judgment
         all_judgment_chunks = [
             c for c in all_chunks
             if c.get("chunk_type") == "judgment" and 
@@ -357,16 +396,11 @@ def find_matching_judgments(extracted: dict, all_chunks: list) -> dict:
         match_info["chunks"] = all_judgment_chunks
         partial_match_list.append(match_info)
         
-        logger.info(f"⚠️  PARTIAL MATCH (0.5) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', "
-                   f"external_id={external_id}, chunks={len(all_judgment_chunks)}")
-    
-    substring_match_list = list(substring_chunk_ids.values())
-    
-    if not exact_match_list and not partial_match_list and not substring_match_list:
-        logger.info("❌ NO MATCHES in metadata")
+        logger.info(f"⚠️  PARTIAL (0.65) - {match_info['matched_field'].upper()}='{match_info['matched_value']}', "
+                   f"ID={external_id}, chunks={len(all_judgment_chunks)}")
     
     return {
         "exact_matches": exact_match_list,
         "partial_matches": partial_match_list,
-        "substring_matches": substring_match_list
+        "substring_matches": []
     }
