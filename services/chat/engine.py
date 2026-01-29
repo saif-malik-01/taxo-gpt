@@ -3,7 +3,10 @@ from services.retrieval.hybrid import retrieve
 from services.retrieval.citation_matcher import get_index
 from services.llm.bedrock_client import call_bedrock, call_bedrock_stream
 from services.chat.prompt_builder import build_structured_prompt
-from starlette.concurrency import run_in_threadpool
+from services.chat.response_citation_extractor import extract_and_attribute_citations
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def classify_query_intent(query: str) -> str:
@@ -36,7 +39,6 @@ def split_primary_and_supporting(chunks, intent):
     
     HANDLES COMPLETE JUDGMENT CHUNKS:
     - Complete judgment chunks (with _is_complete_judgment=True) are always primary
-    - They already have metadata prepended in their text field
     """
     primary = []
     supporting = []
@@ -44,7 +46,7 @@ def split_primary_and_supporting(chunks, intent):
     for ch in chunks:
         ctype = ch.get("chunk_type")
         
-        # ✅ Complete judgment chunks are ALWAYS primary
+        # Complete judgment chunks are ALWAYS primary
         if ch.get("_is_complete_judgment"):
             primary.append(ch)
             continue
@@ -77,17 +79,14 @@ def get_full_judgments(retrieved_chunks, all_chunks):
     HANDLES BOTH:
     1. Complete judgment chunks (already assembled with metadata)
     2. Regular judgment chunks (need assembly)
-    
-    Returns judgment metadata for display/citation purposes
     """
     full_judgments = {}
     
     for chunk in retrieved_chunks:
-        # Skip non-judgment chunks
         if chunk.get("chunk_type") != "judgment":
             continue
         
-        # Case 1: Complete judgment chunk (already assembled)
+        # Case 1: Complete judgment chunk
         if chunk.get("_is_complete_judgment"):
             external_id = chunk.get("_external_id")
             
@@ -113,26 +112,26 @@ def get_full_judgments(retrieved_chunks, all_chunks):
                     "rule_number": metadata.get("rule_number", ""),
                     "notification_number": metadata.get("notification_number", ""),
                     "case_note": metadata.get("case_note", ""),
-                    "full_text": chunk["text"],  # Already has metadata prepended
+                    "full_text": chunk["text"],
                     "external_id": external_id,
                     "_is_complete": True
                 }
         
-        # Case 2: Regular judgment chunk (need to assemble)
+        # Case 2: Regular judgment chunk
         else:
             external_id = chunk.get("metadata", {}).get("external_id")
             
             if not external_id or external_id in full_judgments:
                 continue
             
-            # OPTIMIZED: Use index lookup instead of linear scan over 450MB
-            index = get_index(all_chunks)
-            related_chunks = index.judgment_by_external_id.get(external_id, [])
+            related_chunks = [
+                c for c in all_chunks
+                if c.get("chunk_type") == "judgment" and 
+                   c.get("metadata", {}).get("external_id") == external_id
+            ]
             
             if related_chunks:
-                # Combine original chunks (no metadata headers)
                 full_text = "\n\n".join(c["text"] for c in related_chunks)
-                
                 metadata = related_chunks[0].get("metadata", {})
                 
                 full_judgments[external_id] = {
@@ -154,7 +153,7 @@ def get_full_judgments(retrieved_chunks, all_chunks):
                     "rule_number": metadata.get("rule_number", ""),
                     "notification_number": metadata.get("notification_number", ""),
                     "case_note": metadata.get("case_note", ""),
-                    "full_text": full_text,  # Clean original text
+                    "full_text": full_text,
                     "external_id": external_id,
                     "_is_complete": False
                 }
@@ -163,9 +162,12 @@ def get_full_judgments(retrieved_chunks, all_chunks):
 
 
 async def chat(query, store, all_chunks, history=[], profile_summary=None):
-    # Offload retrieval to thread pool
-    retrieved = await run_in_threadpool(
-        retrieve,
+    """
+    Enhanced chat with automatic citation attribution
+    """
+    
+    # Step 1: Retrieve
+    retrieved = retrieve(
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
@@ -177,8 +179,6 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
     # Step 3: Build prompt
-    # The prompt builder will receive complete judgment chunks in primary/supporting
-    # and will render them using chunk['text'] which already has metadata prepended
     prompt = build_structured_prompt(
         query=query,
         primary=primary,
@@ -187,19 +187,37 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         profile_summary=profile_summary
     )
 
-    # Offload Bedrock call
-    answer = await run_in_threadpool(call_bedrock, prompt)
+    # Step 4: Call LLM
+    raw_answer = call_bedrock(prompt)
     
-    # Offload reassembly to thread pool
-    full_judgments = await run_in_threadpool(get_full_judgments, retrieved, all_chunks)
+    logger.info("=" * 80)
+    logger.info("RAW LLM RESPONSE (before citation attribution):")
+    logger.info(raw_answer[:500] + "..." if len(raw_answer) > 500 else raw_answer)
+    logger.info("=" * 80)
+    
+    # Step 5: Extract party pairs and find citations
+    enhanced_answer, party_citations = extract_and_attribute_citations(raw_answer, all_chunks)
+    
+    logger.info("=" * 80)
+    logger.info("ENHANCED RESPONSE (with citation attribution):")
+    logger.info(enhanced_answer[:500] + "..." if len(enhanced_answer) > 500 else enhanced_answer)
+    logger.info(f"Party citations found: {len(party_citations)}")
+    logger.info("=" * 80)
+    
+    # Step 6: Get complete judgments
+    full_judgments = get_full_judgments(retrieved, all_chunks)
 
-    return answer, retrieved, full_judgments
+    # Return enhanced answer (with citations appended) and party_citations metadata
+    return enhanced_answer, retrieved, full_judgments, party_citations
 
 
 async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
-    # Offload retrieval
-    retrieved = await run_in_threadpool(
-        retrieve,
+    """
+    Streaming chat with citation attribution at the end
+    """
+    
+    # Step 1: Retrieve
+    retrieved = retrieve(
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
@@ -229,10 +247,38 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         "full_judgments": full_judgments
     }
 
-    # Step 5: Stream LLM response
+    # Step 5: Stream LLM response and collect full answer
+    full_answer = ""
     for chunk in call_bedrock_stream(prompt):
+        full_answer += chunk
         await asyncio.sleep(0.01)
         yield {
             "type": "content",
             "delta": chunk
+        }
+    
+    logger.info("=" * 80)
+    logger.info("STREAMING: Full answer collected, extracting citations...")
+    logger.info("=" * 80)
+    
+    # Step 6: Extract citations from full answer
+    _, party_citations = extract_and_attribute_citations(full_answer, all_chunks)
+    
+    # Step 7: If citations found, stream the attribution section
+    if party_citations:
+        from services.chat.response_citation_extractor import format_citation_attribution
+        citation_text = format_citation_attribution(party_citations)
+        
+        logger.info(f"Streaming citation attribution ({len(citation_text)} chars)")
+        
+        # Stream the citation section
+        yield {
+            "type": "content",
+            "delta": citation_text
+        }
+        
+        # Also send metadata about citations
+        yield {
+            "type": "citations",
+            "party_citations": party_citations
         }
