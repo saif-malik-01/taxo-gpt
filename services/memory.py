@@ -1,4 +1,8 @@
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from services.database import get_redis, AsyncSessionLocal

@@ -280,8 +280,8 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     
     # Step 7: If citations found, stream the attribution section
     if party_citations:
-        from services.chat.response_citation_extractor import format_citation_attribution
-        citation_text = format_citation_attribution(party_citations)
+        from services.chat.response_citation_extractor import format_citation_section
+        citation_text = format_citation_section(party_citations)
         
         logger.info(f"Streaming citation attribution ({len(citation_text)} chars)")
         
@@ -291,8 +291,14 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
             "delta": citation_text
         }
         
+        
+        # Convert tuple keys to string for JSON serialization
+        party_citations_json = {}
+        for (p1, p2), citations in party_citations.items():
+            party_citations_json[f"{p1} vs {p2}"] = citations
+
         # Also send metadata about citations
         yield {
             "type": "citations",
-            "party_citations": party_citations
+            "party_citations": party_citations_json
         }
