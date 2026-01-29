@@ -220,7 +220,13 @@
 
 # async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
 #     """
-#     Streaming chat with citation attribution at the end
+#     Streaming chat with citation attribution
+    
+#     UPDATED FLOW:
+#     1. Retrieve sources
+#     2. Generate initial response (collect fully)
+#     3. Extract citations and re-attribute
+#     4. Stream the ENHANCED response character by character
 #     """
     
 #     # Step 1: Retrieve
@@ -246,7 +252,7 @@
 #         profile_summary=profile_summary
 #     )
 
-#     # Offload reassembly
+#     # Offload reassembly to thread pool
 #     full_judgments = await run_in_threadpool(get_full_judgments, retrieved, all_chunks)
 
 #     # Yield retrieval info first
@@ -256,53 +262,59 @@
 #         "full_judgments": full_judgments
 #     }
 
-#     # Step 5: Stream LLM response and collect full answer
-#     full_answer = ""
-#     # Pass system prompts and temperature=0
+#     # Step 4: Collect FULL initial response (non-streaming)
+#     logger.info("=" * 80)
+#     logger.info("STREAMING: Collecting initial LLM response...")
+#     logger.info("=" * 80)
+    
+#     initial_response = ""
 #     for chunk in call_bedrock_stream(
 #         prompt=user_prompt,
 #         system_prompts=[system_prompt],
 #         temperature=0.0
 #     ):
-#         full_answer += chunk
-#         await asyncio.sleep(0.01)
+#         initial_response += chunk
+    
+#     logger.info(f"Initial response collected: {len(initial_response)} chars")
+    
+#     # Step 5: Extract citations and re-attribute
+#     logger.info("Extracting and attributing citations...")
+    
+#     enhanced_response, party_citations = await run_in_threadpool(
+#         extract_and_attribute_citations,
+#         initial_response,
+#         all_chunks
+#     )
+    
+#     logger.info(f"Enhanced response ready: {len(enhanced_response)} chars")
+#     logger.info(f"Party citations found: {len(party_citations)}")
+    
+#     # Step 6: Stream the ENHANCED response
+#     logger.info("Streaming enhanced response...")
+    
+#     # Stream character by character with small delays
+#     for char in enhanced_response:
+#         await asyncio.sleep(0.01)  # Small delay for smooth streaming
 #         yield {
 #             "type": "content",
-#             "delta": chunk
+#             "delta": char
 #         }
     
-#     logger.info("=" * 80)
-#     logger.info("STREAMING: Full answer collected, extracting citations...")
-#     logger.info("=" * 80)
-    
-#     # Step 6: Extract citations from full answer
-#     _, party_citations = extract_and_attribute_citations(full_answer, all_chunks)
-    
-#     # Step 7: If citations found, stream the attribution section
+#     # Step 7: Send citation metadata
 #     if party_citations:
-#         from services.chat.response_citation_extractor import format_citation_section
-#         citation_text = format_citation_section(party_citations)
-        
-#         logger.info(f"Streaming citation attribution ({len(citation_text)} chars)")
-        
-#         # Stream the citation section
-#         yield {
-#             "type": "content",
-#             "delta": citation_text
-#         }
-        
-        
 #         # Convert tuple keys to string for JSON serialization
 #         party_citations_json = {}
 #         for (p1, p2), citations in party_citations.items():
 #             party_citations_json[f"{p1} vs {p2}"] = citations
 
-#         # Also send metadata about citations
 #         yield {
 #             "type": "citations",
 #             "party_citations": party_citations_json
 #         }
-
+    
+#     logger.info("=" * 80)
+#     logger.info("STREAMING COMPLETE")
+#     logger.info("=" * 80)
 
 import asyncio
 from services.retrieval.hybrid import retrieve
@@ -528,11 +540,7 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     """
     Streaming chat with citation attribution
     
-    UPDATED FLOW:
-    1. Retrieve sources
-    2. Generate initial response (collect fully)
-    3. Extract citations and re-attribute
-    4. Stream the ENHANCED response character by character
+    OPTIMIZED FOR FRONTEND - Sends larger chunks (50 chars at a time)
     """
     
     # Step 1: Retrieve
@@ -568,7 +576,7 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         "full_judgments": full_judgments
     }
 
-    # Step 4: Collect FULL initial response (non-streaming)
+    # Step 4: Collect FULL initial response
     logger.info("=" * 80)
     logger.info("STREAMING: Collecting initial LLM response...")
     logger.info("=" * 80)
@@ -595,15 +603,18 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     logger.info(f"Enhanced response ready: {len(enhanced_response)} chars")
     logger.info(f"Party citations found: {len(party_citations)}")
     
-    # Step 6: Stream the ENHANCED response
+    # Step 6: Stream the ENHANCED response in chunks of 50 characters
+    # This is much more efficient than char-by-char and works better with frontend
     logger.info("Streaming enhanced response...")
     
-    # Stream character by character with small delays
-    for char in enhanced_response:
-        await asyncio.sleep(0.01)  # Small delay for smooth streaming
+    CHUNK_SIZE = 50  # Characters per chunk
+    
+    for i in range(0, len(enhanced_response), CHUNK_SIZE):
+        chunk_text = enhanced_response[i:i + CHUNK_SIZE]
+        
         yield {
             "type": "content",
-            "delta": char
+            "delta": chunk_text
         }
     
     # Step 7: Send citation metadata
