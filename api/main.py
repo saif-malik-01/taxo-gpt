@@ -207,11 +207,15 @@ async def ask_gst_stream(
 
     async def stream_generator():
         full_answer = ""
-        
         # 4. Save User Query
         await add_message(session_id, "user", payload.question, user_id)
-        
-        # 5. Stream response
+
+        # containers to capture metadata
+        sources = []
+        full_judgments = {}
+        party_citations = None
+
+        # 5. Stream response: send content chunks immediately
         async for chunk in chat_stream(
             query=payload.question,
             store=vector_store,
@@ -219,20 +223,52 @@ async def ask_gst_stream(
             history=history,
             profile_summary=profile_summary
         ):
-            # Collect full answer from content chunks
-            if chunk["type"] == "content":
-                full_answer += chunk["delta"]
-            
-            # Add session_id to first chunk
-            if chunk["type"] == "retrieval":
-                chunk["session_id"] = session_id
+            ctype = chunk.get("type")
 
+            if ctype == "content":
+                delta = chunk.get("delta", "")
+                full_answer += delta
+                yield json.dumps({"type": "content", "delta": delta}) + "\n"
+                continue
+
+            # capture retrieval sources (do not forward as separate line)
+            if ctype == "retrieval":
+                sources = chunk.get("sources", []) or []
+                # keep session_id for clients if needed
+                continue
+
+            if ctype == "metadata":
+                full_judgments = chunk.get("full_judgments", {}) or {}
+                continue
+
+            if ctype == "citations":
+                party_citations = chunk.get("party_citations", {})
+                continue
+
+            # forward anything else unchanged
             yield json.dumps(chunk) + "\n"
 
-        # 6. Save AI Response
-        await add_message(session_id, "assistant", full_answer, user_id)
+        # 6. After streaming, save assistant message to DB to obtain message_id
+        assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
+        message_id = getattr(assistant_msg, "id", None)
 
-        # 7. Background Task
+        # 7. Emit retrieval/metadata line as final NDJSON object
+        retrieval_obj = {
+            "type": "retrieval",
+            "sources": sources,
+            "full_judgments": full_judgments,
+            "message_id": message_id,
+            "session_id": session_id,
+            "id": message_id
+        }
+
+        # include citations if available
+        if party_citations:
+            retrieval_obj["party_citations"] = party_citations
+
+        yield json.dumps(retrieval_obj) + "\n"
+
+        # 8. Background task: update profile
         background_tasks.add_task(auto_update_profile, user_id, payload.question, full_answer)
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
