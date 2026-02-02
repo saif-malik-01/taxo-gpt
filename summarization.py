@@ -7,7 +7,7 @@ from docling.document_converter import DocumentConverter
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import PdfFormatOption
-from typing import Optional
+from typing import Optional, List
 from PIL import Image
 from dotenv import load_dotenv
 import re
@@ -21,11 +21,11 @@ from pydantic import BaseModel
 load_dotenv()
 
 # ============================================================================
-# DOCUMENT PROCESSOR - WITH JSON TABLE EXTRACTION
+# DOCUMENT PROCESSOR - WITH JSON TABLE EXTRACTION (OPTIMIZED)
 # ============================================================================
 
 class AmazonNovaClient:
-    """AWS Bedrock client"""
+    """AWS Bedrock client for vision analysis"""
     
     def __init__(self, model_id: str = "amazon.nova-lite-v1:0", region: str = None):
         self.model_id = model_id
@@ -34,6 +34,7 @@ class AmazonNovaClient:
         self.client = boto3.client('bedrock-runtime', region_name=region)
     
     def describe_image(self, pil_image: Image.Image, prompt: str = None) -> str:
+        """Describe image using Amazon Nova with optimized settings"""
         max_size = 2048
         if max(pil_image.size) > max_size:
             pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -43,8 +44,8 @@ class AmazonNovaClient:
         img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
         if prompt is None:
-            prompt = """Extract information from this image/diagram/flowchart.
-Extract: all visible text, visual elements, flow, meaning, labels."""
+            prompt = """Extract all information from this image/diagram/flowchart.
+Include: all visible text, visual elements, flow, meaning, labels, annotations."""
 
         request_body = {
             "messages": [{
@@ -75,7 +76,7 @@ Extract: all visible text, visual elements, flow, meaning, labels."""
 
 
 class DocumentProcessor:
-    """Document processor for extraction with JSON table support"""
+    """Document processor with improved text extraction and JSON table support"""
     
     def __init__(self, bedrock_model: str = "amazon.nova-lite-v1:0", bedrock_region: str = None):
         if bedrock_region is None:
@@ -83,6 +84,7 @@ class DocumentProcessor:
         
         self.vision_client = AmazonNovaClient(bedrock_model, bedrock_region)
         
+        # Optimized pipeline settings
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = True
         pipeline_options.generate_picture_images = True
@@ -94,11 +96,21 @@ class DocumentProcessor:
             }
         )
     
-    def _normalize_text(self, text: str) -> str:
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text for better readability"""
+        if not text:
+            return ""
+        
+        # Replace tabs with spaces
         text = text.replace('\t', ' ')
+        
+        # Normalize multiple spaces to single space
         text = re.sub(r' {2,}', ' ', text)
+        
+        # Split into lines and process
         lines = [line.strip() for line in text.split('\n')]
         
+        # Remove excessive blank lines (keep max 1 consecutive blank line)
         result = []
         prev_blank = False
         for line in lines:
@@ -113,38 +125,75 @@ class DocumentProcessor:
         return '\n'.join(result)
     
     def extract_text(self, file_path: str) -> str:
-        """Extract text from document - returns plain text with JSON tables"""
+        """Extract text from document - returns clean text with JSON tables"""
         result = self.converter.convert(file_path)
         self.current_document = result.document
         
-        all_content = []
+        content_blocks = []
         
         for item, _ in result.document.iterate_items():
             element_type = type(item).__name__
             
             if element_type == "TableItem":
-                all_content.append(self._format_table_as_json(item))
+                # Extract table as JSON
+                table_json = self._format_table_as_json(item)
+                if table_json:
+                    content_blocks.append(table_json)
+            
             elif element_type == "PictureItem":
-                all_content.append(self._process_image(item))
+                # Process images/diagrams
+                image_desc = self._process_image(item)
+                if image_desc:
+                    content_blocks.append(image_desc)
+            
             else:
+                # Regular text content
                 if hasattr(item, 'text') and item.text.strip():
-                    all_content.append(item.text.strip())
+                    cleaned_text = self._clean_text(item.text.strip())
+                    if cleaned_text:
+                        content_blocks.append(cleaned_text)
         
-        return '\n\n'.join(all_content)
+        # Join all content with double newlines for readability
+        full_text = '\n\n'.join(content_blocks)
+        
+        # Final cleanup pass
+        return self._clean_text(full_text)
+    
+    def extract_text_from_multiple_files(self, file_paths: List[str], filenames: List[str]) -> str:
+        """Extract and combine text from multiple documents"""
+        combined_text_parts = []
+        
+        for idx, (file_path, filename) in enumerate(zip(file_paths, filenames), 1):
+            # Add document separator with filename
+            separator = f"\n\n{'='*80}\nDOCUMENT {idx}: {filename}\n{'='*80}\n\n"
+            
+            # Extract text from this document
+            try:
+                extracted_text = self.extract_text(file_path)
+                if extracted_text.strip():
+                    combined_text_parts.append(separator + extracted_text)
+                else:
+                    combined_text_parts.append(separator + f"[No text could be extracted from {filename}]")
+            except Exception as e:
+                combined_text_parts.append(separator + f"[Error extracting text from {filename}: {str(e)}]")
+        
+        # Combine all documents
+        return '\n\n'.join(combined_text_parts)
     
     def _format_table_as_json(self, table_item) -> str:
-        """Convert table to row-wise JSON format"""
+        """Convert table to clean row-wise JSON format"""
         try:
-            # Export table to markdown first to get structured data
+            # Export table to markdown first
             md = table_item.export_to_markdown(doc=self.current_document)
             
             # Parse markdown table to JSON
             lines = [line.strip() for line in md.strip().split('\n') if line.strip()]
             
             if len(lines) < 2:
+                # Fallback to markdown if too short
                 return f"\n[TABLE]\n{md}\n[/TABLE]\n"
             
-            # Extract headers
+            # Extract headers from first line
             headers = [h.strip() for h in lines[0].split('|') if h.strip()]
             
             # Skip separator line (line 1)
@@ -156,12 +205,14 @@ class DocumentProcessor:
                     row_dict = {}
                     for i, header in enumerate(headers):
                         if i < len(cells):
-                            row_dict[header] = cells[i]
+                            # Clean cell content
+                            cell_value = cells[i].strip()
+                            row_dict[header] = cell_value
                         else:
                             row_dict[header] = ""
                     rows_json.append(row_dict)
             
-            # Format as JSON
+            # Format as clean JSON
             json_output = json.dumps(rows_json, indent=2, ensure_ascii=False)
             return f"\n[TABLE_JSON]\n{json_output}\n[/TABLE_JSON]\n"
             
@@ -174,10 +225,12 @@ class DocumentProcessor:
                 return f"[TABLE Error: {str(e)}]"
     
     def _process_image(self, picture_item) -> str:
+        """Process images and flowcharts"""
         if picture_item.image and picture_item.image.pil_image:
             try:
                 desc = self.vision_client.describe_image(picture_item.image.pil_image)
-                return f"\n[IMAGE/FLOWCHART]\n{self._normalize_text(desc)}\n[/IMAGE/FLOWCHART]\n"
+                cleaned_desc = self._clean_text(desc)
+                return f"\n[IMAGE/FLOWCHART]\n{cleaned_desc}\n[/IMAGE/FLOWCHART]\n"
             except Exception as e:
                 return f"[IMAGE Error: {str(e)}]"
         return ""
@@ -198,6 +251,12 @@ class DocumentAnalyzer:
     
     def analyze(self, extracted_text: str, user_question: Optional[str] = None) -> dict:
         """Analyze legal document with optimized issue detection and comprehensive summary"""
+        
+        # Truncate text if too long (leave room for prompt + response)
+        # 32k tokens ≈ 24k words ≈ 120k chars
+        MAX_TEXT_LENGTH = 100000  # Conservative limit
+        if len(extracted_text) > MAX_TEXT_LENGTH:
+            extracted_text = extracted_text[:MAX_TEXT_LENGTH] + "\n\n[...Document truncated due to length...]"
         
         # Build optimized analysis prompt
         prompt = f"""You are analyzing a legal document. Extract information ONLY from the document text provided. Do not infer or generate information.
@@ -274,7 +333,7 @@ you MUST return null.
 
 3. USER QUESTION RESPONSE (if user asked a question):
    - If the answer exists in the document text → provide the answer
-   - If the answer does NOT exist in document text → respond: "Should I resolve your query using my knowledge?"
+   - If the answer does NOT exist in document text → respond: "It would we better to answer your query using my knowledge?"
 
 4. ISSUES/ALLEGATIONS DETECTION (STRICT CRITERIA):
    
@@ -331,7 +390,7 @@ CRITICAL RULES:
 - Use document text only, no external knowledge
 """
 
-        # Call Qwen3-Next via Bedrock Converse API
+        # Call Qwen3-Next via Bedrock Converse API with increased max tokens
         request_body = {
             "messages": [
                 {
@@ -340,7 +399,7 @@ CRITICAL RULES:
                 }
             ],
             "inferenceConfig": {
-                "maxTokens": 4096,
+                "maxTokens": 32000,  # Increased from 4096 to 32000
                 "temperature": 0.1,
                 "topP": 0.9
             }
@@ -440,9 +499,9 @@ CRITICAL RULES:
 # ============================================================================
 
 app = FastAPI(
-    title="Legal Document Analysis API - Optimized",
-    description="Analyze legal documents with optimized issue detection and comprehensive summaries",
-    version="5.0.0"
+    title="Legal Document Analysis API - Optimized with Multi-File Support",
+    description="Analyze single or multiple legal documents with improved text extraction and 32k token support",
+    version="5.2.0"
 )
 
 # Initialize processors (singleton)
@@ -461,28 +520,37 @@ class AnalysisResponse(BaseModel):
 
 @app.post("/analyze-document", response_model=AnalysisResponse)
 async def analyze_document(
-    file: UploadFile = File(..., description="Legal document (PDF, DOCX, PPTX, XLSX, HTML, Images)"),
-    user_question: Optional[str] = Form(None, description="Optional: Question about the document")
+    files: List[UploadFile] = File(..., description="Legal document(s) - single or multiple files (PDF, DOCX, PPTX, XLSX, HTML, Images)"),
+    user_question: Optional[str] = Form(None, description="Optional: Question about the document(s)")
 ):
     """
-    Analyze legal documents with optimized structure
+    Analyze single or multiple legal documents with optimized structure and improved text extraction
     
     **Features:**
+    - **Multi-file support:** Upload one or more documents - they will be combined for analysis
+    - Clean, normalized text extraction
     - Comprehensive document summary (entire document in 4-7 sentences)
     - Smart issue detection (only genuine allegations/violations, not routine notices)
     - Conditional party extraction (only if explicitly present)
     - Row-wise JSON table extraction
     - Single formatted response for frontend display
+    - 32k max token support for analysis
+    
+    **Multi-File Processing:**
+    - Each document is extracted separately
+    - Documents are combined with clear separators (Document 1, Document 2, etc.)
+    - Combined text is passed to the analyzer for comprehensive analysis
+    - Summary covers all documents together
     
     **Output Structure:**
-    1. extracted_text: Full document text with JSON tables
+    1. extracted_text: Full combined text from all documents with JSON tables (cleaned and normalized)
     2. structured_analysis: JSON object with individual fields
     3. formatted_response: Single formatted text combining all non-empty fields (for frontend display)
-    4. metadata: File and processing information
+    4. metadata: File and processing information for all documents
     
     **formatted_response structure:**
     - PARTY IDENTIFICATION (if sender/recipient present)
-    - DOCUMENT SUMMARY (always present)
+    - DOCUMENT SUMMARY (always present - covers all documents)
     - YOUR QUESTION (if user asked question)
     - ISSUES/ALLEGATIONS (only if genuine issues found)
     
@@ -499,36 +567,54 @@ async def analyze_document(
     - Requests for clarification
     """
     
-    temp_file = None
+    temp_files = []
     
     try:
-        # Validate file extension
-        filename = file.filename.lower()
+        # Supported file extensions
         supported = ['.pdf', '.docx', '.pptx', '.xlsx', '.html', '.png', '.jpg', '.jpeg', '.tiff', '.bmp']
         
-        if not any(filename.endswith(ext) for ext in supported):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file format. Supported: {', '.join(supported)}"
-            )
+        # Validate and save all uploaded files
+        file_paths = []
+        filenames = []
+        total_size = 0
         
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
-            temp_file = tmp.name
-            shutil.copyfileobj(file.file, tmp)
+        for file in files:
+            filename = file.filename.lower()
+            
+            # Validate file extension
+            if not any(filename.endswith(ext) for ext in supported):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file format for '{file.filename}'. Supported: {', '.join(supported)}"
+                )
+            
+            # Save uploaded file temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+                temp_file = tmp.name
+                temp_files.append(temp_file)
+                shutil.copyfileobj(file.file, tmp)
+                
+                file_paths.append(temp_file)
+                filenames.append(file.filename)
+                total_size += os.path.getsize(temp_file)
         
-        # Step 1: Extract text from document
-        print(f"Extracting text from {filename}...")
-        extracted_text = doc_processor.extract_text(temp_file)
+        # Step 1: Extract text from all documents and combine them
+        print(f"Extracting text from {len(files)} document(s)...")
+        if len(file_paths) == 1:
+            # Single file - extract normally
+            extracted_text = doc_processor.extract_text(file_paths[0])
+        else:
+            # Multiple files - extract and combine
+            extracted_text = doc_processor.extract_text_from_multiple_files(file_paths, filenames)
         
         if not extracted_text.strip():
             raise HTTPException(
                 status_code=422,
-                detail="No text could be extracted from the document"
+                detail="No text could be extracted from the document(s)"
             )
         
-        # Step 2: Analyze with Qwen3-Next-80B-A3B
-        print(f"Analyzing document...")
+        # Step 2: Analyze with Qwen3-Next-80B-A3B (with 32k max tokens)
+        print(f"Analyzing document(s)...")
         structured_analysis = doc_analyzer.analyze(extracted_text, user_question)
         
         # Step 3: Format response for frontend
@@ -541,10 +627,12 @@ async def analyze_document(
             structured_analysis=structured_analysis,
             formatted_response=formatted_response,
             metadata={
-                "filename": file.filename,
-                "content_type": file.content_type,
-                "size_bytes": os.path.getsize(temp_file),
-                "llm_model": "qwen.qwen3-next-80b-a3b"
+                "num_files": len(files),
+                "filenames": [f.filename for f in files],
+                "content_types": [f.content_type for f in files],
+                "total_size_bytes": total_size,
+                "llm_model": "qwen.qwen3-next-80b-a3b",
+                "max_tokens": 32000
             }
         )
         
@@ -554,12 +642,13 @@ async def analyze_document(
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
     
     finally:
-        # Cleanup temp file
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
+        # Cleanup all temp files
+        for temp_file in temp_files:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
 
 
 @app.get("/health")
@@ -567,9 +656,11 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "Legal Document Analysis API - Optimized",
-        "version": "5.0.0",
-        "llm_model": "Qwen3-Next-80B-A3B"
+        "service": "Legal Document Analysis API - Optimized with Multi-File Support",
+        "version": "5.2.0",
+        "llm_model": "Qwen3-Next-80B-A3B",
+        "max_tokens": 32000,
+        "features": ["single_file", "multi_file", "32k_tokens", "improved_text_extraction"]
     }
 
 
@@ -584,7 +675,9 @@ async def supported_formats():
             "Excel (.xlsx)",
             "HTML (.html)",
             "Images (.png, .jpg, .jpeg, .tiff, .bmp)"
-        ]
+        ],
+        "multi_file_support": True,
+        "note": "You can upload multiple files at once. They will be combined and analyzed together."
     }
 
 
@@ -620,15 +713,15 @@ async def response_structure():
     """Explain the response structure"""
     return {
         "response_fields": {
-            "extracted_text": "Full document text with [TABLE_JSON] sections",
+            "extracted_text": "Full combined text from all documents with [TABLE_JSON] sections (cleaned and normalized)",
             "structured_analysis": "JSON object with individual fields (clean, no empty fields)",
             "formatted_response": "Single clean text merging all non-empty fields (ready for frontend display)",
-            "metadata": "File and processing information"
+            "metadata": "File and processing information for all documents"
         },
         "structured_analysis_fields": {
-            "sender": "Present only if explicitly mentioned in document",
-            "recipient": "Present only if explicitly mentioned in document",
-            "summary": "Always present - comprehensive 4-7 sentence summary of entire document",
+            "sender": "Present only if explicitly mentioned in document(s)",
+            "recipient": "Present only if explicitly mentioned in document(s)",
+            "summary": "Always present - comprehensive 4-7 sentence summary of entire document(s)",
             "user_question_response": "Present only if user asked a question",
             "issues": "Present only if genuine allegations/violations found",
             "issues_prompt": "Present only when issues are present"
@@ -639,7 +732,7 @@ async def response_structure():
                 "From: ... (if sender present)",
                 "To: ... (if recipient present)",
                 "",
-                "Summary text...",
+                "Summary text covering all documents...",
                 "",
                 "Answer: ... (if user asked question)",
                 "",
@@ -648,20 +741,18 @@ async def response_structure():
                 "2. Issue two",
                 "",
                 "Should I prepare the reply or guide for these issues?"
+            ]
+        },
+        "multi_file_processing": {
+            "description": "When multiple files are uploaded",
+            "process": [
+                "1. Each document is extracted separately",
+                "2. Documents are combined with clear separators",
+                "3. Combined text shows: DOCUMENT 1: filename.pdf, DOCUMENT 2: filename2.pdf, etc.",
+                "4. Analyzer processes all documents together",
+                "5. Summary and analysis cover all documents comprehensively"
             ],
-            "example_full": """From: Income Tax Department, Mumbai
-To: ABC Pvt Ltd (GSTIN: 27XXXXX)
-
-This is a system-generated notice under Rule 88C of GST law...
-
-Answer: The deadline for response is 7 days from notice date.
-
-Issues:
-1. Tax evasion allegation under Section 74
-2. Penalty of Rs 5,00,000 proposed
-
-Should I prepare the reply or guide for these issues?""",
-            "example_simple": """This is a system-generated notice under Rule 88C of GST law, intimating the taxpayer of differential tax liability..."""
+            "example_separator": "================================================================================\nDOCUMENT 1: notice.pdf\n================================================================================\n\n[extracted text from notice.pdf]\n\n\n================================================================================\nDOCUMENT 2: reply.pdf\n================================================================================\n\n[extracted text from reply.pdf]"
         },
         "usage": {
             "for_json_processing": "Use structured_analysis field",
@@ -681,22 +772,30 @@ if __name__ == "__main__":
         exit(1)
     
     print("\n" + "="*70)
-    print("LEGAL DOCUMENT ANALYSIS API - OPTIMIZED VERSION")
+    print("LEGAL DOCUMENT ANALYSIS API - OPTIMIZED WITH MULTI-FILE SUPPORT")
     print("="*70)
-    print("Version: 5.0.0")
+    print("Version: 5.2.0")
     print("LLM Model: Qwen3-Next-80B-A3B-Instruct")
-    print("\nOptimizations:")
+    print("\nFeatures:")
+    print("  ✓ Multi-file upload support (analyze multiple documents together)")
+    print("  ✓ Improved text extraction with better normalization")
+    print("  ✓ Increased max tokens to 32,000 (from 4,096)")
     print("  ✓ Comprehensive summaries (4-7 sentences covering entire document)")
     print("  ✓ Smart issue detection (only genuine allegations/violations)")
     print("  ✓ Clean response structure (no empty fields)")
     print("  ✓ Row-wise JSON table extraction")
     print("  ✓ Conditional party identification")
+    print("\nMulti-File Processing:")
+    print("  • Upload 1 or more documents at once")
+    print("  • Each document is extracted separately")
+    print("  • Documents are combined with clear separators")
+    print("  • Analysis covers all documents comprehensively")
     print("\nIssue Detection:")
     print("  • Includes: Allegations, violations, penalties, legal cases")
     print("  • Excludes: Routine notices, administrative discrepancies")
     print("="*70)
     print("Endpoints:")
-    print("  POST /analyze-document")
+    print("  POST /analyze-document  (accepts single or multiple files)")
     print("  GET  /health")
     print("  GET  /supported-formats")
     print("  GET  /issue-detection-criteria")
