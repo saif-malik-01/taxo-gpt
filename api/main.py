@@ -299,6 +299,37 @@ async def get_history(
     return history
 
 
+@app.get("/chat/sessions")
+async def list_sessions(
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    # Return list of sessions for the authenticated user
+    email = user.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    res = await db.execute(select(User).where(User.email == email))
+    db_user = res.scalars().first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    res = await db.execute(
+        select(ChatSession).where(ChatSession.user_id == db_user.id).order_by(ChatSession.created_at.desc())
+    )
+    sessions = res.scalars().all()
+
+    out = []
+    for s in sessions:
+        out.append({
+            "id": s.id,
+            "title": s.title,
+            "created_at": s.created_at.isoformat() if s.created_at else None
+        })
+
+    return out
+
+
 @app.delete("/chat/session")
 async def delete_chat(
     session_id: str,
