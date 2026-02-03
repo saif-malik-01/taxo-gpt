@@ -12,3 +12,6 @@ alembic
 pydantic-settings
 passlib[bcrypt]
 multipart
+pillow
+docling
+python-multipart

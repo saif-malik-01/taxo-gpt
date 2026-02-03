@@ -1,7 +1,11 @@
+import os
+# Configure Hugging Face cache for cross-platform compatibility
+os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
+os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), '..', '..', '.hf_cache')
+
 import json
 import base64
 import boto3
-import os
 import re
 from io import BytesIO
 from typing import Optional, List

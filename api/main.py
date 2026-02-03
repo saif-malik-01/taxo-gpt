@@ -1,4 +1,9 @@
 import os
+
+# Configure Hugging Face cache for cross-platform compatibility
+os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
+os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), '..', '.hf_cache')
+
 import json
 import uuid
 import tempfile
@@ -66,6 +71,8 @@ doc_analyzer = DocumentAnalyzer()
 class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
+    # Document context: can include extracted text from uploaded documents
+    document_context: Optional[str] = None
 
 class SourceChunk(BaseModel):
     id: str
@@ -201,13 +208,25 @@ async def ask_gst(
 
 @app.post("/chat/ask/stream")
 async def ask_gst_stream(
-    payload: ChatRequest,
-    background_tasks: BackgroundTasks,
+    question: str = Form(...),
+    session_id: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+    background_tasks: BackgroundTasks = None,
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Unified chat stream endpoint with optional document analysis.
+    
+    Usage:
+    - Without documents: Form data with question and optional session_id
+    - With documents: Form data with question, files, and optional session_id
+    
+    All features (chat history, profile, DB save) work with or without documents.
+    """
+    
     # 1. Manage Session
-    session_id = payload.session_id or str(uuid.uuid4())
+    session_id = session_id or str(uuid.uuid4())
     
     # 2. Get User ID
     email = user.get("sub")
@@ -218,28 +237,107 @@ async def ask_gst_stream(
     
     user_id = db_user.id
 
-    # 3. Fetch Context
+    # 3. Process documents if provided
+    document_context = None
+    document_metadata = None
+    document_analysis = None
+    temp_files = []
+
+    if files and len(files) > 0:
+        try:
+            supported = {'.pdf', '.docx', '.pptx', '.xlsx', '.html', '.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
+            file_paths = []
+            filenames = []
+            total_size = 0
+
+            for file in files:
+                ext = os.path.splitext(file.filename)[1].lower()
+                if ext not in supported:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported file format: {file.filename}. Supported: {', '.join(sorted(supported))}"
+                    )
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    temp_files.append(tmp.name)
+                    shutil.copyfileobj(file.file, tmp)
+                    file_paths.append(tmp.name)
+                    filenames.append(file.filename)
+                    total_size += os.path.getsize(tmp.name)
+
+            # Extract text from document(s)
+            if len(file_paths) == 1:
+                document_context = doc_processor.extract_text(file_paths[0])
+            else:
+                document_context = doc_processor.extract_text_from_multiple_files(file_paths, filenames)
+
+            if not document_context or not document_context.strip():
+                raise HTTPException(status_code=422, detail="No text could be extracted from the document(s)")
+
+            # Run document analysis to extract structured insights
+            try:
+                analysis = doc_analyzer.analyze(document_context, user_question=question)
+                formatted = doc_analyzer.format_response_for_frontend(analysis)
+                document_analysis = {
+                    "formatted": formatted,
+                    "structured": analysis
+                }
+                print(f"✓ Document analysis completed. Formatted length: {len(formatted)}")
+            except Exception as e:
+                # Log but don't fail if analysis fails
+                import logging
+                logging.error(f"Document analysis failed: {str(e)}", exc_info=True)
+                print(f"✗ Document analysis error: {str(e)}")
+                document_analysis = None
+
+            document_metadata = {
+                "num_files": len(files),
+                "filenames": filenames,
+                "content_types": [f.content_type for f in files],
+                "total_size_bytes": total_size,
+                "has_analysis": document_analysis is not None
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Document processing error: {str(e)}")
+        finally:
+            # Cleanup temp files
+            for fp in temp_files:
+                if fp and os.path.exists(fp):
+                    try:
+                        os.unlink(fp)
+                    except OSError:
+                        pass
+
+    # 4. Fetch Context
     profile = await get_user_profile(user_id)
     profile_summary = profile.dynamic_summary if profile else None
     history = await get_session_history(session_id)
 
     async def stream_generator():
         full_answer = ""
-        # 4. Save User Query
-        await add_message(session_id, "user", payload.question, user_id)
+        # 5. Save User Query (include document info in message if documents were provided)
+        user_message = question
+        if document_metadata:
+            user_message += f"\n\n[Documents: {', '.join(document_metadata['filenames'])}]"
+        
+        await add_message(session_id, "user", user_message, user_id)
 
         # containers to capture metadata
         sources = []
         full_judgments = {}
         party_citations = None
 
-        # 5. Stream response: send content chunks immediately
+        # 5a. Stream chat response with optional document context
         async for chunk in chat_stream(
-            query=payload.question,
+            query=question,
             store=vector_store,
             all_chunks=ALL_CHUNKS,
             history=history,
-            profile_summary=profile_summary
+            profile_summary=profile_summary,
+            document_context=document_context  # Pass extracted document text
         ):
             ctype = chunk.get("type")
 
@@ -280,6 +378,14 @@ async def ask_gst_stream(
             "id": message_id
         }
 
+        # Include document metadata and analysis in response metadata (not in streamed content)
+        if document_metadata:
+            retrieval_obj["document_metadata"] = document_metadata
+            
+            # Include structured analysis in metadata only
+            if document_analysis:
+                retrieval_obj["document_analysis"] = document_analysis["structured"]
+
         # include citations if available
         if party_citations:
             retrieval_obj["party_citations"] = party_citations
@@ -287,7 +393,7 @@ async def ask_gst_stream(
         yield json.dumps(retrieval_obj) + "\n"
 
         # 8. Background task: update profile
-        background_tasks.add_task(auto_update_profile, user_id, payload.question, full_answer)
+        background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 

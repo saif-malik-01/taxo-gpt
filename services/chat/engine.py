@@ -162,9 +162,11 @@ def get_full_judgments(retrieved_chunks, all_chunks):
     return full_judgments
 
 
-async def chat(query, store, all_chunks, history=[], profile_summary=None):
+async def chat(query, store, all_chunks, history=[], profile_summary=None, document_context=None):
     """
     Enhanced chat with automatic citation attribution
+    
+    Supports optional document_context for analyzing uploaded documents.
     """
     
     # Step 1: Retrieve
@@ -179,7 +181,7 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
     intent = classify_query_intent(query)
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     
-    # Step 3: Build prompt (SYSTEM + USER)
+    # Step 3: Build prompt (SYSTEM + USER) with optional document context
     system_prompt = get_system_prompt(profile_summary)
     
     user_prompt = build_structured_prompt(
@@ -187,7 +189,8 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
         primary=primary,
         supporting=supporting,
         history=history,
-        profile_summary=profile_summary
+        profile_summary=profile_summary,
+        document_context=document_context  # Pass document context
     )
 
     # Step 4: Call LLM (Inference Params: Temp=0)
@@ -221,7 +224,7 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None):
     return enhanced_answer, retrieved, full_judgments, party_citations
 
 
-async def chat_stream(query, store, all_chunks, history=[], profile_summary=None):
+async def chat_stream(query, store, all_chunks, history=[], profile_summary=None, document_context=None):
     """
     ✅ FULLY OPTIMIZED STREAMING WITH REAL-TIME ENHANCED RESPONSE
     
@@ -230,6 +233,11 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     2. Process citations in background (parallel processing, top-5, etc.)
     3. STREAM enhanced response AS LLM GENERATES IT (real streaming!)
     4. Send sources and metadata after streaming
+    
+    DOCUMENT SUPPORT:
+    - Optional document_context parameter for analyzing uploaded documents
+    - If provided, documents are integrated into the prompt for context-aware analysis
+    - Works seamlessly with existing chat flow (backward compatible)
     """
     
     import time
@@ -237,9 +245,11 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     
     logger.info("=" * 80)
     logger.info(f"QUERY: {query[:100]}...")
+    if document_context:
+        logger.info(f"📄 Document context provided: {len(document_context)} chars")
     logger.info("=" * 80)
     
-    # Step 1: Retrieve chunks
+    # Step 1: Retrieve chunks (optionally skip if document_context is comprehensive)
     retrieved = retrieve(
         query=query,
         vector_store=store,
@@ -253,14 +263,15 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     primary, supporting = split_primary_and_supporting(retrieved, intent)
     logger.info(f"✓ Intent: {intent} | Primary: {len(primary)} | Supporting: {len(supporting)}")
     
-    # Step 3: Build prompts
+    # Step 3: Build prompts (incorporate document context if provided)
     system_prompt = get_system_prompt(profile_summary)
     user_prompt = build_structured_prompt(
         query=query,
         primary=primary,
         supporting=supporting,
         history=history,
-        profile_summary=profile_summary
+        profile_summary=profile_summary,
+        document_context=document_context  # Pass document context to prompt builder
     )
 
     # Step 4: START BACKGROUND TASK for full_judgments

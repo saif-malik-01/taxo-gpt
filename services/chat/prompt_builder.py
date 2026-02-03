@@ -35,9 +35,12 @@ Explain nuances the way you would in a written opinion or advisory note.
 
 """
 
-def build_structured_prompt(query, primary, supporting, history=[], profile_summary=None):
+def build_structured_prompt(query, primary, supporting, history=[], profile_summary=None, document_context=None):
     """
     Builds the USER message content (Dynamic Context)
+    
+    Supports optional document_context for analyzing uploaded documents.
+    If document_context is provided, it's integrated as the highest priority context.
     """
     def render(chunks):
         rendered_list = []
@@ -55,6 +58,15 @@ def build_structured_prompt(query, primary, supporting, history=[], profile_summ
             return "No previous context."
         return "\n".join(f"{h['role'].upper()}: {h['content']}" for h in history[-10:])
 
+    # Build document context section if provided
+    document_section = ""
+    if document_context:
+        document_section = f"""
+DOCUMENT CONTEXT (UPLOADED BY USER - HIGHEST PRIORITY):
+{document_context}
+
+"""
+
     # This part is now just the dynamic context and the question
     # The persona/identity is moved to System Prompt
     user_message = f"""
@@ -64,11 +76,12 @@ CONVERSATION HISTORY:
 QUESTION:
 {query}
 
-Before answering, internally identify what the question is really asking for:
+{document_section}Before answering, internally identify what the question is really asking for:
 - A legal conclusion
 - A procedural remedy
 - A specific legal position extraction
 - An interpretational issue
+- Document analysis or specific questions about provided documents
 
 PRIMARY LEGAL MATERIAL (MOST RELEVANT):
 {render(primary)}
@@ -76,6 +89,6 @@ PRIMARY LEGAL MATERIAL (MOST RELEVANT):
 SUPPORTING LEGAL MATERIAL (USE ONLY IF IT ADDS REAL VALUE):
 {render(supporting)}
 
-Using the above material (especially the PRIMARY material), answer the professional query.
+Using the above material (especially the PRIMARY material{', and the document context if provided,' if document_context else ''}), answer the professional query.
 """
     return user_message
