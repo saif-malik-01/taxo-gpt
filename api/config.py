@@ -6,6 +6,13 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "supersecretkey"
     ALGORITH: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    
+    # Email Configuration for Feedback Reports
+    SMTP_SERVER: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    FEEDBACK_RECIPIENT_EMAIL: str = "atul@gmail.com"
 
     class Config:
         env_file = ".env"

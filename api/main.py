@@ -25,6 +25,7 @@ from services.memory import get_session_history, add_message, get_user_profile
 from services.models import Feedback, User, ChatSession, UserProfile
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
+from services.jobs import start_scheduler, stop_scheduler, list_jobs
 
 # ---------------- INIT ---------------- #
 
@@ -32,6 +33,43 @@ app = FastAPI(
     title="GST Expert API",
     version="2.1.0"  # Updated version
 )
+
+# ---------------- LIFECYCLE EVENTS ---------------- #
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on application startup."""
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    logger.info("🚀 Starting GST Expert API...")
+    
+    # Start background job scheduler
+    try:
+        start_scheduler()
+        logger.info("✅ Background jobs initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to start scheduler: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on application shutdown."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info("👋 Shutting down GST Expert API...")
+    
+    # Stop background job scheduler
+    try:
+        stop_scheduler()
+        logger.info("✅ Background jobs stopped")
+    except Exception as e:
+        logger.error(f"❌ Failed to stop scheduler: {e}")
 
 # ---------------- CORS ---------------- #
 
@@ -144,6 +182,43 @@ def health():
 @app.get("/auth/me")
 def me(user=Depends(auth_guard)):
     return {"user": user}
+
+
+# ---------------- JOB MANAGEMENT ROUTES ---------------- #
+
+@app.get("/admin/jobs")
+async def get_scheduled_jobs(user=Depends(auth_guard)):
+    """
+    List all scheduled background jobs.
+    Returns job details including next run time.
+    """
+    jobs = list_jobs()
+    return {
+        "jobs": jobs,
+        "count": len(jobs)
+    }
+
+
+@app.post("/admin/jobs/feedback/trigger")
+async def trigger_feedback_report(user=Depends(auth_guard)):
+    """
+    Manually trigger the daily feedback report.
+    Useful for testing without waiting for the scheduled time.
+    """
+    from services.jobs.feedback_emailer import send_daily_feedback_report
+    
+    try:
+        await send_daily_feedback_report()
+        return {
+            "status": "success",
+            "message": "Feedback report sent successfully"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send feedback report: {str(e)}"
+        )
+
 
 
 @app.post("/chat/ask", response_model=ChatResponse)
