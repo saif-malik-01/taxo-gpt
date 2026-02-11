@@ -63,3 +63,14 @@ class Feedback(Base):
 
     message = relationship("ChatMessage", back_populates="feedback")
 
+
+class SharedMessage(Base):
+    __tablename__ = "shared_messages"
+
+    id = Column(String, primary_key=True, index=True) # Obfuscated ID (e.g., short UUID or random string)
+    message_id = Column(BigInteger, ForeignKey("chat_messages.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
+    message = relationship("ChatMessage")
+

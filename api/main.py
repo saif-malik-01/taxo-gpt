@@ -21,8 +21,8 @@ from services.vector.store import VectorStore
 from services.auth.deps import auth_guard
 from api.auth import router as auth_router
 from services.database import get_db, AsyncSession
-from services.memory import get_session_history, add_message, get_user_profile
-from services.models import Feedback, User, ChatSession, UserProfile
+from services.memory import get_session_history, add_message, get_user_profile, share_message, get_shared_message
+from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
 from services.jobs import start_scheduler, stop_scheduler, list_jobs
@@ -171,6 +171,14 @@ class AnalysisResponse(BaseModel):
     structured_analysis: dict
     formatted_response: str
     metadata: dict
+
+class SharedMessageResponse(BaseModel):
+    id: str
+    role: str
+    content: str
+    sources: List[SourceChunk] = []
+    full_judgments: Dict[str, FullJudgment] = {}
+    message_id: int
 
 # ---------------- CHAT ROUTES ---------------- #
 
@@ -496,6 +504,77 @@ async def get_history(
 ):
     history = await get_session_history(session_id, limit=50)
     return history
+
+
+@app.post("/chat/share/{message_id}")
+async def enable_sharing(
+    message_id: int,
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    """Mark a message as public and return a shared ID."""
+    try:
+        # 1. Verify ownership (via session)
+        email = user.get("sub")
+        
+        # More explicit query with precise joins
+        res = await db.execute(
+            select(ChatMessage)
+            .join(ChatMessage.session)
+            .join(ChatSession.user)
+            .where(ChatMessage.id == message_id, User.email == email)
+        )
+        message = res.scalars().first()
+        
+        if not message:
+            # Check if message exists AT ALL to give better debug info
+            exists_res = await db.execute(select(ChatMessage).where(ChatMessage.id == message_id))
+            exists = exists_res.scalars().first()
+            if not exists:
+                raise HTTPException(status_code=404, detail=f"Message {message_id} not found in database")
+            raise HTTPException(status_code=403, detail="Unauthorized: You do not own this message")
+        
+        # Check if it's an assistant message
+        if message.role != "assistant":
+            raise HTTPException(status_code=400, detail="Only assistant messages can be shared")
+        
+        # 2. Create/Get shared link
+        shared_id = await share_message(message_id, db)
+        
+        return {
+            "shared_id": shared_id,
+            "message_id": message_id,
+            "share_url": f"/share/{shared_id}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"ERROR in enable_sharing: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+
+@app.get("/chat/share/{shared_id}", response_model=SharedMessageResponse)
+async def retrieve_shared_message(
+    shared_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Fetch shared message content (Public access)."""
+    message = await get_shared_message(shared_id, db)
+    
+    if not message:
+        raise HTTPException(status_code=404, detail="Shared message not found")
+    
+    # Return in standard format
+    return {
+        "id": f"msg_{message.id}",
+        "role": message.role,
+        "content": message.content,
+        "sources": [], # Currently not stored in DB, but required by frontend schema
+        "full_judgments": {}, # Currently not stored in DB
+        "message_id": message.id
+    }
 
 
 @app.get("/chat/sessions")

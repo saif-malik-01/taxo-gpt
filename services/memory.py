@@ -6,7 +6,10 @@ logger = logging.getLogger(__name__)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from services.database import get_redis, AsyncSessionLocal
-from services.models import ChatSession, ChatMessage, UserProfile, User
+import secrets
+import string
+from sqlalchemy.orm import selectinload
+from services.models import ChatSession, ChatMessage, UserProfile, User, SharedMessage
 from api.config import settings
 
 # Key prefixes
@@ -101,3 +104,35 @@ async def get_user_profile(user_id: int):
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
         return result.scalar_one_or_none()
+
+def generate_share_id(length=12):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for i in range(length))
+
+async def share_message(message_id: int, db: AsyncSession):
+    """Creates a shared link record for a message."""
+    # Check if already shared
+    existing = await db.execute(select(SharedMessage).where(SharedMessage.message_id == message_id))
+    shared = existing.scalar_one_or_none()
+    
+    if shared:
+        return shared.id
+        
+    # Create new shared record
+    shared_id = generate_share_id()
+    new_shared = SharedMessage(id=shared_id, message_id=message_id)
+    db.add(new_shared)
+    await db.commit()
+    return shared_id
+
+async def get_shared_message(shared_id: str, db: AsyncSession):
+    """Retrieves a message and its session context for a public shared link."""
+    result = await db.execute(
+        select(SharedMessage)
+        .options(selectinload(SharedMessage.message).selectinload(ChatMessage.session))
+        .where(SharedMessage.id == shared_id)
+    )
+    shared = result.scalar_one_or_none()
+    if not shared:
+        return None
+    return shared.message
