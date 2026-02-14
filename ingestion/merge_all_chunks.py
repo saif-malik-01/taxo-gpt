@@ -11,7 +11,16 @@ FILES = [
     "data/processed/judgment_chunks.json",
     "data/processed/article_chunks.json",
     "data/processed/hsn_chunks.json",
-    "data/processed/sac_chunks.json"
+    "data/processed/sac_chunks.json",
+    "data/processed/forms.json",
+    "data/processed/gst_council_meetings.json",
+    "data/processed/gstat_rules.json",
+    "data/processed/gstat_forms.json",
+    "data/processed/case_scenarios.json",
+    "data/processed/section_analytical_review.json",
+    "data/processed/faqs.json",
+    "data/processed/draft_replies.json",
+    "data/processed/case_studies.json",
 ]
 
 OUTPUT_FILE = "data/processed/all_chunks.json"
@@ -56,11 +65,11 @@ def main():
         json.dump(merged, f, ensure_ascii=False, indent=2)
 
     print("\n==============================")
-    print(f"✅ TOTAL UNIQUE CHUNKS: {len(merged)}")
-    print(f"⛔ Skipped invalid chunks: {skipped_chunks}")
+    print(f"[OK] TOTAL UNIQUE CHUNKS: {len(merged)}")
+    print(f"[SKIP] Skipped invalid chunks: {skipped_chunks}")
 
     if skipped_files:
-        print("\n⚠️ Skipped missing files:")
+        print("\n[WARN] Skipped missing files:")
         for s in skipped_files:
             print(f" - {s}")
 

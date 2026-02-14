@@ -252,14 +252,24 @@ def retrieve(query, vector_store, all_chunks, k=25):
 def apply_legal_hierarchy(sorted_results):
     """
     Apply legal priority ordering to chunks with similar scores
-    Groups chunks with scores within 0.15 of each other
+    Groups chunks with scores within 0.05 of each other
     """
     
     priority_order = [
         "judgment",
         "definition",
         "operative",
+        "case_scenario",    # Prioritize practical illustrations
+        "case_study",
         "rule",
+        "hsn",              # Added: Prioritize HSN codes
+        "sac",              # Added: Prioritize SAC codes
+        "council_decision", # GST Council Meeting minutes
+        "gstat_rule",       # GSTAT procedural rules
+        "gstat_form",       # GSTAT forms
+        "gstat_register",   # GSTAT registers/CDR
+        "draft_reply",      # Prioritize drafted responses
+        "faq",              # Prioritize FAQs
         "notification",
         "circular",
         "analytical_review"
@@ -274,23 +284,40 @@ def apply_legal_hierarchy(sorted_results):
     while i < len(sorted_results):
         current_chunk, current_score = sorted_results[i]
         
-        # Find all chunks with similar scores (within 0.15)
+        # Find all chunks with similar scores (within 0.05)
         similar_group = [current_chunk]
         j = i + 1
         
         while j < len(sorted_results):
             next_chunk, next_score = sorted_results[j]
-            if abs(current_score - next_score) <= 0.15:
+            if abs(current_score - next_score) <= 0.05:
                 similar_group.append(next_chunk)
                 j += 1
             else:
                 break
         
         # Sort similar group by legal priority
-        similar_group.sort(
-            key=lambda c: priority_order.index(c.get("chunk_type", "analytical_review"))
-            if c.get("chunk_type") in priority_order else 99
-        )
+        def get_priority_index(c):
+            # 1. Try explicit chunk_type
+            ctype = c.get("chunk_type")
+            
+            # 2. Try doc_type (normalized)
+            if not ctype:
+                ctype = c.get("doc_type", "").lower().replace(" ", "_")
+            
+            # 3. Fallback for HSN/SAC which might lack explicit types
+            if not ctype:
+                meta = c.get("metadata", {})
+                if "hsn_code" in meta:
+                    ctype = "hsn"
+                elif "sac_code" in meta:
+                    ctype = "sac"
+            
+            if ctype in priority_order:
+                return priority_order.index(ctype)
+            return 99
+
+        similar_group.sort(key=get_priority_index)
         
         result.extend(similar_group)
         i = j

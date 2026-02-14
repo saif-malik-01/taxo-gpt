@@ -31,6 +31,12 @@ def classify_query_intent(query: str) -> str:
     if "difference" in q or "vs" in q:
         return "comparison"
 
+    if "gstat" in q or "form" in q or "register" in q or "cdr" in q:
+        return "gstat"
+
+    if "council" in q or "meeting" in q:
+        return "council"
+
     return "general"
 
 
@@ -59,7 +65,13 @@ def split_primary_and_supporting(chunks, intent):
         elif intent == "definition" and ctype in ("definition", "operative", "act"):
             primary.append(ch)
 
-        elif intent == "procedure" and ctype == "rule":
+        elif (intent == "procedure" or intent == "gstat") and ctype in ("rule", "gstat_rule", "gstat_form", "gstat_register"):
+            primary.append(ch)
+
+        elif intent == "council" and ctype == "council_decision":
+            primary.append(ch)
+
+        elif intent == "gstat" and ctype in ("gstat_rule", "gstat_form", "gstat_register"):
             primary.append(ch)
 
         else:

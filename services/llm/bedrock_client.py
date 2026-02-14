@@ -7,14 +7,13 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Config for better reliability and performance
 bedrock_config = Config(
     region_name="us-east-1",
-    read_timeout=120,      # Increased to 2 minutes
+    read_timeout=120,
     connect_timeout=30,
     retries={
         "max_attempts": 3,
-        "mode": "adaptive" # More robust for rate limits / transients
+        "mode": "adaptive"
     }
 )
 
@@ -46,7 +45,6 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
         }
     ]
     
-    # Prepare system block if provided
     system_block = []
     if system_prompts:
         for sp in system_prompts:
@@ -71,7 +69,7 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
         return response["output"]["message"]["content"][0]["text"]
     except Exception as e:
         logger.error(f"Bedrock call failed: {str(e)}")
-        return "NONE" # Return NONE to signal failure or no facts
+        return "NONE"
 
 
 def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> Iterator[str]:
@@ -87,7 +85,6 @@ def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None,
         }
     ]
 
-    # Prepare system block if provided
     system_block = []
     if system_prompts:
         for sp in system_prompts:

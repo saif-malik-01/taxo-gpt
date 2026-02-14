@@ -14,6 +14,11 @@ class MetadataIndex:
         self.by_case_num = {}
         self.judgment_by_external_id = {}
         self.judgments_unique = {}  # external_id -> first_chunk (for metadata search)
+        # GSTAT specific indices
+        self.by_gstat_form = {}
+        self.by_gstat_rule = {}
+        self.by_gstat_cdr = {}
+        self.by_council_meeting = {}
         self._build(chunks)
 
     def _build(self, chunks):
@@ -95,9 +100,52 @@ class MetadataIndex:
                             if eid not in [c.get("metadata", {}).get("external_id") for c in self.by_case_num[cn_norm]]:
                                 self.by_case_num[cn_norm].append(chunk)
 
+            # 5. GSTAT Indexing (Forms, Rules, Registers/CDR)
+            doc_type = chunk.get("doc_type")
+            structure = chunk.get("structure", {})
+            
+            if doc_type == "Form":
+                # Index GSTAT Forms
+                form_number = structure.get("number")
+                if form_number:
+                    form_num_str = str(form_number).strip().lstrip('0') or '0'
+                    if form_num_str not in self.by_gstat_form:
+                        self.by_gstat_form[form_num_str] = []
+                    self.by_gstat_form[form_num_str].append(chunk)
+            
+            elif doc_type == "Register" or (doc_type == "Other" and structure.get("title") and 
+                                            ("register" in structure.get("title", "").lower() or 
+                                             "cdr" in chunk.get("text", "").lower())):
+                # Index GSTAT Registers/CDR
+                cdr_number = structure.get("number")
+                if cdr_number and cdr_number != "UNKNOWN":
+                    cdr_num_str = str(cdr_number).strip().lstrip('0') or '0'
+                    if cdr_num_str not in self.by_gstat_cdr:
+                        self.by_gstat_cdr[cdr_num_str] = []
+                    self.by_gstat_cdr[cdr_num_str].append(chunk)
+            
+            elif doc_type == "Rule" and chunk.get("parent_doc") == "GSTAT Rules 2025":
+                # Index GSTAT Rules
+                rule_number = structure.get("rule_number")
+                if rule_number:
+                    rule_num_str = str(rule_number).strip().lstrip('0') or '0'
+                    if rule_num_str not in self.by_gstat_rule:
+                        self.by_gstat_rule[rule_num_str] = []
+                    self.by_gstat_rule[rule_num_str].append(chunk)
+
+            elif doc_type == "Council Minutes":
+                # Index Council Meetings
+                meeting_number = structure.get("meeting_number")
+                if meeting_number:
+                    meeting_num_str = str(meeting_number).strip()
+                    if meeting_num_str not in self.by_council_meeting:
+                        self.by_council_meeting[meeting_num_str] = []
+                    self.by_council_meeting[meeting_num_str].append(chunk)
+
         logger.info(f"🚀 Built MetadataIndex with {count} chunks")
         logger.info(f"   Sections: {len(self.by_section)} | Rules: {len(self.by_rule)} | Judgments: {judgments_count}")
         logger.info(f"   Citations: {len(self.by_citation)} | Case Numbers: {len(self.by_case_num)}")
+        logger.info(f"   GSTAT Forms: {len(self.by_gstat_form)} | GSTAT Rules: {len(self.by_gstat_rule)} | GSTAT CDR: {len(self.by_gstat_cdr)} | Council Meetings: {len(self.by_council_meeting)}")
 
 
 _INDEX_CACHE = None

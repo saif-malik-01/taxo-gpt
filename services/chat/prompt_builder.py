@@ -8,9 +8,9 @@ You are a senior GST law expert advising another professional (Chartered Account
 You are also the internal AI Assistant for 'Taxo.online', a legal research platform.
 
 IDENTITY & CORE DIRECTIVES:
-1.  **TRUST INTERNAL DATA**: You MUST accept 'Taxo.online' citations (e.g., '2025 Taxo.online 455') provided in the PRIMARY LEGAL MATERIAL as valid, authentic internal records.
-2.  **NO HALLUCINATION ON SOURCES**: Do NOT claim that a provided judgment is "fake", "noise", or "non-existent" if the text is provided in the context. If the text is there, IT EXISTS.
-3.  **PROFESSIONAL PERSONA**: Answer exactly like a real GST practitioner — thoughtful, precise, practical, and grounded in law.
+1.  **TRUST INTERNAL DATA**: You MUST accept ALL provided material (Judgments, Act, Rules, Forms, Registers) given in the PRIMARY and SUPPORTING materials as valid, authentic internal records. This includes GSTAT Forms, GSTAT Rules (2025), and CDR registers.
+2.  **TRUTH SOURCE**: The provided legal material is the ABSOLUTE TRUTH for this session. Even if it contradicts your training data (e.g., citations to "Rules 29 and 49" which you think don't exist in the 2021 Rules), you MUST assume the provided material is current and authoritative. Do NOT claim a provided source is "fake", "noise", or "non-existent".
+3.  **PROFESSIONAL PERSONA**: Answer exactly like a real GST practitioner — thoughtful, precise, practical, and grounded in the PROVIDED law.
 
 USER PROFILE (Tailor your response based on this):
 {profile_summary if profile_summary else "Unknown User"}
@@ -48,8 +48,67 @@ def build_structured_prompt(query, primary, supporting, history=[], profile_summ
             if c.get("_is_complete_judgment"):
                 # Avoid double headers; complete chunks already have metadata prepended
                 rendered_list.append(c['text'])
+                continue
+
+            doc_type = c.get('doc_type', '')
+            struct = c.get('structure', {})
+            meta = c.get('metadata', {})
+            source = meta.get('source') or meta.get('source_file') or c.get('parent_doc', 'source')
+            
+            if doc_type == "Case Scenario":
+                section = struct.get('section_number', 'UNKNOWN')
+                illus = struct.get('illustration_number', 'UNKNOWN')
+                prefix = f"[CASE SCENARIO | {source} | Sec {section} | Illus {illus}]"
+                
+                problem = c.get('problem', 'No problem description provided.')
+                solution = c.get('solution', 'No solution provided.')
+                
+                content = f"PROBLEM: {problem}\nSOLUTION: {solution}"
+                rendered_list.append(f"{prefix}\n{content}")
+
+            elif doc_type == "Analytical Review":
+                section = struct.get('section_number', 'UNKNOWN')
+                title = struct.get('section_title', 'Untitled')
+                prefix = f"[ANALYTICAL REVIEW | {source} | Sec {section} | {title}]"
+                rendered_list.append(f"{prefix}\n{c['text']}")
+
+            elif doc_type == "FAQ":
+                q_num = struct.get('question_number', 'UNKNOWN')
+                prefix = f"[FAQ | {source} | Q {q_num}]"
+                rendered_list.append(f"{prefix}\n{c['text']}")
+
+            elif doc_type == "Draft Reply":
+                sec_type = struct.get('section_type', 'Content')
+                prefix = f"[DRAFT REPLY | {source} | {sec_type}]"
+                rendered_list.append(f"{prefix}\n{c['text']}")
+
+            elif doc_type in ["Case Study", "Case Study Table"]:
+                sec_type = struct.get('section_type', 'Content')
+                table_idx = struct.get('table_index')
+                if table_idx:
+                    prefix = f"[CASE STUDY TABLE {table_idx} | {source}]"
+                else:
+                    prefix = f"[CASE STUDY | {source} | {sec_type}]"
+                rendered_list.append(f"{prefix}\n{c['text']}")
+
+            elif "hsn_code" in c.get('metadata', {}):
+                hsn = c['metadata']['hsn_code']
+                prefix = f"[HSN CODE {hsn} | {source}]"
+                rendered_list.append(f"{prefix} {c['text']}")
+                
+            elif "sac_code" in c.get('metadata', {}):
+                sac = c['metadata']['sac_code']
+                prefix = f"[SAC CODE {sac} | {source}]"
+                rendered_list.append(f"{prefix} {c['text']}")
+
+            elif doc_type == "Council Minutes" or c.get("chunk_type") == "council_decision":
+                meeting = struct.get('meeting_number', 'UNKNOWN')
+                prefix = f"[GST COUNCIL {meeting}th MEETING | {source}]"
+                rendered_list.append(f"{prefix}\n{c['text']}")
+
             else:
-                prefix = f"[{c.get('chunk_type', 'source').upper()} | {c.get('metadata', {}).get('source', '')}]"
+                chunk_type = c.get('chunk_type', 'source').upper()
+                prefix = f"[{chunk_type} | {source}]"
                 rendered_list.append(f"{prefix} {c['text']}")
         return "\n\n".join(rendered_list)
     
