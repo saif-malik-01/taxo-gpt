@@ -269,6 +269,7 @@ def apply_legal_hierarchy(sorted_results):
         "gstat_form",       # GSTAT forms
         "gstat_register",   # GSTAT registers/CDR
         "draft_reply",      # Prioritize drafted responses
+        "qa_pair",
         "faq",              # Prioritize FAQs
         "notification",
         "circular",
