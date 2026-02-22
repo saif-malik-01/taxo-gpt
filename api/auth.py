@@ -5,11 +5,15 @@ from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 from services.auth.jwt import create_access_token
 from services.auth.utils import verify_password, get_password_hash
 from services.auth.deps import auth_guard
 from services.database import get_db
 from services.models import User, UserProfile
+from api.config import settings
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -20,6 +24,70 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
+@router.post("/google", response_model=LoginResponse)
+async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        # Verify Google token
+        # Skip verification if in development and token is "debug" (or similar if needed)
+        # But for now, let's implement proper verification
+        idinfo = id_token.verify_oauth2_token(
+            payload.credential, 
+            google_requests.Request(), 
+            settings.GOOGLE_CLIENT_ID
+        )
+
+        google_id = idinfo['sub']
+        email = idinfo['email']
+        name = idinfo.get('name')
+
+        # Check if user exists by google_id
+        result = await db.execute(select(User).where(User.google_id == google_id))
+        user = result.scalars().first()
+
+        if not user:
+            # Check if user exists by email
+            result = await db.execute(select(User).where(User.email == email))
+            user = result.scalars().first()
+
+            if user:
+                # Link existing user to Google account
+                user.google_id = google_id
+                if not user.full_name and name:
+                    user.full_name = name
+                await db.commit()
+            else:
+                # Create new user
+                user = User(
+                    email=email,
+                    google_id=google_id,
+                    full_name=name,
+                    password_hash=None, # No password for Google users
+                    role="user"
+                )
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
+
+                # Create empty profile
+                new_profile = UserProfile(user_id=user.id, preferences={})
+                db.add(new_profile)
+                await db.commit()
+
+        token = create_access_token({
+            "sub": user.email,
+            "role": user.role
+        })
+
+        return {"access_token": token}
+
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 class RegisterRequest(BaseModel):
     email: str

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     SMTP_USERNAME: str = ""
     SMTP_PASSWORD: str = ""
     FEEDBACK_RECIPIENT_EMAIL: str = "atul@gmail.com"
+    GOOGLE_CLIENT_ID: str = ""
 
     class Config:
         env_file = ".env"

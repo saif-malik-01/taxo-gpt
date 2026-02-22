@@ -15,3 +15,5 @@ multipart
 pillow
 python-multipart
 apscheduler
+google-auth
+requests
