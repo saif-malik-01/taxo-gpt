@@ -9,7 +9,7 @@ from services.database import get_redis, AsyncSessionLocal
 import secrets
 import string
 from sqlalchemy.orm import selectinload
-from services.models import ChatSession, ChatMessage, UserProfile, User, SharedMessage
+from services.models import ChatSession, ChatMessage, UserProfile, User, SharedSession
 from api.config import settings
 
 # Key prefixes
@@ -109,10 +109,10 @@ def generate_share_id(length=12):
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for i in range(length))
 
-async def share_message(message_id: int, db: AsyncSession):
-    """Creates a shared link record for a message."""
+async def share_session(session_id: str, db: AsyncSession):
+    """Creates a shared link record for a session."""
     # Check if already shared
-    existing = await db.execute(select(SharedMessage).where(SharedMessage.message_id == message_id))
+    existing = await db.execute(select(SharedSession).where(SharedSession.session_id == session_id))
     shared = existing.scalar_one_or_none()
     
     if shared:
@@ -120,19 +120,21 @@ async def share_message(message_id: int, db: AsyncSession):
         
     # Create new shared record
     shared_id = generate_share_id()
-    new_shared = SharedMessage(id=shared_id, message_id=message_id)
+    new_shared = SharedSession(id=shared_id, session_id=session_id)
     db.add(new_shared)
     await db.commit()
     return shared_id
 
-async def get_shared_message(shared_id: str, db: AsyncSession):
-    """Retrieves a message and its session context for a public shared link."""
+async def get_shared_session(shared_id: str, db: AsyncSession):
+    """Retrieves a session and its message history for a public shared link."""
     result = await db.execute(
-        select(SharedMessage)
-        .options(selectinload(SharedMessage.message).selectinload(ChatMessage.session))
-        .where(SharedMessage.id == shared_id)
+        select(SharedSession)
+        .options(
+            selectinload(SharedSession.session).selectinload(ChatSession.messages)
+        )
+        .where(SharedSession.id == shared_id)
     )
     shared = result.scalar_one_or_none()
     if not shared:
         return None
-    return shared.message
+    return shared.session

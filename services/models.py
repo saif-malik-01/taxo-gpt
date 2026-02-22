@@ -7,7 +7,10 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String, nullable=True)
     email = Column(String, unique=True, index=True, nullable=False)
+    mobile_number = Column(String, nullable=True)
+    country = Column(String, nullable=True)
     password_hash = Column(String, nullable=False)
     role = Column(String, default="user")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -64,13 +67,13 @@ class Feedback(Base):
     message = relationship("ChatMessage", back_populates="feedback")
 
 
-class SharedMessage(Base):
-    __tablename__ = "shared_messages"
+class SharedSession(Base):
+    __tablename__ = "shared_sessions"
 
     id = Column(String, primary_key=True, index=True) # Obfuscated ID (e.g., short UUID or random string)
-    message_id = Column(BigInteger, ForeignKey("chat_messages.id"), nullable=False)
+    session_id = Column(String, ForeignKey("chat_sessions.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=True)
 
-    message = relationship("ChatMessage")
+    session = relationship("ChatSession")
 

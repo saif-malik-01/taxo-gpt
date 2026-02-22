@@ -481,38 +481,35 @@ def reattribute_citations_in_response_stream(
     
     logger.info(f"📤 Sending {len(citation_mapping)} citations to LLM (minimal 6-field payload)")
     
-    # IMPROVED PROMPT - Much more explicit about preserving content
+    # IMPROVED PROMPT - Much more explicit about preserving content and NOT repeating markers
     prompt = f"""CRITICAL RULES - READ CAREFULLY:
 
-1. You MUST return the EXACT original response below
-2. ONLY change/add citations for cases that appear in the "CORRECT CITATIONS" list
-3. Do NOT rephrase, restructure, or modify ANY other text
-4. For cases NOT in the list below: KEEP their existing citations unchanged
-5. Do NOT add explanations or commentary
+1. You MUST return the EXACT original response provided below.
+2. ONLY change/add citations for cases that appear in the "CORRECT CITATIONS" list.
+3. Do NOT rephrase, restructure, or modify ANY other text.
+4. For cases NOT in the list below: KEEP their existing citations unchanged.
+5. Do NOT add explanations, introductory text, or commentary.
+6. START your response IMMEDIATELY with the corrected response text.
+7. DO NOT include any tags or markers in your output.
 
-ORIGINAL RESPONSE (PRESERVE EXACTLY):
----START---
+ORIGINAL RESPONSE (PRESERVE EXACT STYLE AND CONTENT):
+<original_text>
 {original_response}
----END---
+</original_text>
 
 CORRECT CITATIONS (Only update these specific cases):
 {json.dumps(citation_mapping, indent=2)}
 
 INSTRUCTIONS:
-- Find where each case/party pair from the citation list is mentioned
+- Find where each case/party pair from the citation list is mentioned.
 - Match flexibly: "Shree Govind" matches "SHREE GOVIND ALLOYS PVT. LTD."
-- If the case already has a citation: REPLACE with the correct one from the list
-- If the case has NO citation: ADD the correct citation from the list
-- Format: "Party1 v. Party2 (Citation)" or "Party1 vs Party2 (Citation)"
-- For all other cases not in the list: DO NOT TOUCH their citations
-- Return the COMPLETE response with only these specific citation updates
+- If the case already has a citation: REPLACE it with the correct one from the list.
+- If the case has NO citation: ADD the correct citation from the list.
+- Format: "Party1 v. Party2 (Citation)" or "Party1 vs Party2 (Citation)".
+- For all other cases not in the list: DO NOT TOUCH their citations.
+- Return the COMPLETE response with only these specific citation updates.
 
-EXAMPLE:
-Original text: "In ABC Corp v. XYZ Ltd (wrong citation), the court held that..."
-Citation list has ABC Corp → "2024 TMI 123"
-Corrected: "In ABC Corp v. XYZ Ltd (2024 TMI 123), the court held that..."
-
-NOW RETURN THE COMPLETE RESPONSE WITH ONLY THE SPECIFIED CITATION CORRECTIONS:"""
+NOW RETURN THE COMPLETE RESPONSE STARTING IMMEDIATELY WITH THE TEXT (NO HEADERS, NO MARKERS):"""
     
     try:
         # ✅ STREAM the re-attribution response as LLM generates it
@@ -531,6 +528,7 @@ NOW RETURN THE COMPLETE RESPONSE WITH ONLY THE SPECIFIED CITATION CORRECTIONS:""
         
         # VALIDATION after streaming completes
         reattributed = collected_response.strip()
+        
         if reattributed.startswith("```"):
             lines = reattributed.split("\n")
             reattributed = "\n".join(lines[1:-1]) if len(lines) > 2 else reattributed

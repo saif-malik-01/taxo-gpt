@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 # Configure Hugging Face cache for cross-platform compatibility
 os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
@@ -21,7 +22,7 @@ from services.vector.store import VectorStore
 from services.auth.deps import auth_guard
 from api.auth import router as auth_router
 from services.database import get_db, AsyncSession
-from services.memory import get_session_history, add_message, get_user_profile, share_message, get_shared_message
+from services.memory import get_session_history, add_message, get_user_profile, share_session, get_shared_session
 from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
@@ -172,24 +173,22 @@ class AnalysisResponse(BaseModel):
     formatted_response: str
     metadata: dict
 
-class SharedMessageResponse(BaseModel):
-    id: str
+class SharedMessageSchema(BaseModel):
+    id: int
     role: str
     content: str
-    sources: List[SourceChunk] = []
-    full_judgments: Dict[str, FullJudgment] = {}
-    message_id: int
+    timestamp: datetime
+
+class SharedSessionResponse(BaseModel):
+    session_id: str
+    title: Optional[str]
+    messages: List[SharedMessageSchema]
 
 # ---------------- CHAT ROUTES ---------------- #
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/auth/me")
-def me(user=Depends(auth_guard)):
-    return {"user": user}
 
 
 # ---------------- JOB MANAGEMENT ROUTES ---------------- #
@@ -678,74 +677,99 @@ async def save_feedback(
 @app.get("/chat/history")
 async def get_history(
     session_id: str,
-    user=Depends(auth_guard)
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
 ):
+    # 1. Get user record
+    email = user.get("sub")
+    res = await db.execute(select(User).where(User.email == email))
+    db_user = res.scalars().first()
+    
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 2. Verify session ownership
+    res = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.user_id == db_user.id
+        )
+    )
+    session = res.scalars().first()
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or unauthorized")
+
+    # 3. Fetch history
     history = await get_session_history(session_id, limit=50)
     return history
 
 
-@app.post("/chat/share/{message_id}")
-async def enable_sharing(
-    message_id: int,
+@app.post("/chat/share/session/{session_id}")
+async def enable_session_sharing(
+    session_id: str,
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
-    """Mark a message as public and return a shared ID."""
+    """Mark a full chat session as public and return a shared ID."""
     try:
         email = user.get("sub")
         
+        # Verify session ownership
         res = await db.execute(
-            select(ChatMessage)
-            .join(ChatMessage.session)
-            .join(ChatSession.user)
-            .where(ChatMessage.id == message_id, User.email == email)
+            select(ChatSession)
+            .join(User)
+            .where(ChatSession.id == session_id, User.email == email)
         )
-        message = res.scalars().first()
+        session = res.scalars().first()
         
-        if not message:
-            exists_res = await db.execute(select(ChatMessage).where(ChatMessage.id == message_id))
-            exists = exists_res.scalars().first()
-            if not exists:
-                raise HTTPException(status_code=404, detail=f"Message {message_id} not found in database")
-            raise HTTPException(status_code=403, detail="Unauthorized: You do not own this message")
+        if not session:
+            # Check if it exists at all
+            exists_res = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+            if not exists_res.scalars().first():
+                raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=403, detail="Unauthorized: You do not own this session")
         
-        if message.role != "assistant":
-            raise HTTPException(status_code=400, detail="Only assistant messages can be shared")
-        
-        shared_id = await share_message(message_id, db)
-        
+        shared_id = await share_session(session_id, db)
         return {
             "shared_id": shared_id,
-            "message_id": message_id,
+            "session_id": session_id,
             "share_url": f"/share/{shared_id}"
         }
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-        print(f"ERROR in enable_sharing: {str(e)}")
+        print(f"ERROR in enable_session_sharing: {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 
-@app.get("/chat/share/{shared_id}", response_model=SharedMessageResponse)
-async def retrieve_shared_message(
+@app.get("/chat/share/{shared_id}", response_model=SharedSessionResponse)
+async def retrieve_shared_session(
     shared_id: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Fetch shared message content (Public access)."""
-    message = await get_shared_message(shared_id, db)
+    """Fetch shared session content including history (Public access)."""
+    session = await get_shared_session(shared_id, db)
     
-    if not message:
-        raise HTTPException(status_code=404, detail="Shared message not found")
+    if not session:
+        raise HTTPException(status_code=404, detail="Shared session not found")
+
+    # Format messages
+    messages = [
+        SharedMessageSchema(
+            id=m.id,
+            role=m.role,
+            content=m.content,
+            timestamp=m.timestamp
+        ) for m in sorted(session.messages, key=lambda x: x.timestamp)
+    ]
 
     return {
-        "id": f"msg_{message.id}",
-        "role": message.role,
-        "content": message.content,
-        "sources": [], # Currently not stored in DB, but required by frontend schema
-        "full_judgments": {}, # Currently not stored in DB
-        "message_id": message.id
+        "session_id": session.id,
+        "title": session.title,
+        "messages": messages
     }
 
 
