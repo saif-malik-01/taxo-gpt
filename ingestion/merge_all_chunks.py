@@ -22,6 +22,7 @@ FILES = [
     "data/processed/draft_replies.json",
     "data/processed/case_studies.json",
     "data/processed/solved_query_chunks.json", 
+    "data/processed/contempary_issues.json"
 ]
 
 OUTPUT_FILE = "data/processed/all_chunks.json"
