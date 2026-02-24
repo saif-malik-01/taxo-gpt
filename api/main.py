@@ -26,7 +26,7 @@ from services.memory import get_session_history, add_message, get_user_profile, 
 from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
-from services.document.issue_replier import process_issues_parallel, MODE_DEFENSIVE, MODE_IN_FAVOUR, detect_mode  # ← added detect_mode
+from services.document.issue_replier import process_issues_streaming, MODE_DEFENSIVE, MODE_IN_FAVOUR, detect_mode
 from services.jobs import start_scheduler, stop_scheduler, list_jobs
 
 # ---------------- INIT ---------------- #
@@ -404,11 +404,11 @@ async def ask_gst_stream(
             # ----------------------------------------------------------------
             # SCENARIO 2a: Document HAS ISSUES
             # Detect mode from user question (keyword-based, default defensive).
-            # Process each issue independently in parallel (max 3 concurrent).
-            # Stream results sequentially — one issue fully streamed before next.
+            # Process issues in parallel, stream each in order as it completes.
+            # Sources aggregated across all issues, returned in final retrieval event.
             # ----------------------------------------------------------------
             if has_issues:
-                logger.info(f"✅ Scenario 2a: {len(issues_list)} issues — parallel processing, sequential streaming")
+                logger.info(f"✅ Scenario 2a: {len(issues_list)} issues — parallel processing, ordered streaming")
 
                 # Stream document analysis header first
                 if formatted_response:
@@ -417,14 +417,17 @@ async def ask_gst_stream(
                         "delta": f"**Document Analysis:**\n\n{formatted_response}\n\n---\n\n"
                     }) + "\n"
 
-                # ← CHANGED: detect mode from question, default defensive if no keyword match
                 mode      = detect_mode(question)
                 recipient = structured.get("recipient")
                 sender    = structured.get("sender")
 
-                # Process ALL issues in parallel
                 logger.info(f"🚀 Launching parallel processing for {len(issues_list)} issues (mode: {mode})...")
-                issue_replies = await process_issues_parallel(
+
+                full_issues_text = ""
+                all_sources      = []  # aggregated sources across all issues
+
+                # Stream each issue in order as it completes
+                async for issue_number, reply, sources in process_issues_streaming(
                     issues=issues_list,
                     mode=mode,
                     store=vector_store,
@@ -433,30 +436,34 @@ async def ask_gst_stream(
                     sender=sender,
                     profile_summary=profile_summary,
                     max_parallel=3
-                )
-
-                # Stream sequentially — one issue at a time, no mixing
-                full_issues_text = ""
-                for issue_num in range(1, len(issues_list) + 1):
-                    reply = issue_replies.get(issue_num, "[Reply not available]")
-
+                ):
+                    # Signal start of this issue to frontend
                     yield json.dumps({
                         "type":         "issue_start",
-                        "issue_number": issue_num,
-                        "issue_text":   issues_list[issue_num - 1],
+                        "issue_number": issue_number,
+                        "issue_text":   issues_list[issue_number - 1],
                         "total_issues": len(issues_list)
                     }) + "\n"
 
+                    # Stream reply for this issue in chunks immediately
                     chunk_size = 50
                     for i in range(0, len(reply), chunk_size):
                         yield json.dumps({"type": "content", "delta": reply[i:i+chunk_size]}) + "\n"
 
+                    # Signal end of this issue
                     yield json.dumps({
                         "type":         "issue_end",
-                        "issue_number": issue_num
+                        "issue_number": issue_number
                     }) + "\n"
 
-                    full_issues_text += f"\n\n**Issue {issue_num}:** {issues_list[issue_num - 1]}\n\n{reply}"
+                    full_issues_text += f"\n\n**Issue {issue_number}:** {issues_list[issue_number - 1]}\n\n{reply}"
+
+                    # Aggregate sources — deduplicate by id
+                    existing_ids = {s["id"] for s in all_sources}
+                    for s in sources:
+                        if s["id"] not in existing_ids:
+                            all_sources.append(s)
+                            existing_ids.add(s["id"])
 
                 # Single closing block after ALL issues
                 closing_block = (
@@ -492,18 +499,28 @@ async def ask_gst_stream(
                             delta = chunk.get("delta", "")
                             knowledge_answer += delta
                             yield json.dumps({"type": "content", "delta": delta}) + "\n"
+                        elif ctype == "retrieval":
+                            # Merge knowledge base sources with issue sources
+                            kb_sources = chunk.get("sources", []) or []
+                            existing_ids = {s["id"] for s in all_sources}
+                            for s in kb_sources:
+                                if s.get("id") not in existing_ids:
+                                    all_sources.append(s)
+                                    existing_ids.add(s.get("id"))
 
                     full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
 
-                # print("i am printing the complete reply", full_issues_text)
+                print("Complete reply:", full_issues_text)
 
+                # Save combined answer to memory
                 combined_answer = formatted_response + full_issues_text
                 assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
                 message_id      = getattr(assistant_msg, "id", None)
 
+                # Return sources in same format as non-document queries
                 yield json.dumps({
                     "type":              "retrieval",
-                    "sources":           [],
+                    "sources":           all_sources,
                     "full_judgments":    {},
                     "message_id":        message_id,
                     "session_id":        session_id,

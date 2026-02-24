@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, AsyncGenerator
 from starlette.concurrency import run_in_threadpool
 
 from services.retrieval.hybrid import retrieve
@@ -127,6 +127,26 @@ def score_chunk(chunk: dict, mode: str) -> float:
     similarity_score = min(float(similarity) * 20, 20)
 
     return base + decision_bonus + similarity_score
+
+
+# ============================================================================
+# SOURCE FORMATTER — same shape as non-document query sources
+# ============================================================================
+
+def _format_sources(chunks: list) -> list:
+    """
+    Format retrieved chunks into the same source shape returned by chat_stream
+    for non-document queries — id, chunk_type, text, metadata.
+    """
+    sources = []
+    for c in chunks:
+        sources.append({
+            "id":         c.get("id", ""),
+            "chunk_type": c.get("chunk_type", ""),
+            "text":       c.get("text", ""),
+            "metadata":   c.get("metadata", {}),
+        })
+    return sources
 
 
 # ============================================================================
@@ -331,11 +351,12 @@ def _process_single_issue(
     recipient: str = None,
     sender: str = None,
     profile_summary: str = None,
-) -> Tuple[int, str]:
+) -> Tuple[int, str, list]:
     """
     Full pipeline for one issue — runs in a thread pool:
-      retrieve → rank → build prompt → call LLM → return reply text
-    Returns (issue_number, reply_text).
+      retrieve → rank → build prompt → call LLM → return reply + sources
+    Returns (issue_number, reply_text, sources).
+    sources is formatted in the same shape as non-document query sources.
     """
     try:
         logger.info(f"🔍 Processing Issue {issue_number}/{total_issues}: {issue[:80]}...")
@@ -361,19 +382,25 @@ def _process_single_issue(
             temperature=0.0
         )
 
-        logger.info(f"✅ Issue {issue_number} reply ready ({len(reply)} chars)")
-        return issue_number, reply
+        # Format primary chunks as sources — same shape as non-document query
+        sources = _format_sources(primary)
+
+        logger.info(f"✅ Issue {issue_number} reply ready ({len(reply)} chars, {len(sources)} sources)")
+        return issue_number, reply, sources
 
     except Exception as e:
         logger.error(f"❌ Issue {issue_number} failed: {e}", exc_info=True)
-        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]"
+        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", []
 
 
 # ============================================================================
-# PARALLEL ORCHESTRATOR
+# STREAMING ORCHESTRATOR
+# — processes all issues in parallel (max_parallel concurrent)
+# — yields results IN ORDER (issue 1 first, then 2, then 3...)
+# — streams each issue to client as soon as it is ready in sequence
 # ============================================================================
 
-async def process_issues_parallel(
+async def process_issues_streaming(
     issues: list,
     mode: str,
     store,
@@ -382,39 +409,55 @@ async def process_issues_parallel(
     sender: str = None,
     profile_summary: str = None,
     max_parallel: int = 3,
-) -> Dict[int, str]:
+) -> AsyncGenerator[Tuple[int, str, list], None]:
     """
-    Process all issues in parallel with a concurrency cap of max_parallel (default 3).
+    Async generator — yields (issue_number, reply_text, sources) in strict order.
 
-    All issues run simultaneously for retrieval + LLM generation.
-    Results are returned as {issue_number: reply_text} dict.
-    Streaming to the client is handled separately in main.py — sequentially
-    per issue to prevent mixing of streams.
+    All issues run in parallel (capped at max_parallel via semaphore).
+    Each issue result is stored in a per-issue Future.
+    The generator awaits futures in order (1, 2, 3...) so:
+      - Issue 1 is always yielded first even if issue 2 finishes sooner.
+      - Streaming starts as soon as issue 1 is ready — no wait for all issues.
+      - No mixing of issue streams possible.
     """
     total     = len(issues)
     semaphore = asyncio.Semaphore(max_parallel)
+    loop      = asyncio.get_event_loop()
+
+    # One future per issue — set by the worker task when done
+    futures: Dict[int, asyncio.Future] = {
+        i + 1: loop.create_future() for i in range(total)
+    }
 
     async def bounded_process(issue, issue_number):
         async with semaphore:
-            return await run_in_threadpool(
-                _process_single_issue,
-                issue, issue_number, total,
-                mode, store, all_chunks,
-                recipient, sender, profile_summary
-            )
+            try:
+                result = await run_in_threadpool(
+                    _process_single_issue,
+                    issue, issue_number, total,
+                    mode, store, all_chunks,
+                    recipient, sender, profile_summary
+                )
+                futures[issue_number].set_result(result)
+            except Exception as e:
+                logger.error(f"Issue {issue_number} task failed: {e}", exc_info=True)
+                futures[issue_number].set_result(
+                    (issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [])
+                )
 
     logger.info(f"🚀 Processing {total} issues in parallel (max {max_parallel} concurrent)")
 
-    tasks     = [bounded_process(issue, i + 1) for i, issue in enumerate(issues)]
-    completed = await asyncio.gather(*tasks, return_exceptions=True)
+    # Launch all tasks simultaneously
+    tasks = [
+        asyncio.create_task(bounded_process(issue, i + 1))
+        for i, issue in enumerate(issues)
+    ]
 
-    results = {}
-    for result in completed:
-        if isinstance(result, Exception):
-            logger.error(f"Issue task exception: {result}")
-            continue
-        issue_num, reply = result
-        results[issue_num] = reply
+    # Yield in strict order — await future[1], then future[2], etc.
+    for issue_num in range(1, total + 1):
+        issue_number, reply, sources = await futures[issue_num]
+        yield issue_number, reply, sources
 
-    logger.info(f"✅ All {len(results)}/{total} issues processed")
-    return results
+    # Ensure all tasks are fully cleaned up
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"✅ All {total} issues processed and streamed")
