@@ -655,7 +655,7 @@ CRITICAL RULES:
                     structured_response["issues"] = analysis["issues"]
                     if analysis.get("issues_prompt"):
                         structured_response["issues_prompt"] = analysis["issues_prompt"]
-                print("printing doc summary and analysis",structured_response)
+                # print("printing doc summary and analysis",structured_response)
                 return structured_response
             else:
                 return {"summary": content}

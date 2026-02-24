@@ -67,6 +67,33 @@ def build_retrieval_query(issue: str, mode: str) -> str:
 
 
 # ============================================================================
+# MODE DETECTION — keyword based, default defensive
+# ============================================================================
+
+_IN_FAVOUR_KEYWORDS = [
+    "in favour of revenue", "in favor of revenue", "in favour of department",
+    "in favor of department", "against the taxpayer", "against the assessee",
+    "support the notice", "justify the notice", "authority is correct",
+    "department is correct", "uphold the allegation", "support the allegation",
+    "revenue's position", "department's position", "liability of taxpayer",
+]
+
+
+def detect_mode(question: str) -> str:
+    """
+    Keyword-based mode detection from user question.
+    Checks in-favour keywords — if any match, return MODE_IN_FAVOUR.
+    Default — MODE_DEFENSIVE if no keyword matched.
+    """
+    q = question.lower()
+    if any(kw in q for kw in _IN_FAVOUR_KEYWORDS):
+        logger.info("Mode detected: in_favour")
+        return MODE_IN_FAVOUR
+    logger.info("Mode: defensive (default)")
+    return MODE_DEFENSIVE
+
+
+# ============================================================================
 # SCORING
 # ============================================================================
 
@@ -235,22 +262,25 @@ def _build_issue_prompt(
 
     if mode == MODE_DEFENSIVE:
         mode_instruction = (
-            "Draft a professional reply clarifying why the recipient's position is correct and legally sound. "
-            "The tone must be respectful, measured, and formally appropriate for submission to a tax authority. "
-            "You are not challenging or accusing the authority — you are calmly explaining and clarifying "
-            "the recipient's position with legal backing.\n\n"
-            "TONE: Use phrases such as 'We respectfully submit...', 'It is humbly clarified that...', "
-            "'In this regard, it is submitted that...', 'Without prejudice to the above...'\n\n"
-            "CONTENT:\n"
-            "- Quote provision text, judgment language, or circular wording verbatim from the retrieved material where available.\n"
-            "- Where retrieved material lacks exact wording, use standard professional GST advisory language.\n"
-            "- Never state the authority is wrong — only demonstrate that the recipient's position is correct.\n"
-            "- Conclude with a respectful submission that the allegation does not apply to the recipient's facts and circumstances."
+            "Prepare a strong defensive reply protecting the notice recipient's position for submission to a tax authority.\n\n"
+            "- Find every applicable legal exception, proviso, condition, and precedent in the recipient's favour.\n"
+            "- Identify the specific condition or exception within the same provision under which the recipient's action was legally permissible.\n"
+            "- Prioritise judgments where the decision was 'In favour of assessee' — state the court, citation, and apply the ratio directly to this issue.\n"
+            "- Quote statutory wording, circular text, notification language, and judgment extracts verbatim from the retrieved material — exact legal text carries more weight than paraphrasing.\n"
+            "- Ground every argument in a specific section, sub-section, proviso, or clause — not general assertion.\n"
+            "- Demonstrate that the recipient's position is fully in accordance with applicable law — do not attribute fault to any party.\n"
+            "- Conclude by establishing that the allegation is not legally sustainable on the recipient's facts."
         )
-
     else:
-        mode_instruction = """Draft a formal reply establishing the legal basis for the allegation using retrieved provisions, judgments, and circulars.
-Explain why the obligation applies to the recipient's facts. Maintain professional language throughout."""
+        mode_instruction = (
+            "Prepare a strong reply establishing the legal basis for the allegation for submission to a tax authority.\n\n"
+            "- Find every applicable provision, condition, and precedent that supports the revenue's position.\n"
+            "- Identify the specific section, proviso, or clause under which the recipient's action constitutes non-compliance.\n"
+            "- Prioritise judgments where the decision was 'In favour of revenue' — state the court, citation, and apply the ratio directly to this issue.\n"
+            "- Quote statutory wording, circular text, notification language, and judgment extracts verbatim from the retrieved material — exact legal text carries more weight than paraphrasing.\n"
+            "- Ground every argument in a specific section, sub-section, proviso, or clause — not general assertion.\n"
+            "- Conclude by establishing that the obligation squarely applies to the recipient's facts and the allegation is legally sustainable."
+        )
 
     context_lines = []
     if recipient:
@@ -354,7 +384,7 @@ async def process_issues_parallel(
     max_parallel: int = 3,
 ) -> Dict[int, str]:
     """
-    Process all issues in parallel with a concurrency cap of max_parallel (default 5).
+    Process all issues in parallel with a concurrency cap of max_parallel (default 3).
 
     All issues run simultaneously for retrieval + LLM generation.
     Results are returned as {issue_number: reply_text} dict.

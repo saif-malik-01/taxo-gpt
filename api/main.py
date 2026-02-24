@@ -26,7 +26,7 @@ from services.memory import get_session_history, add_message, get_user_profile, 
 from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
-from services.document.issue_replier import process_issues_parallel, MODE_DEFENSIVE, MODE_IN_FAVOUR
+from services.document.issue_replier import process_issues_parallel, MODE_DEFENSIVE, MODE_IN_FAVOUR, detect_mode  # ← added detect_mode
 from services.jobs import start_scheduler, stop_scheduler, list_jobs
 
 # ---------------- INIT ---------------- #
@@ -403,9 +403,9 @@ async def ask_gst_stream(
 
             # ----------------------------------------------------------------
             # SCENARIO 2a: Document HAS ISSUES
-            # Process each issue independently in parallel (max 5 concurrent).
+            # Detect mode from user question (keyword-based, default defensive).
+            # Process each issue independently in parallel (max 3 concurrent).
             # Stream results sequentially — one issue fully streamed before next.
-            # Default mode: DEFENSIVE (protects the notice recipient).
             # ----------------------------------------------------------------
             if has_issues:
                 logger.info(f"✅ Scenario 2a: {len(issues_list)} issues — parallel processing, sequential streaming")
@@ -417,13 +417,13 @@ async def ask_gst_stream(
                         "delta": f"**Document Analysis:**\n\n{formatted_response}\n\n---\n\n"
                     }) + "\n"
 
-                # Determine mode — default is defensive
-                mode      = MODE_DEFENSIVE
+                # ← CHANGED: detect mode from question, default defensive if no keyword match
+                mode      = detect_mode(question)
                 recipient = structured.get("recipient")
                 sender    = structured.get("sender")
 
-                # Process ALL issues in parallel — all running simultaneously
-                logger.info(f"🚀 Launching parallel processing for {len(issues_list)} issues...")
+                # Process ALL issues in parallel
+                logger.info(f"🚀 Launching parallel processing for {len(issues_list)} issues (mode: {mode})...")
                 issue_replies = await process_issues_parallel(
                     issues=issues_list,
                     mode=mode,
@@ -440,7 +440,6 @@ async def ask_gst_stream(
                 for issue_num in range(1, len(issues_list) + 1):
                     reply = issue_replies.get(issue_num, "[Reply not available]")
 
-                    # Signal start of this issue to frontend
                     yield json.dumps({
                         "type":         "issue_start",
                         "issue_number": issue_num,
@@ -448,12 +447,10 @@ async def ask_gst_stream(
                         "total_issues": len(issues_list)
                     }) + "\n"
 
-                    # Stream the reply for this issue in chunks
                     chunk_size = 50
                     for i in range(0, len(reply), chunk_size):
                         yield json.dumps({"type": "content", "delta": reply[i:i+chunk_size]}) + "\n"
 
-                    # Signal end of this issue
                     yield json.dumps({
                         "type":         "issue_end",
                         "issue_number": issue_num
@@ -461,7 +458,7 @@ async def ask_gst_stream(
 
                     full_issues_text += f"\n\n**Issue {issue_num}:** {issues_list[issue_num - 1]}\n\n{reply}"
 
-                # Single closing block after ALL issues — not repeated per issue
+                # Single closing block after ALL issues
                 closing_block = (
                     "\n\n---\n\n"
                     "**Respectfully submitted.**\n\n"
@@ -497,8 +494,9 @@ async def ask_gst_stream(
                             yield json.dumps({"type": "content", "delta": delta}) + "\n"
 
                     full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
-                print("i am printing the complete reply",full_issues_text)
-                # Save combined answer to memory
+
+                # print("i am printing the complete reply", full_issues_text)
+
                 combined_answer = formatted_response + full_issues_text
                 assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
                 message_id      = getattr(assistant_msg, "id", None)
@@ -579,7 +577,6 @@ async def ask_gst_stream(
 
             # ----------------------------------------------------------------
             # SCENARIO 3: Regular chat — no document, use existing chat_stream
-            # This path is completely unchanged from the original flow
             # ----------------------------------------------------------------
             logger.info("✅ Scenario 3: Regular chat")
 
