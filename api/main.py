@@ -1,7 +1,6 @@
 import os
 from datetime import datetime
 
-# Configure Hugging Face cache for cross-platform compatibility
 os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
 os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), '..', '.hf_cache')
 
@@ -16,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 
 from services.chat.engine import chat, chat_stream
 from services.vector.store import VectorStore
@@ -31,10 +31,7 @@ from services.jobs import start_scheduler, stop_scheduler, list_jobs
 
 # ---------------- INIT ---------------- #
 
-app = FastAPI(
-    title="GST Expert API",
-    version="2.1.0"
-)
+app = FastAPI(title="GST Expert API", version="2.1.0")
 
 # ---------------- LIFECYCLE EVENTS ---------------- #
 
@@ -61,7 +58,6 @@ async def shutdown_event():
     logger.info("👋 Shutting down GST Expert API...")
     try:
         stop_scheduler()
-        logger.info("✅ Background jobs stopped")
     except Exception as e:
         logger.error(f"❌ Failed to stop scheduler: {e}")
 
@@ -175,19 +171,33 @@ class SharedSessionResponse(BaseModel):
 # ---------------- HELPERS ---------------- #
 
 def _check_needs_knowledge(analysis: dict) -> bool:
-    """Check if user question needs knowledge base (not issues-related)."""
     user_response = analysis.get("user_question_response", "") or ""
     return (
         "It would we better to answer your query using my knowledge?" in user_response
         or "Should I resolve your query using my knowledge?" in user_response
     )
 
+
+def _merge_full_judgments(target: dict, source: dict) -> None:
+    """Merge source full_judgments into target — no duplicates (keyed by external_id)."""
+    for ext_id, judgment in source.items():
+        if ext_id not in target:
+            target[ext_id] = judgment
+
+
+def _merge_sources(existing: list, new_sources: list, seen_ids: set) -> None:
+    """Append new sources to existing list, deduplicated by id."""
+    for s in new_sources:
+        sid = s.get("id", "")
+        if sid not in seen_ids:
+            existing.append(s)
+            seen_ids.add(sid)
+
 # ---------------- CHAT ROUTES ---------------- #
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 # ---------------- JOB MANAGEMENT ROUTES ---------------- #
 
@@ -269,10 +279,8 @@ async def ask_gst_stream(
     import logging
     logger = logging.getLogger(__name__)
 
-    # 1. Manage Session
     session_id = session_id or str(uuid.uuid4())
 
-    # 2. Get User ID
     email  = user.get("sub")
     result = await db.execute(select(User).where(User.email == email))
     db_user = result.scalars().first()
@@ -280,21 +288,14 @@ async def ask_gst_stream(
         raise HTTPException(status_code=404, detail="User not found")
     user_id = db_user.id
 
-    # 3. Process documents if provided
-    document_context   = None
-    document_metadata  = None
-    document_analysis  = None
-    extracted_text     = None
-    formatted_response = None
-    temp_files         = []
+    # ---- Save uploaded files to temp paths before stream starts ----
+    # File objects are only valid during the request scope; save them now.
+    supported  = {'.pdf', '.docx', '.pptx', '.xlsx', '.html', '.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
+    temp_file_paths = []  # (tmp_path, ext, filename, content_type, size)
+    has_files = files and len(files) > 0
 
-    if files and len(files) > 0:
+    if has_files:
         try:
-            supported  = {'.pdf', '.docx', '.pptx', '.xlsx', '.html', '.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
-            file_paths = []
-            filenames  = []
-            total_size = 0
-
             for file in files:
                 ext = os.path.splitext(file.filename)[1].lower()
                 if ext not in supported:
@@ -303,87 +304,109 @@ async def ask_gst_stream(
                         detail=f"Unsupported file format: {file.filename}. Supported: {', '.join(sorted(supported))}"
                     )
                 with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    temp_files.append(tmp.name)
                     shutil.copyfileobj(file.file, tmp)
-                    file_paths.append(tmp.name)
-                    filenames.append(file.filename)
-                    total_size += os.path.getsize(tmp.name)
-
-            if len(file_paths) == 1:
-                extracted_text = doc_processor.extract_text(file_paths[0])
-            else:
-                extracted_text = doc_processor.extract_text_from_multiple_files(file_paths, filenames)
-
-            if not extracted_text or not extracted_text.strip():
-                raise HTTPException(status_code=422, detail="No text could be extracted from the document(s)")
-
-            try:
-                analysis           = doc_analyzer.analyze(extracted_text, user_question=question)
-                formatted_response = doc_analyzer.format_response_for_frontend(analysis)
-                document_analysis  = {"formatted": formatted_response, "structured": analysis}
-                logger.info(f"✓ Document analysis completed. Formatted length: {len(formatted_response)}")
-            except Exception as e:
-                logger.error(f"Document analysis failed: {str(e)}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Document analysis error: {str(e)}")
-
-            document_metadata = {
-                "num_files":        len(files),
-                "filenames":        filenames,
-                "content_types":    [f.content_type for f in files],
-                "total_size_bytes": total_size,
-                "has_analysis":     True
-            }
-
+                    size = os.path.getsize(tmp.name)
+                    temp_file_paths.append((tmp.name, ext, file.filename, file.content_type, size))
         except HTTPException:
+            for tp, *_ in temp_file_paths:
+                if os.path.exists(tp): os.unlink(tp)
             raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Document processing error: {str(e)}")
-        finally:
-            for fp in temp_files:
-                if fp and os.path.exists(fp):
-                    try:
-                        os.unlink(fp)
-                    except OSError:
-                        pass
 
-    # 4. Fetch Context
-    profile         = await get_user_profile(user_id)
-    profile_summary = profile.dynamic_summary if profile else None
-    history         = await get_session_history(session_id)
-
-    # 5. Determine routing
-    has_issues      = False
-    needs_knowledge = False
-    issues_list     = []
-    structured      = {}
-
-    if document_analysis:
-        structured      = document_analysis["structured"]
-        issues_list     = structured.get("issues") or []
-        has_issues      = len(issues_list) > 0
-        needs_knowledge = _check_needs_knowledge(structured)
-
-    # -------------------------------------------------------------------------
-    # Stream generator
-    # -------------------------------------------------------------------------
     async def stream_generator():
         try:
-            # Save user message
+            # ----------------------------------------------------------------
+            # Save user message immediately
+            # ----------------------------------------------------------------
             user_message = question
-            if document_metadata:
-                user_message += f"\n\n[Documents: {', '.join(document_metadata['filenames'])}]"
-            if extracted_text:
-                user_message += f"\n\n[Extracted Text]:\n{extracted_text[:1000]}..."
+            if has_files and temp_file_paths:
+                filenames = [fp[2] for fp in temp_file_paths]
+                user_message += f"\n\n[Documents: {', '.join(filenames)}]"
             await add_message(session_id, "user", user_message, user_id)
 
+            profile         = await get_user_profile(user_id)
+            profile_summary = profile.dynamic_summary if profile else None
+            history         = await get_session_history(session_id)
+
             # ----------------------------------------------------------------
-            # SCENARIO 1: Document with NO issues and NO knowledge needed
-            # Stream the formatted analysis directly — no RAG required
+            # DOCUMENT PATH — extraction + analysis run in thread pool
+            # User sees a status event immediately; no waiting before stream opens
+            # ----------------------------------------------------------------
+            document_analysis  = None
+            extracted_text     = None
+            formatted_response = None
+            document_metadata  = None
+            structured         = {}
+            has_issues         = False
+            needs_knowledge    = False
+            issues_list        = []
+
+            if has_files and temp_file_paths:
+                try:
+                    file_paths    = [fp[0] for fp in temp_file_paths]
+                    filenames     = [fp[2] for fp in temp_file_paths]
+                    total_size    = sum(fp[4] for fp in temp_file_paths)
+                    content_types = [fp[3] for fp in temp_file_paths]
+
+                    def _extract_and_analyse():
+                        """
+                        Extraction immediately followed by analysis in one synchronous
+                        function — no event-loop round-trip between the two steps.
+                        Runs entirely in a single threadpool call.
+                        """
+                        if len(file_paths) == 1:
+                            text = doc_processor.extract_text(file_paths[0])
+                        else:
+                            text = doc_processor.extract_text_from_multiple_files(file_paths, filenames)
+
+                        if not text or not text.strip():
+                            return None, None, None
+
+                        structured_result = doc_analyzer.analyze(text, question)
+                        formatted_result  = doc_analyzer.format_response_for_frontend(structured_result)
+                        return text, structured_result, formatted_result
+
+                    # Single await — no round-trip between extraction finishing and analysis starting
+                    extracted_text, analysis, formatted_response = await run_in_threadpool(_extract_and_analyse)
+
+                    if not extracted_text:
+                        yield json.dumps({"type": "error", "message": "No text could be extracted from the document(s)."}) + "\n"
+                        return
+
+                    document_analysis = {"formatted": formatted_response, "structured": analysis}
+
+                    document_metadata = {
+                        "num_files":        len(temp_file_paths),
+                        "filenames":        filenames,
+                        "content_types":    content_types,
+                        "total_size_bytes": total_size,
+                        "has_analysis":     True
+                    }
+
+                    structured      = document_analysis["structured"]
+                    issues_list     = structured.get("issues") or []
+                    has_issues      = len(issues_list) > 0
+                    needs_knowledge = _check_needs_knowledge(structured)
+
+                    logger.info(f"✓ Document analysed. Issues: {len(issues_list)}, needs_knowledge: {needs_knowledge}")
+
+                except Exception as e:
+                    logger.error(f"Document processing failed: {e}", exc_info=True)
+                    yield json.dumps({"type": "error", "message": f"Document processing error: {str(e)}"}) + "\n"
+                    return
+                finally:
+                    for tp, *_ in temp_file_paths:
+                        if os.path.exists(tp):
+                            try: os.unlink(tp)
+                            except OSError: pass
+
+            # ----------------------------------------------------------------
+            # SCENARIO 1: Document — no issues, no knowledge needed
+            # Stream formatted analysis directly
             # ----------------------------------------------------------------
             if document_analysis and not has_issues and not needs_knowledge:
-                logger.info("✅ Scenario 1: Streaming document analysis (no RAG needed)")
+                logger.info("✅ Scenario 1: Document analysis only (no RAG)")
 
-                chunk_size = 50
+                chunk_size = 200
                 for i in range(0, len(formatted_response), chunk_size):
                     yield json.dumps({"type": "content", "delta": formatted_response[i:i+chunk_size]}) + "\n"
 
@@ -403,31 +426,30 @@ async def ask_gst_stream(
 
             # ----------------------------------------------------------------
             # SCENARIO 2a: Document HAS ISSUES
-            # Detect mode from user question (keyword-based, default defensive).
-            # Process issues in parallel, stream each in order as it completes.
-            # Sources aggregated across all issues, returned in final retrieval event.
+            # Parallel processing, ordered streaming, formatted per issue
+            # Sources + full_judgments aggregated and returned in retrieval event
             # ----------------------------------------------------------------
             if has_issues:
                 logger.info(f"✅ Scenario 2a: {len(issues_list)} issues — parallel processing, ordered streaming")
 
-                # Stream document analysis header first
+                # Stream document analysis header
                 if formatted_response:
-                    yield json.dumps({
-                        "type":  "content",
-                        "delta": f"**Document Analysis:**\n\n{formatted_response}\n\n---\n\n"
-                    }) + "\n"
+                    chunk_size = 200
+                    header_text = f"**Document Analysis:**\n\n{formatted_response}\n\n---\n\n"
+                    for i in range(0, len(header_text), chunk_size):
+                        yield json.dumps({"type": "content", "delta": header_text[i:i+chunk_size]}) + "\n"
 
                 mode      = detect_mode(question)
                 recipient = structured.get("recipient")
                 sender    = structured.get("sender")
+                total     = len(issues_list)
 
-                logger.info(f"🚀 Launching parallel processing for {len(issues_list)} issues (mode: {mode})...")
+                full_issues_text  = ""
+                all_sources       = []
+                all_full_judgments = {}
+                seen_source_ids   = set()
 
-                full_issues_text = ""
-                all_sources      = []  # aggregated sources across all issues
-
-                # Stream each issue in order as it completes
-                async for issue_number, reply, sources in process_issues_streaming(
+                async for issue_number, reply, sources, full_judgments in process_issues_streaming(
                     issues=issues_list,
                     mode=mode,
                     store=vector_store,
@@ -437,35 +459,40 @@ async def ask_gst_stream(
                     profile_summary=profile_summary,
                     max_parallel=3
                 ):
-                    # Signal start of this issue to frontend
+                    issue_text = issues_list[issue_number - 1]
+
+                    # ---- Issue header (formatted) ----
+                    header = f"\n\n---\n\n### Issue {issue_number} of {total}\n\n> {issue_text}\n\n"
+                    yield json.dumps({"type": "content", "delta": header}) + "\n"
+
+                    # Signal start to frontend (for any UI tracking)
                     yield json.dumps({
                         "type":         "issue_start",
                         "issue_number": issue_number,
-                        "issue_text":   issues_list[issue_number - 1],
-                        "total_issues": len(issues_list)
+                        "issue_text":   issue_text,
+                        "total_issues": total
                     }) + "\n"
 
-                    # Stream reply for this issue in chunks immediately
+                    # Stream reply in chunks
                     chunk_size = 50
                     for i in range(0, len(reply), chunk_size):
                         yield json.dumps({"type": "content", "delta": reply[i:i+chunk_size]}) + "\n"
 
-                    # Signal end of this issue
+                    # Signal end to frontend
                     yield json.dumps({
                         "type":         "issue_end",
                         "issue_number": issue_number
                     }) + "\n"
 
-                    full_issues_text += f"\n\n**Issue {issue_number}:** {issues_list[issue_number - 1]}\n\n{reply}"
+                    full_issues_text += f"\n\n---\n\n### Issue {issue_number}: {issue_text}\n\n{reply}"
 
-                    # Aggregate sources — deduplicate by id
-                    existing_ids = {s["id"] for s in all_sources}
-                    for s in sources:
-                        if s["id"] not in existing_ids:
-                            all_sources.append(s)
-                            existing_ids.add(s["id"])
+                    # Aggregate sources (deduplicated)
+                    _merge_sources(all_sources, sources, seen_source_ids)
 
-                # Single closing block after ALL issues
+                    # Aggregate full judgments (deduplicated by external_id)
+                    _merge_full_judgments(all_full_judgments, full_judgments)
+
+                # ---- Single closing block after all issues ----
                 closing_block = (
                     "\n\n---\n\n"
                     "**Respectfully submitted.**\n\n"
@@ -478,7 +505,7 @@ async def ask_gst_stream(
                     yield json.dumps({"type": "content", "delta": closing_block[i:i+chunk_size]}) + "\n"
                 full_issues_text += closing_block
 
-                # If user also asked a question needing knowledge, answer it too
+                # ---- Knowledge base supplement if needed ----
                 if needs_knowledge:
                     yield json.dumps({
                         "type":  "content",
@@ -500,28 +527,22 @@ async def ask_gst_stream(
                             knowledge_answer += delta
                             yield json.dumps({"type": "content", "delta": delta}) + "\n"
                         elif ctype == "retrieval":
-                            # Merge knowledge base sources with issue sources
-                            kb_sources = chunk.get("sources", []) or []
-                            existing_ids = {s["id"] for s in all_sources}
-                            for s in kb_sources:
-                                if s.get("id") not in existing_ids:
-                                    all_sources.append(s)
-                                    existing_ids.add(s.get("id"))
+                            _merge_sources(all_sources, chunk.get("sources", []) or [], seen_source_ids)
+                        elif ctype == "metadata":
+                            _merge_full_judgments(all_full_judgments, chunk.get("full_judgments", {}) or {})
 
                     full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
 
-                print("Complete reply:", full_issues_text)
-
-                # Save combined answer to memory
-                combined_answer = formatted_response + full_issues_text
+                # Save combined answer
+                combined_answer = (formatted_response or "") + full_issues_text
                 assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
                 message_id      = getattr(assistant_msg, "id", None)
 
-                # Return sources in same format as non-document queries
+                # Retrieval event — sources + full_judgments in same shape as non-document
                 yield json.dumps({
                     "type":              "retrieval",
                     "sources":           all_sources,
-                    "full_judgments":    {},
+                    "full_judgments":    all_full_judgments,
                     "message_id":        message_id,
                     "session_id":        session_id,
                     "id":                message_id,
@@ -533,11 +554,10 @@ async def ask_gst_stream(
                 return
 
             # ----------------------------------------------------------------
-            # SCENARIO 2b: Document with NO issues but user question
-            # needs the knowledge base — use existing chat_stream
+            # SCENARIO 2b: Document — no issues but knowledge needed
             # ----------------------------------------------------------------
             if document_analysis and needs_knowledge:
-                logger.info("✅ Scenario 2b: Document + knowledge base for user question")
+                logger.info("✅ Scenario 2b: Document + knowledge base")
 
                 if formatted_response:
                     yield json.dumps({
@@ -546,9 +566,6 @@ async def ask_gst_stream(
                     }) + "\n"
 
                 full_rag_answer = ""
-                sources         = []
-                full_judgments  = {}
-                party_citations = None
 
                 async for chunk in chat_stream(
                     query=question,
@@ -564,43 +581,51 @@ async def ask_gst_stream(
                         full_rag_answer += delta
                         yield json.dumps({"type": "content", "delta": delta}) + "\n"
                     elif ctype == "retrieval":
-                        sources = chunk.get("sources", []) or []
+                        # Yield retrieval immediately — no buffering
+                        combined_answer = (formatted_response or "") + "\n\n---\n\n**Answer to your query:**\n\n" + full_rag_answer
+                        assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
+                        message_id      = getattr(assistant_msg, "id", None)
+
+                        retrieval_obj = {
+                            "type":              "retrieval",
+                            "sources":           chunk.get("sources", []) or [],
+                            "full_judgments":    {},
+                            "message_id":        message_id,
+                            "session_id":        session_id,
+                            "id":                message_id,
+                            "document_metadata": document_metadata,
+                            "document_analysis": structured
+                        }
+                        yield json.dumps(retrieval_obj) + "\n"
+
                     elif ctype == "metadata":
-                        full_judgments = chunk.get("full_judgments", {}) or {}
+                        # Yield full_judgments immediately as they arrive
+                        yield json.dumps({
+                            "type":          "metadata",
+                            "full_judgments": chunk.get("full_judgments", {}) or {}
+                        }) + "\n"
+
                     elif ctype == "citations":
-                        party_citations = chunk.get("party_citations", {})
+                        yield json.dumps({
+                            "type":           "citations",
+                            "party_citations": chunk.get("party_citations", {})
+                        }) + "\n"
 
-                combined_answer = formatted_response + "\n\n---\n\n**Answer to your query:**\n\n" + full_rag_answer
-                assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
-                message_id      = getattr(assistant_msg, "id", None)
-
-                retrieval_obj = {
-                    "type":              "retrieval",
-                    "sources":           sources,
-                    "full_judgments":    full_judgments,
-                    "message_id":        message_id,
-                    "session_id":        session_id,
-                    "id":                message_id,
-                    "document_metadata": document_metadata,
-                    "document_analysis": structured
-                }
-                if party_citations:
-                    retrieval_obj["party_citations"] = party_citations
-
-                yield json.dumps(retrieval_obj) + "\n"
-
-                background_tasks.add_task(auto_update_profile, user_id, question, combined_answer)
+                background_tasks.add_task(
+                    auto_update_profile, user_id, question,
+                    (formatted_response or "") + "\n\n" + full_rag_answer
+                )
                 return
 
             # ----------------------------------------------------------------
-            # SCENARIO 3: Regular chat — no document, use existing chat_stream
+            # SCENARIO 3: Regular chat — no document
+            # Yield retrieval/metadata/citations inline as they arrive (no buffering)
+            # This eliminates the pause between content end and retrieval event
             # ----------------------------------------------------------------
             logger.info("✅ Scenario 3: Regular chat")
 
-            full_answer     = ""
-            sources         = []
-            full_judgments  = {}
-            party_citations = None
+            full_answer = ""
+            message_saved = False
 
             async for chunk in chat_stream(
                 query=question,
@@ -611,32 +636,47 @@ async def ask_gst_stream(
                 document_context=None
             ):
                 ctype = chunk.get("type")
+
                 if ctype == "content":
                     delta = chunk.get("delta", "")
                     full_answer += delta
                     yield json.dumps({"type": "content", "delta": delta}) + "\n"
+
                 elif ctype == "retrieval":
-                    sources = chunk.get("sources", []) or []
+                    # Save message once — get message_id for the retrieval event
+                    if not message_saved:
+                        assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
+                        message_id    = getattr(assistant_msg, "id", None)
+                        message_saved = True
+                    else:
+                        message_id = None
+
+                    # Yield retrieval immediately — no pause
+                    yield json.dumps({
+                        "type":           "retrieval",
+                        "sources":        chunk.get("sources", []) or [],
+                        "full_judgments": {},
+                        "message_id":     message_id,
+                        "session_id":     session_id,
+                        "id":             message_id
+                    }) + "\n"
+
                 elif ctype == "metadata":
-                    full_judgments = chunk.get("full_judgments", {}) or {}
+                    # Yield full_judgments immediately as they arrive
+                    yield json.dumps({
+                        "type":          "metadata",
+                        "full_judgments": chunk.get("full_judgments", {}) or {}
+                    }) + "\n"
+
                 elif ctype == "citations":
-                    party_citations = chunk.get("party_citations", {})
+                    yield json.dumps({
+                        "type":           "citations",
+                        "party_citations": chunk.get("party_citations", {})
+                    }) + "\n"
 
-            assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
-            message_id    = getattr(assistant_msg, "id", None)
-
-            retrieval_obj = {
-                "type":           "retrieval",
-                "sources":        sources,
-                "full_judgments": full_judgments,
-                "message_id":     message_id,
-                "session_id":     session_id,
-                "id":             message_id
-            }
-            if party_citations:
-                retrieval_obj["party_citations"] = party_citations
-
-            yield json.dumps(retrieval_obj) + "\n"
+            # Ensure message is saved even if retrieval event never came
+            if not message_saved:
+                assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
 
             background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
 
@@ -648,6 +688,11 @@ async def ask_gst_stream(
             }) + "\n"
 
         finally:
+            # Clean up any leftover temp files (safety net)
+            for tp, *_ in temp_file_paths:
+                if os.path.exists(tp):
+                    try: os.unlink(tp)
+                    except OSError: pass
             logger.info(f"✅ Stream closed cleanly for session {session_id}")
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")

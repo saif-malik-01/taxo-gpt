@@ -6,6 +6,7 @@ from starlette.concurrency import run_in_threadpool
 from services.retrieval.hybrid import retrieve
 from services.llm.bedrock_client import call_bedrock
 from services.chat.prompt_builder import get_system_prompt
+from services.chat.engine import get_full_judgments
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ def score_chunk(chunk: dict, mode: str) -> float:
     elif chunk_type in LEGAL_SOURCE_TYPES:
         base = LEGAL_SOURCE_SCORE
     else:
-        base = DEFAULT_SCORE  # analytical_review, contemporary_issues, others
+        base = DEFAULT_SCORE
 
     # Decision field bonus — only for judgments
     decision_bonus = 0
@@ -189,7 +190,7 @@ def get_sibling_chunks(retrieved_chunks: list, all_chunks: list) -> list:
 
         if is_sibling:
             chunk_copy           = dict(chunk)
-            chunk_copy["_score"] = 0.4  # conservative default similarity for siblings
+            chunk_copy["_score"] = 0.4
             siblings.append(chunk_copy)
 
     return siblings
@@ -206,30 +207,20 @@ def _retrieve_and_rank_for_issue(
     all_chunks: list,
 ) -> Tuple[list, list]:
     """
-    Three-pass retrieval for a single issue:
+    Three-pass retrieval for a single issue.
 
     Pass 1 — reframed mode-specific query
-        Surfaces exception/condition chunks aligned to defensive or in-favour mode.
-
     Pass 2 — original issue text
-        Surfaces main provisions, judgments, and draft replies relevant to the allegation.
-
     Pass 3 — sibling chunk expansion on Pass 2 results
-        Fetches provisos and exceptions within the same parent section that
-        semantic search may have ranked too low to appear in Pass 1 or 2.
 
     All chunks are deduplicated, scored, and sorted. Top 15 → primary, next 10 → supporting.
     """
     reframed_query = build_retrieval_query(issue, mode)
 
-    # Pass 1
-    pass1 = retrieve(query=reframed_query, vector_store=store, all_chunks=all_chunks, k=15)
-    # Pass 2
-    pass2 = retrieve(query=issue,          vector_store=store, all_chunks=all_chunks, k=15)
-    # Pass 3
+    pass1    = retrieve(query=reframed_query, vector_store=store, all_chunks=all_chunks, k=15)
+    pass2    = retrieve(query=issue,          vector_store=store, all_chunks=all_chunks, k=15)
     siblings = get_sibling_chunks(pass2, all_chunks)
 
-    # Deduplicate across all three passes
     seen          = set()
     all_retrieved = []
     for chunk in pass1 + pass2 + siblings:
@@ -238,7 +229,6 @@ def _retrieve_and_rank_for_issue(
             seen.add(key)
             all_retrieved.append(chunk)
 
-    # Score and sort descending
     for chunk in all_retrieved:
         chunk["_final_score"] = score_chunk(chunk, mode)
     all_retrieved.sort(key=lambda x: x["_final_score"], reverse=True)
@@ -351,12 +341,16 @@ def _process_single_issue(
     recipient: str = None,
     sender: str = None,
     profile_summary: str = None,
-) -> Tuple[int, str, list]:
+) -> Tuple[int, str, list, dict]:
     """
     Full pipeline for one issue — runs in a thread pool:
-      retrieve → rank → build prompt → call LLM → return reply + sources
-    Returns (issue_number, reply_text, sources).
-    sources is formatted in the same shape as non-document query sources.
+      retrieve → rank → build prompt → call LLM → compute full_judgments → return
+
+    Returns (issue_number, reply_text, sources, full_judgments).
+
+    sources       — primary chunks in same shape as non-document query sources
+    full_judgments — complete judgment data for all judgment chunks in primary,
+                     same shape as returned by chat_stream for non-document queries
     """
     try:
         logger.info(f"🔍 Processing Issue {issue_number}/{total_issues}: {issue[:80]}...")
@@ -382,15 +376,22 @@ def _process_single_issue(
             temperature=0.0
         )
 
-        # Format primary chunks as sources — same shape as non-document query
+        # Sources — same shape as non-document query sources
         sources = _format_sources(primary)
 
-        logger.info(f"✅ Issue {issue_number} reply ready ({len(reply)} chars, {len(sources)} sources)")
-        return issue_number, reply, sources
+        # Full judgments — same shape as get_full_judgments in engine.py
+        # Only pass primary chunks to limit assembly cost per issue
+        full_judgments = get_full_judgments(primary, all_chunks)
+
+        logger.info(
+            f"✅ Issue {issue_number} reply ready "
+            f"({len(reply)} chars, {len(sources)} sources, {len(full_judgments)} judgments)"
+        )
+        return issue_number, reply, sources, full_judgments
 
     except Exception as e:
         logger.error(f"❌ Issue {issue_number} failed: {e}", exc_info=True)
-        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", []
+        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", {}, {}
 
 
 # ============================================================================
@@ -409,9 +410,9 @@ async def process_issues_streaming(
     sender: str = None,
     profile_summary: str = None,
     max_parallel: int = 3,
-) -> AsyncGenerator[Tuple[int, str, list], None]:
+) -> AsyncGenerator[Tuple[int, str, list, dict], None]:
     """
-    Async generator — yields (issue_number, reply_text, sources) in strict order.
+    Async generator — yields (issue_number, reply_text, sources, full_judgments) in strict order.
 
     All issues run in parallel (capped at max_parallel via semaphore).
     Each issue result is stored in a per-issue Future.
@@ -424,7 +425,6 @@ async def process_issues_streaming(
     semaphore = asyncio.Semaphore(max_parallel)
     loop      = asyncio.get_event_loop()
 
-    # One future per issue — set by the worker task when done
     futures: Dict[int, asyncio.Future] = {
         i + 1: loop.create_future() for i in range(total)
     }
@@ -442,22 +442,19 @@ async def process_issues_streaming(
             except Exception as e:
                 logger.error(f"Issue {issue_number} task failed: {e}", exc_info=True)
                 futures[issue_number].set_result(
-                    (issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [])
+                    (issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [], {})
                 )
 
     logger.info(f"🚀 Processing {total} issues in parallel (max {max_parallel} concurrent)")
 
-    # Launch all tasks simultaneously
     tasks = [
         asyncio.create_task(bounded_process(issue, i + 1))
         for i, issue in enumerate(issues)
     ]
 
-    # Yield in strict order — await future[1], then future[2], etc.
     for issue_num in range(1, total + 1):
-        issue_number, reply, sources = await futures[issue_num]
-        yield issue_number, reply, sources
+        issue_number, reply, sources, full_judgments = await futures[issue_num]
+        yield issue_number, reply, sources, full_judgments
 
-    # Ensure all tasks are fully cleaned up
     await asyncio.gather(*tasks, return_exceptions=True)
     logger.info(f"✅ All {total} issues processed and streamed")
