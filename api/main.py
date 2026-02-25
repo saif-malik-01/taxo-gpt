@@ -21,9 +21,10 @@ from services.chat.engine import chat, chat_stream
 from services.vector.store import VectorStore
 from services.auth.deps import auth_guard
 from api.auth import router as auth_router
+from api.payments import router as payment_router
 from services.database import get_db, AsyncSession
-from services.memory import get_session_history, add_message, get_user_profile, share_session, get_shared_session
-from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage
+from services.memory import get_session_history, add_message, get_user_profile, share_session, get_shared_session, track_usage, check_credits
+from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage, UserUsage
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
 from services.document.issue_replier import process_issues_streaming, MODE_DEFENSIVE, MODE_IN_FAVOUR, detect_mode
@@ -74,6 +75,7 @@ app.add_middleware(
 # ---------------- ROUTERS ---------------- #
 
 app.include_router(auth_router)
+app.include_router(payment_router)
 
 # ---------------- DATA ---------------- #
 
@@ -236,6 +238,11 @@ async def ask_gst(
         raise HTTPException(status_code=404, detail="User not found")
 
     user_id = db_user.id
+    
+    # --- CREDIT CHECK ---
+    allowed, error_msg = await check_credits(user_id, session_id, False, db)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=error_msg)
 
     profile         = await get_user_profile(user_id)
     profile_summary = profile.dynamic_summary if profile else None
@@ -251,6 +258,8 @@ async def ask_gst(
 
     await add_message(session_id, "user", payload.question, user_id)
     await add_message(session_id, "assistant", answer, user_id)
+    
+    await track_usage(user_id, session_id, db)
 
     background_tasks.add_task(auto_update_profile, user_id, payload.question, answer)
 
@@ -287,6 +296,14 @@ async def ask_gst_stream(
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
     user_id = db_user.id
+ 
+    # --- CREDIT CHECK ---
+    # We check has_files later but for pre-flight we can check if files exist in the request
+    # Since it's multipart, we can see 'files' list
+    has_files_pre = files and len(files) > 0
+    allowed, error_msg = await check_credits(user_id, session_id, has_files_pre, db)
+    if not allowed:
+        raise HTTPException(status_code=402, detail=error_msg)
 
     # ---- Save uploaded files to temp paths before stream starts ----
     # File objects are only valid during the request scope; save them now.
@@ -678,6 +695,8 @@ async def ask_gst_stream(
             if not message_saved:
                 assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
 
+            await track_usage(user_id, session_id, db)
+
             background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
 
         except Exception as e:
@@ -783,6 +802,36 @@ async def retrieve_shared_session(
         for m in sorted(session.messages, key=lambda x: x.timestamp)
     ]
     return {"session_id": session.id, "title": session.title, "messages": messages}
+
+
+@app.get("/auth/credits")
+async def get_user_credits(
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    email = user.get("sub")
+    res = await db.execute(select(User).where(User.email == email))
+    db_user = res.scalars().first()
+    
+    res = await db.execute(select(UserUsage).where(UserUsage.user_id == db_user.id))
+    usage = res.scalars().first()
+    
+    if not usage:
+        usage = UserUsage(user_id=db_user.id)
+        db.add(usage)
+        await db.commit()
+        await db.refresh(usage)
+        
+    return {
+        "balance": {
+            "simple": usage.simple_query_balance,
+            "draft": usage.draft_reply_balance
+        },
+        "used": {
+            "simple": usage.simple_query_used,
+            "draft": usage.draft_reply_used
+        }
+    }
 
 
 @app.get("/chat/sessions")

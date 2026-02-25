@@ -13,7 +13,9 @@ from services.auth.utils import verify_password, get_password_hash
 from services.auth.deps import auth_guard
 from services.database import get_db
 from services.models import User, UserProfile
+from services.redis import add_session, remove_session
 from api.config import settings
+import uuid
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -77,9 +79,14 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
                 db.add(new_profile)
                 await db.commit()
 
+        session_id = str(uuid.uuid4())
+        await add_session(user.id, session_id, user.max_sessions)
+
         token = create_access_token({
             "sub": user.email,
-            "role": user.role
+            "id": user.id,
+            "role": user.role,
+            "session_id": session_id
         })
 
         return {"access_token": token}
@@ -122,10 +129,16 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     db.add(new_profile)
     await db.commit()
 
+    # Create session
+    session_id = str(uuid.uuid4())
+    await add_session(new_user.id, session_id, new_user.max_sessions)
+
     # Generate token
     token = create_access_token({
         "sub": new_user.email,
-        "role": new_user.role
+        "id": new_user.id,
+        "role": new_user.role,
+        "session_id": session_id
     })
 
     return {"access_token": token}
@@ -139,12 +152,25 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    session_id = str(uuid.uuid4())
+    await add_session(user.id, session_id, user.max_sessions)
+
     token = create_access_token({
         "sub": user.email,
-        "role": user.role
+        "id": user.id,
+        "role": user.role,
+        "session_id": session_id
     })
 
     return {"access_token": token}
+
+@router.post("/logout")
+async def logout(user=Depends(auth_guard)):
+    user_id = user.get("id")
+    session_id = user.get("session_id")
+    if user_id and session_id:
+        await remove_session(user_id, session_id)
+    return {"status": "logged out"}
 
 @router.get("/me")
 async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):

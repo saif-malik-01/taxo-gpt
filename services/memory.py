@@ -9,7 +9,7 @@ from services.database import get_redis, AsyncSessionLocal
 import secrets
 import string
 from sqlalchemy.orm import selectinload
-from services.models import ChatSession, ChatMessage, UserProfile, User, SharedSession
+from services.models import ChatSession, ChatMessage, UserProfile, User, SharedSession, UserUsage
 from api.config import settings
 
 # Key prefixes
@@ -58,8 +58,17 @@ async def add_message(session_id: str, role: str, content: str, user_id: int = N
              # Fast check if session exists
             session_exists = await db.execute(select(ChatSession.id).where(ChatSession.id == session_id))
             if not session_exists.scalar():
-                new_session = ChatSession(id=session_id, user_id=user_id, title=content[:30])
+                session_type = "draft" if role == "user" and "[Documents:" in content else "simple"
+                new_session = ChatSession(id=session_id, user_id=user_id, title=content[:30], session_type=session_type)
                 db.add(new_session)
+                await db.commit()
+            elif role == "user" and "[Documents:" in content:
+                # Upgrade existing session to draft if a document is uploaded
+                await db.execute(
+                    ChatSession.__table__.update()
+                    .where(ChatSession.id == session_id)
+                    .values(session_type="draft")
+                )
                 await db.commit()
 
         new_msg = ChatMessage(session_id=session_id, role=role, content=content)
@@ -138,3 +147,65 @@ async def get_shared_session(shared_id: str, db: AsyncSession):
     if not shared:
         return None
     return shared.session
+
+async def track_usage(user_id: int, session_id: str, db: AsyncSession):
+    """
+    Deducts balance and increments used counters based on session type.
+    """
+    # 1. Get session type
+    res = await db.execute(select(ChatSession.session_type).where(ChatSession.id == session_id))
+    session_type = res.scalar() or "simple"
+
+    # 2. Update usage table (Atomic decrement/increment)
+    res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
+    usage = res.scalars().first()
+
+    if not usage:
+        usage = UserUsage(user_id=user_id)
+        db.add(usage)
+        await db.flush()
+
+    if session_type == "draft":
+        # Deduct balance (ensure it doesn't go below 0, though check_credits should handle this)
+        if usage.draft_reply_balance > 0:
+            usage.draft_reply_balance -= 1
+        usage.draft_reply_used += 1
+    else:
+        # Simple queries are "unlimited" for now, but we still decrement balance to track
+        if usage.simple_query_balance > 0:
+            usage.simple_query_balance -= 1
+        usage.simple_query_used += 1
+    
+    await db.commit()
+
+async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession):
+    """
+    Gatekeeper check before the LLM runs.
+    """
+    # 1. Determine effective session type for this request
+    effective_type = "simple"
+    if has_files:
+        effective_type = "draft"
+    else:
+        # Check existing session type
+        if session_id:
+            res = await db.execute(select(ChatSession.session_type).where(ChatSession.id == session_id))
+            effective_type = res.scalar() or "simple"
+
+    # 2. Check balance
+    res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
+    usage = res.scalars().first()
+
+    if not usage:
+        usage = UserUsage(user_id=user_id)
+        db.add(usage)
+        await db.commit()
+        await db.refresh(usage)
+
+    if effective_type == "draft" and usage.draft_reply_balance <= 0:
+        return False, "Insufficient Draft Reply credits. Please purchase a package."
+    
+    if effective_type == "simple" and usage.simple_query_balance <= 0:
+        return False, "Daily limit for simple queries reached."
+
+    return True, None

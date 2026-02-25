@@ -14,6 +14,7 @@ class User(Base):
     password_hash = Column(String, nullable=True)
     google_id = Column(String, unique=True, index=True, nullable=True)
     role = Column(String, default="user")
+    max_sessions = Column(Integer, default=1)  # Dynamic session limit
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     profile = relationship("UserProfile", back_populates="user", uselist=False)
@@ -37,10 +38,66 @@ class ChatSession(Base):
     id = Column(String, primary_key=True, index=True) # UUID
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=True)
+    session_type = Column(String, default="simple") # 'simple' or 'draft'
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="sessions")
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+
+
+class UserUsage(Base):
+    __tablename__ = "user_usage"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    
+    # Balances (What is left to spend)
+    # Using -1 or a very high number for "Unlimited"
+    simple_query_balance = Column(Integer, default=1000000) 
+    draft_reply_balance = Column(Integer, default=0)
+    
+    # Lifetime usage (For analytics)
+    simple_query_used = Column(Integer, default=0)
+    draft_reply_used = Column(Integer, default=0)
+    
+    last_updated = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    user = relationship("User")
+
+
+class CreditPackage(Base):
+    __tablename__ = "credit_packages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True) # slug e.g. "draft-20"
+    title = Column(String)
+    description = Column(Text, nullable=True)
+    amount = Column(Integer) # In paise
+    currency = Column(String, default="INR")
+    credits_added = Column(Integer)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PaymentTransaction(Base):
+    __tablename__ = "payment_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    order_id = Column(String, unique=True, index=True) # Razorpay Order ID
+    payment_id = Column(String, nullable=True) # Razorpay Payment ID
+    amount = Column(Integer) # In paise/cents
+    currency = Column(String, default="INR")
+    
+    package_id = Column(Integer, ForeignKey("credit_packages.id"), nullable=True)
+    credits_added = Column(Integer)
+    
+    status = Column(String, default="pending") # pending, completed, failed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    package = relationship("CreditPackage")
 
 
 class ChatMessage(Base):

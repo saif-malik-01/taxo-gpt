@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     FEEDBACK_RECIPIENT_EMAIL: str = "atul@gmail.com"
     GOOGLE_CLIENT_ID: str = ""
+    
+    # Razorpay Configuration
+    RAZORPAY_KEY_ID: str = ""
+    RAZORPAY_KEY_SECRET: str = ""
 
     class Config:
         env_file = ".env"
