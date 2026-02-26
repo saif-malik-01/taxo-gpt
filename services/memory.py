@@ -9,7 +9,7 @@ from services.database import get_redis, AsyncSessionLocal
 import secrets
 import string
 from sqlalchemy.orm import selectinload
-from services.models import ChatSession, ChatMessage, UserProfile, User, SharedSession, UserUsage
+from services.models import ChatSession, ChatMessage, UserProfile, User, SharedSession, UserUsage, CreditLog
 from api.config import settings
 
 # Key prefixes
@@ -169,11 +169,27 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession):
         # Deduct balance (ensure it doesn't go below 0, though check_credits should handle this)
         if usage.draft_reply_balance > 0:
             usage.draft_reply_balance -= 1
+            log = CreditLog(
+                user_id=user_id,
+                amount=-1,
+                credit_type="draft",
+                transaction_type="usage",
+                reference_id=session_id
+            )
+            db.add(log)
         usage.draft_reply_used += 1
     else:
         # Simple queries are "unlimited" for now, but we still decrement balance to track
         if usage.simple_query_balance > 0:
             usage.simple_query_balance -= 1
+            log = CreditLog(
+                user_id=user_id,
+                amount=-1,
+                credit_type="simple",
+                transaction_type="usage",
+                reference_id=session_id
+            )
+            db.add(log)
         usage.simple_query_used += 1
     
     await db.commit()

@@ -43,6 +43,7 @@ class ChatSession(Base):
 
     user = relationship("User", back_populates="sessions")
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+    shared_links = relationship("SharedSession", back_populates="session", cascade="all, delete-orphan")
 
 
 class UserUsage(Base):
@@ -54,7 +55,7 @@ class UserUsage(Base):
     # Balances (What is left to spend)
     # Using -1 or a very high number for "Unlimited"
     simple_query_balance = Column(Integer, default=1000000) 
-    draft_reply_balance = Column(Integer, default=0)
+    draft_reply_balance = Column(Integer, default=3)
     
     # Lifetime usage (For analytics)
     simple_query_used = Column(Integer, default=0)
@@ -93,11 +94,30 @@ class PaymentTransaction(Base):
     package_id = Column(Integer, ForeignKey("credit_packages.id"), nullable=True)
     credits_added = Column(Integer)
     
+    coupon_id = Column(Integer, ForeignKey("coupons.id"), nullable=True)
+    discount_amount = Column(Integer, default=0) # In paise
+    
     status = Column(String, default="pending") # pending, completed, failed
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
     package = relationship("CreditPackage")
+    coupon = relationship("Coupon")
+
+
+class Coupon(Base):
+    __tablename__ = "coupons"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String, unique=True, index=True, nullable=False)
+    discount_type = Column(String, nullable=False) # 'percentage' or 'fixed'
+    discount_value = Column(Integer, nullable=False) # In paise or 0-100 percentage
+    max_uses = Column(Integer, nullable=True)
+    current_uses = Column(Integer, default=0)
+    valid_from = Column(DateTime(timezone=True), nullable=True)
+    valid_until = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class ChatMessage(Base):
@@ -133,5 +153,21 @@ class SharedSession(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=True)
 
-    session = relationship("ChatSession")
+    session = relationship("ChatSession", back_populates="shared_links")
+
+
+class CreditLog(Base):
+    __tablename__ = "credit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    amount = Column(Integer, nullable=False) # Positive for credit, negative for debit
+    credit_type = Column(String, nullable=False) # 'draft' or 'simple'
+    transaction_type = Column(String, nullable=False) # 'purchase', 'usage', 'admin_adjustment'
+    
+    reference_id = Column(String, nullable=True) # e.g. order_id or session_id
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
 

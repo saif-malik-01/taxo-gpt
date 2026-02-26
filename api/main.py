@@ -276,6 +276,7 @@ async def ask_gst(
     }
 
 
+@app.post("/chat/stream")
 @app.post("/chat/ask/stream")
 async def ask_gst_stream(
     background_tasks: BackgroundTasks,
@@ -298,9 +299,9 @@ async def ask_gst_stream(
     user_id = db_user.id
  
     # --- CREDIT CHECK ---
-    # We check has_files later but for pre-flight we can check if files exist in the request
-    # Since it's multipart, we can see 'files' list
-    has_files_pre = files and len(files) > 0
+    # Robust file detection: some clients send parts with empty filenames
+    has_files_pre = any(f.filename for f in files) if files else False
+    
     allowed, error_msg = await check_credits(user_id, session_id, has_files_pre, db)
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
@@ -338,7 +339,12 @@ async def ask_gst_stream(
             if has_files and temp_file_paths:
                 filenames = [fp[2] for fp in temp_file_paths]
                 user_message += f"\n\n[Documents: {', '.join(filenames)}]"
+            
             await add_message(session_id, "user", user_message, user_id)
+            
+            # TRACK USAGE IMMEDIATELY after message is saved and session is upgraded
+            # This ensures we charge for the "Draft" feature as soon as the work begins
+            await track_usage(user_id, session_id, db)
 
             profile         = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
@@ -695,7 +701,7 @@ async def ask_gst_stream(
             if not message_saved:
                 assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
 
-            await track_usage(user_id, session_id, db)
+            # track_usage moved to beginning of stream_generator
 
             background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
 

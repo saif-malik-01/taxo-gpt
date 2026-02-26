@@ -12,7 +12,7 @@ from services.auth.jwt import create_access_token
 from services.auth.utils import verify_password, get_password_hash
 from services.auth.deps import auth_guard
 from services.database import get_db
-from services.models import User, UserProfile
+from services.models import User, UserProfile, UserUsage
 from services.redis import add_session, remove_session
 from api.config import settings
 import uuid
@@ -74,9 +74,13 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
                 await db.commit()
                 await db.refresh(user)
 
-                # Create empty profile
+                # Create empty profile and usage
                 new_profile = UserProfile(user_id=user.id, preferences={})
                 db.add(new_profile)
+                
+                new_usage = UserUsage(user_id=user.id)
+                db.add(new_usage)
+                
                 await db.commit()
 
         session_id = str(uuid.uuid4())
@@ -124,9 +128,13 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     await db.commit()
     await db.refresh(new_user)
 
-    # Create empty profile
+    # Create empty profile and usage
     new_profile = UserProfile(user_id=new_user.id, preferences={})
     db.add(new_profile)
+    
+    new_usage = UserUsage(user_id=new_user.id)
+    db.add(new_usage)
+    
     await db.commit()
 
     # Create session
