@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import httpx
 
 from services.auth.jwt import create_access_token
 from services.auth.utils import verify_password, get_password_hash
@@ -29,6 +30,9 @@ class LoginResponse(BaseModel):
 
 class GoogleLoginRequest(BaseModel):
     credential: str
+
+class FacebookLoginRequest(BaseModel):
+    access_token: str
 
 @router.post("/google", response_model=LoginResponse)
 async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(get_db)):
@@ -97,6 +101,93 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
 
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/facebook", response_model=LoginResponse)
+async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        # Verify Facebook token with Graph API
+        async with httpx.AsyncClient() as client:
+            fb_res = await client.get(
+                "https://graph.facebook.com/me",
+                params={
+                    "fields": "id,name,email",
+                    "access_token": payload.access_token
+                }
+            )
+            
+            if fb_res.status_code != 200:
+                raise HTTPException(status_code=401, detail="Invalid Facebook token")
+            
+            fb_data = fb_res.json()
+            
+        fb_id = fb_data.get('id')
+        email = fb_data.get('email')
+        name = fb_data.get('name')
+
+        if not fb_id:
+            raise HTTPException(status_code=401, detail="Could not retrieve Facebook ID")
+
+        # Check if user exists by facebook_id
+        result = await db.execute(select(User).where(User.facebook_id == fb_id))
+        user = result.scalars().first()
+
+        if not user:
+            # If no email from FB (rare but possible), we might need another way or just fail
+            if not email:
+                # We can try to find by ID only or ask for email. 
+                # For simplicity, if email is missing, we'll use a placeholder or fail.
+                # Usually FB provides email if requested in scopes.
+                pass
+
+            if email:
+                # Check if user exists by email
+                result = await db.execute(select(User).where(User.email == email))
+                user = result.scalars().first()
+
+            if user:
+                # Link existing user to Facebook account
+                user.facebook_id = fb_id
+                if not user.full_name and name:
+                    user.full_name = name
+                await db.commit()
+            else:
+                # Create new user
+                # If email is missing, we generate a fake one or handle it
+                effective_email = email or f"{fb_id}@facebook.user"
+                user = User(
+                    email=effective_email,
+                    facebook_id=fb_id,
+                    full_name=name,
+                    password_hash=None,
+                    role="user"
+                )
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
+
+                # Create profile and usage
+                new_profile = UserProfile(user_id=user.id, preferences={})
+                db.add(new_profile)
+                new_usage = UserUsage(user_id=user.id)
+                db.add(new_usage)
+                await db.commit()
+
+        session_id = str(uuid.uuid4())
+        await add_session(user.id, session_id, user.max_sessions)
+
+        token = create_access_token({
+            "sub": user.email,
+            "id": user.id,
+            "role": user.role,
+            "session_id": session_id
+        })
+
+        return {"access_token": token}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

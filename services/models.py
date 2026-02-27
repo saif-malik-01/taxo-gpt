@@ -13,6 +13,7 @@ class User(Base):
     country = Column(String, nullable=True)
     password_hash = Column(String, nullable=True)
     google_id = Column(String, unique=True, index=True, nullable=True)
+    facebook_id = Column(String, unique=True, index=True, nullable=True)
     role = Column(String, default="user")
     max_sessions = Column(Integer, default=1)  # Dynamic session limit
     created_at = Column(DateTime(timezone=True), server_default=func.now())

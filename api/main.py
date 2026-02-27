@@ -439,7 +439,9 @@ async def ask_gst_stream(
                     "type":              "retrieval",
                     "sources":           [],
                     "full_judgments":    {},
+                    "message_id":        None,
                     "session_id":        session_id,
+                    "id":                None,
                     "document_metadata": document_metadata,
                     "document_analysis": structured
                 }) + "\n"
@@ -551,7 +553,6 @@ async def ask_gst_stream(
                             yield json.dumps({"type": "content", "delta": delta}) + "\n"
                         elif ctype == "retrieval":
                             _merge_sources(all_sources, chunk.get("sources", []) or [], seen_source_ids)
-                        elif ctype == "metadata":
                             _merge_full_judgments(all_full_judgments, chunk.get("full_judgments", {}) or {})
 
                     full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
@@ -612,7 +613,7 @@ async def ask_gst_stream(
                         retrieval_obj = {
                             "type":              "retrieval",
                             "sources":           chunk.get("sources", []) or [],
-                            "full_judgments":    {},
+                            "full_judgments":    chunk.get("full_judgments", {}) or {},
                             "message_id":        message_id,
                             "session_id":        session_id,
                             "id":                message_id,
@@ -620,13 +621,6 @@ async def ask_gst_stream(
                             "document_analysis": structured
                         }
                         yield json.dumps(retrieval_obj) + "\n"
-
-                    elif ctype == "metadata":
-                        # Yield full_judgments immediately as they arrive
-                        yield json.dumps({
-                            "type":          "metadata",
-                            "full_judgments": chunk.get("full_judgments", {}) or {}
-                        }) + "\n"
 
                     elif ctype == "citations":
                         yield json.dumps({
@@ -678,17 +672,10 @@ async def ask_gst_stream(
                     yield json.dumps({
                         "type":           "retrieval",
                         "sources":        chunk.get("sources", []) or [],
-                        "full_judgments": {},
+                        "full_judgments": chunk.get("full_judgments", {}) or {},
                         "message_id":     message_id,
                         "session_id":     session_id,
                         "id":             message_id
-                    }) + "\n"
-
-                elif ctype == "metadata":
-                    # Yield full_judgments immediately as they arrive
-                    yield json.dumps({
-                        "type":          "metadata",
-                        "full_judgments": chunk.get("full_judgments", {}) or {}
                     }) + "\n"
 
                 elif ctype == "citations":

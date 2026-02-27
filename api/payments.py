@@ -160,6 +160,30 @@ async def update_package(
     await db.commit()
     return {"status": "updated"}
 
+@router.delete("/admin/package/{package_id}")
+async def delete_package(
+    package_id: int,
+    user=Depends(admin_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    res = await db.execute(select(CreditPackage).where(CreditPackage.id == package_id))
+    package = res.scalars().first()
+    
+    if not package:
+        raise HTTPException(status_code=404, detail="Package not found")
+    
+    # Nullify references in transactions before deleting
+    from sqlalchemy import update
+    await db.execute(
+        update(PaymentTransaction)
+        .where(PaymentTransaction.package_id == package_id)
+        .values(package_id=None)
+    )
+    
+    await db.delete(package)
+    await db.commit()
+    return {"status": "deleted", "id": package_id}
+
 @router.post("/admin/coupon")
 async def create_coupon(
     payload: CouponCreate,
@@ -211,6 +235,29 @@ async def update_coupon(
     
     await db.commit()
     return {"status": "updated"}
+
+@router.delete("/admin/coupon/{coupon_id}")
+async def delete_coupon(
+    coupon_id: int,
+    user=Depends(admin_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    res = await db.execute(select(Coupon).where(Coupon.id == coupon_id))
+    coupon = res.scalars().first()
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+        
+    # Nullify references in transactions before deleting
+    from sqlalchemy import update
+    await db.execute(
+        update(PaymentTransaction)
+        .where(PaymentTransaction.coupon_id == coupon_id)
+        .values(coupon_id=None)
+    )
+    
+    await db.delete(coupon)
+    await db.commit()
+    return {"status": "deleted", "id": coupon_id}
 
 @router.post("/validate-coupon")
 async def validate_coupon(

@@ -373,23 +373,18 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     stream_complete_time = time.time() - start_time
     logger.info(f"✓ Enhanced response streaming complete in {stream_complete_time:.2f}s")
     
-    # Step 8: ✅ SEND SOURCES
-    logger.info("📤 Sending retrieval sources...")
+    # Step 8: Wait for full_judgments and citation metadata
+    full_judgments = await full_judgments_task
+    logger.info(f"✓ Full judgments ready: {len(full_judgments)}")
+
+    # Step 9: ✅ SEND SOURCES AND METADATA TOGETHER
+    logger.info("📤 Sending retrieval sources and judgments...")
     yield {
         "type": "retrieval",
         "sources": retrieved,
-        "full_judgments": {}
-    }
-    logger.info("✓ Sent retrieval metadata")
-    
-    # Step 9: Wait for full_judgments and send
-    full_judgments = await full_judgments_task
-    logger.info(f"✓ Full judgments ready: {len(full_judgments)}")
-    
-    yield {
-        "type": "metadata",
         "full_judgments": full_judgments
     }
+    logger.info("✓ Sent retrieval metadata and sources")
     
     # Step 10: Send citation metadata
     if party_citations:

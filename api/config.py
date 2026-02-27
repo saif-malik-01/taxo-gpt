@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     FEEDBACK_RECIPIENT_EMAIL: str = "atul@gmail.com"
     GOOGLE_CLIENT_ID: str = ""
+    FACEBOOK_APP_ID: str = ""
+    FACEBOOK_APP_SECRET: str = ""
     
     # Razorpay Configuration
     RAZORPAY_KEY_ID: str = ""
