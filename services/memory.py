@@ -50,7 +50,7 @@ async def get_session_history(session_id: str, limit: int = 50):
             
         return history
 
-async def add_message(session_id: str, role: str, content: str, user_id: int = None):
+async def add_message(session_id: str, role: str, content: str, user_id: int = None, chat_mode: str = None):
     # 1. Update DB First to get the ID
     async with AsyncSessionLocal() as db:
         # Check if session exists, if not create it (only if user_id is provided)
@@ -58,18 +58,27 @@ async def add_message(session_id: str, role: str, content: str, user_id: int = N
              # Fast check if session exists
             session_exists = await db.execute(select(ChatSession.id).where(ChatSession.id == session_id))
             if not session_exists.scalar():
-                session_type = "draft" if role == "user" and "[Documents:" in content else "simple"
+                session_type = "simple"
+                if chat_mode:
+                    session_type = chat_mode
+                elif role == "user" and "[Documents:" in content:
+                    session_type = "draft"
+                    
                 new_session = ChatSession(id=session_id, user_id=user_id, title=content[:30], session_type=session_type)
                 db.add(new_session)
                 await db.commit()
-            elif role == "user" and "[Documents:" in content:
-                # Upgrade existing session to draft if a document is uploaded
-                await db.execute(
-                    ChatSession.__table__.update()
-                    .where(ChatSession.id == session_id)
-                    .values(session_type="draft")
-                )
-                await db.commit()
+            elif chat_mode == "draft" or (role == "user" and "[Documents:" in content):
+                # Upgrade existing session to draft if explicitly requested or a document is uploaded
+                current_type_res = await db.execute(select(ChatSession.session_type).where(ChatSession.id == session_id))
+                current_type = current_type_res.scalar()
+                
+                if current_type != "draft":
+                    await db.execute(
+                        ChatSession.__table__.update()
+                        .where(ChatSession.id == session_id)
+                        .values(session_type="draft")
+                    )
+                    await db.commit()
 
         new_msg = ChatMessage(session_id=session_id, role=role, content=content)
         db.add(new_msg)
@@ -194,13 +203,15 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession):
     
     await db.commit()
 
-async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession):
+async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession, chat_mode: str = None):
     """
     Gatekeeper check before the LLM runs.
     """
     # 1. Determine effective session type for this request
     effective_type = "simple"
-    if has_files:
+    if chat_mode:
+        effective_type = chat_mode
+    elif has_files:
         effective_type = "draft"
     else:
         # Check existing session type

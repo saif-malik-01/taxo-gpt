@@ -276,15 +276,50 @@ async def ask_gst(
     }
 
 
-@app.post("/chat/stream")
-@app.post("/chat/ask/stream")
-async def ask_gst_stream(
+@app.post("/chat/stream/simple")
+@app.post("/chat/ask/stream/simple")
+async def ask_gst_stream_simple(
+    background_tasks: BackgroundTasks,
+    question: str = Form(...),
+    session_id: Optional[str] = Form(None),
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    return await _ask_gst_stream_core("simple", background_tasks, question, session_id, [], user, db)
+
+@app.post("/chat/stream/draft")
+@app.post("/chat/ask/stream/draft")
+async def ask_gst_stream_draft(
     background_tasks: BackgroundTasks,
     question: str = Form(...),
     session_id: Optional[str] = Form(None),
     files: List[UploadFile] = File(default=[]),
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
+):
+    return await _ask_gst_stream_core("draft", background_tasks, question, session_id, files, user, db)
+
+@app.post("/chat/stream")
+@app.post("/chat/ask/stream")
+async def ask_gst_stream_legacy(
+    background_tasks: BackgroundTasks,
+    question: str = Form(...),
+    session_id: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    chat_mode = "draft" if files and any(f.filename for f in files) else "simple"
+    return await _ask_gst_stream_core(chat_mode, background_tasks, question, session_id, files, user, db)
+
+async def _ask_gst_stream_core(
+    chat_mode: str,
+    background_tasks: BackgroundTasks,
+    question: str,
+    session_id: Optional[str],
+    files: List[UploadFile],
+    user,
+    db: AsyncSession
 ):
     import logging
     logger = logging.getLogger(__name__)
@@ -302,7 +337,7 @@ async def ask_gst_stream(
     # Robust file detection: some clients send parts with empty filenames
     has_files_pre = any(f.filename for f in files) if files else False
     
-    allowed, error_msg = await check_credits(user_id, session_id, has_files_pre, db)
+    allowed, error_msg = await check_credits(user_id, session_id, has_files_pre, db, chat_mode=chat_mode)
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
@@ -340,7 +375,7 @@ async def ask_gst_stream(
                 filenames = [fp[2] for fp in temp_file_paths]
                 user_message += f"\n\n[Documents: {', '.join(filenames)}]"
             
-            await add_message(session_id, "user", user_message, user_id)
+            await add_message(session_id, "user", user_message, user_id, chat_mode=chat_mode)
             
             # TRACK USAGE IMMEDIATELY after message is saved and session is upgraded
             # This ensures we charge for the "Draft" feature as soon as the work begins
@@ -849,7 +884,12 @@ async def list_sessions(
     sessions = res.scalars().all()
 
     return [
-        {"id": s.id, "title": s.title, "created_at": s.created_at.isoformat() if s.created_at else None}
+        {
+            "id": s.id,
+            "title": s.title,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "session_type": getattr(s, "session_type", "simple")  # Fallback just in case
+        }
         for s in sessions
     ]
 
