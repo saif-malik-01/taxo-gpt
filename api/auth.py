@@ -37,14 +37,23 @@ class FacebookLoginRequest(BaseModel):
 @router.post("/google", response_model=LoginResponse)
 async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(get_db)):
     try:
-        # Verify Google token
-        # Skip verification if in development and token is "debug" (or similar if needed)
-        # But for now, let's implement proper verification
-        idinfo = id_token.verify_oauth2_token(
-            payload.credential, 
-            google_requests.Request(), 
-            settings.GOOGLE_CLIENT_ID
-        )
+        # Check if credential is an access token (starts with ya29.)
+        if payload.credential.startswith("ya29."):
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://www.googleapis.com/oauth2/v3/userinfo",
+                    headers={"Authorization": f"Bearer {payload.credential}"}
+                )
+                if resp.status_code != 200:
+                    raise ValueError(f"Invalid access token: {resp.text}")
+                idinfo = resp.json()
+        else:
+            # It's an ID token (JWT)
+            idinfo = id_token.verify_oauth2_token(
+                payload.credential, 
+                google_requests.Request(), 
+                settings.GOOGLE_CLIENT_ID
+            )
 
         google_id = idinfo['sub']
         email = idinfo['email']
