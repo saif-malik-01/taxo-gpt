@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
-from sqlalchemy import select
+from sqlalchemy import select, func
 from starlette.concurrency import run_in_threadpool
 
 from services.chat.engine import chat, chat_stream
@@ -22,6 +22,7 @@ from services.vector.store import VectorStore
 from services.auth.deps import auth_guard
 from api.auth import router as auth_router
 from api.payments import router as payment_router
+from api.admin import router as admin_router
 from services.database import get_db, AsyncSession
 from services.memory import get_session_history, add_message, get_user_profile, share_session, get_shared_session, track_usage, check_credits
 from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage, UserUsage
@@ -76,6 +77,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(payment_router)
+app.include_router(admin_router)
 
 # ---------------- DATA ---------------- #
 
@@ -232,7 +234,7 @@ async def ask_gst(
     if not email:
         raise HTTPException(status_code=401, detail="Invalid user")
 
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = result.scalars().first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -327,7 +329,7 @@ async def _ask_gst_stream_core(
     session_id = session_id or str(uuid.uuid4())
 
     email  = user.get("sub")
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = result.scalars().first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -768,7 +770,7 @@ async def get_history(
     db: AsyncSession = Depends(get_db)
 ):
     email = user.get("sub")
-    res   = await db.execute(select(User).where(User.email == email))
+    res   = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = res.scalars().first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -797,7 +799,7 @@ async def enable_session_sharing(
         res   = await db.execute(
             select(ChatSession)
             .join(User)
-            .where(ChatSession.id == session_id, User.email == email)
+            .where(ChatSession.id == session_id, func.lower(User.email) == email.lower())
         )
         session = res.scalars().first()
         if not session:
@@ -838,7 +840,7 @@ async def get_user_credits(
     db: AsyncSession = Depends(get_db)
 ):
     email = user.get("sub")
-    res = await db.execute(select(User).where(User.email == email))
+    res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = res.scalars().first()
     
     res = await db.execute(select(UserUsage).where(UserUsage.user_id == db_user.id))
@@ -871,7 +873,7 @@ async def list_sessions(
     if not email:
         raise HTTPException(status_code=401, detail="Invalid user")
 
-    res = await db.execute(select(User).where(User.email == email))
+    res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = res.scalars().first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -901,7 +903,7 @@ async def delete_chat(
     db: AsyncSession = Depends(get_db)
 ):
     email = user.get("sub")
-    res   = await db.execute(select(User).where(User.email == email))
+    res   = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = res.scalars().first()
 
     res = await db.execute(

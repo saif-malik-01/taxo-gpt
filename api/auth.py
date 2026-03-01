@@ -1,6 +1,7 @@
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -56,7 +57,7 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
             )
 
         google_id = idinfo['sub']
-        email = idinfo['email']
+        email = idinfo['email'].lower()
         name = idinfo.get('name')
 
         # Check if user exists by google_id
@@ -64,8 +65,8 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
         user = result.scalars().first()
 
         if not user:
-            # Check if user exists by email
-            result = await db.execute(select(User).where(User.email == email))
+            # Check if user exists by email (case-insensitive)
+            result = await db.execute(select(User).where(func.lower(User.email) == email))
             user = result.scalars().first()
 
             if user:
@@ -133,6 +134,8 @@ async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depen
             
         fb_id = fb_data.get('id')
         email = fb_data.get('email')
+        if email:
+            email = email.lower()
         name = fb_data.get('name')
 
         if not fb_id:
@@ -151,8 +154,8 @@ async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depen
                 pass
 
             if email:
-                # Check if user exists by email
-                result = await db.execute(select(User).where(User.email == email))
+                # Check if user exists by email (case-insensitive)
+                result = await db.execute(select(User).where(func.lower(User.email) == email))
                 user = result.scalars().first()
 
             if user:
@@ -210,14 +213,15 @@ class RegisterRequest(BaseModel):
 
 @router.post("/register", response_model=LoginResponse)
 async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower()
     # Check if user exists
-    result = await db.execute(select(User).where(User.email == payload.email))
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
     if result.scalars().first():
         raise HTTPException(status_code=400, detail="Email already registered")
     
     # Create user
     new_user = User(
-        email=payload.email, 
+        email=email, 
         password_hash=get_password_hash(payload.password),
         full_name=payload.full_name,
         mobile_number=payload.mobile_number,
@@ -254,7 +258,8 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 @router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == payload.email))
+    email = payload.email.lower()
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
     user = result.scalars().first()
 
     if not user or not verify_password(payload.password, user.password_hash):
@@ -290,7 +295,7 @@ async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
     res = await db.execute(
         select(User)
         .options(selectinload(User.profile))
-        .where(User.email == email)
+        .where(func.lower(User.email) == email.lower())
     )
     db_user = res.scalars().first()
     
@@ -326,7 +331,7 @@ async def update_profile(
     email = user.get("sub")
     
     # Get user
-    res = await db.execute(select(User).where(User.email == email))
+    res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = res.scalars().first()
     
     # Get profile

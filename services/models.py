@@ -18,8 +18,11 @@ class User(Base):
     max_sessions = Column(Integer, default=1)  # Dynamic session limit
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    profile = relationship("UserProfile", back_populates="user", uselist=False)
-    sessions = relationship("ChatSession", back_populates="user")
+    profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
+    usage = relationship("UserUsage", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    transactions = relationship("PaymentTransaction", back_populates="user", cascade="all, delete-orphan")
+    credit_logs = relationship("CreditLog", back_populates="user", cascade="all, delete-orphan")
 
 
 class UserProfile(Base):
@@ -64,7 +67,7 @@ class UserUsage(Base):
     
     last_updated = Column(DateTime(timezone=True), onupdate=func.now())
     
-    user = relationship("User")
+    user = relationship("User", back_populates="usage")
 
 
 class CreditPackage(Base):
@@ -101,7 +104,7 @@ class PaymentTransaction(Base):
     status = Column(String, default="pending") # pending, completed, failed
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    user = relationship("User")
+    user = relationship("User", back_populates="transactions")
     package = relationship("CreditPackage")
     coupon = relationship("Coupon")
 
@@ -170,5 +173,5 @@ class CreditLog(Base):
     reference_id = Column(String, nullable=True) # e.g. order_id or session_id
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    user = relationship("User")
+    user = relationship("User", back_populates="credit_logs")
 
