@@ -7,7 +7,7 @@ from services.payments import create_razorpay_order, verify_payment
 from services.models import CreditPackage, Coupon, PaymentTransaction, User, CreditLog
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
@@ -304,23 +304,112 @@ async def validate_coupon(
 
 @router.get("/admin/analytics")
 async def get_analytics(
+    user_id: Optional[int] = None,
     user=Depends(admin_guard),
     db: AsyncSession = Depends(get_db)
 ):
+    # Time slices (UTC)
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    
     # Total Users
-    res_users = await db.execute(select(func.count(User.id)))
+    user_q = select(func.count(User.id))
+    if user_id:
+        user_q = user_q.where(User.id == user_id)
+    res_users = await db.execute(user_q)
     total_users = res_users.scalar() or 0
     
     # Revenue (Only completed transactions)
-    res_rev = await db.execute(select(func.sum(PaymentTransaction.amount)).where(PaymentTransaction.status == "completed"))
+    rev_q = select(func.sum(PaymentTransaction.amount)).where(PaymentTransaction.status == "completed")
+    if user_id:
+        rev_q = rev_q.where(PaymentTransaction.user_id == user_id)
+    res_rev = await db.execute(rev_q)
     total_revenue_paise = res_rev.scalar() or 0
     
     # Packages Sold
-    res_sales = await db.execute(select(func.count(PaymentTransaction.id)).where(PaymentTransaction.status == "completed"))
+    sales_q = select(func.count(PaymentTransaction.id)).where(PaymentTransaction.status == "completed")
+    if user_id:
+        sales_q = sales_q.where(PaymentTransaction.user_id == user_id)
+    res_sales = await db.execute(sales_q)
     total_sales = res_sales.scalar() or 0
     
+    # Today's Usage (CreditLog entries with transaction_type="usage")
+    usage_q = select(func.count(CreditLog.id)).where(CreditLog.transaction_type == "usage")
+    if user_id:
+        usage_q = usage_q.where(CreditLog.user_id == user_id)
+        
+    res_today = await db.execute(usage_q.where(CreditLog.created_at >= today_start))
+    today_usage = res_today.scalar() or 0
+    
+    # Yesterday's Usage
+    res_yesterday = await db.execute(
+        usage_q.where(CreditLog.created_at >= yesterday_start, CreditLog.created_at < today_start)
+    )
+    yesterday_usage = res_yesterday.scalar() or 0
+    
     return {
+        "user_id": user_id,
         "total_users": total_users,
         "total_revenue_paise": total_revenue_paise,
-        "total_sales": total_sales
+        "total_sales": total_sales,
+        "today_usage": today_usage,
+        "yesterday_usage": yesterday_usage
     }
+
+@router.get("/admin/analytics/users")
+async def get_user_wise_analytics(
+    user=Depends(admin_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Returns a list of users with their today and yesterday usage stats.
+    """
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    
+    # Aggregate usage today per user
+    sq_today = (
+        select(CreditLog.user_id, func.count(CreditLog.id).label("today_count"))
+        .where(CreditLog.transaction_type == "usage", CreditLog.created_at >= today_start)
+        .group_by(CreditLog.user_id)
+        .subquery()
+    )
+    
+    # Aggregate usage yesterday per user
+    sq_yesterday = (
+        select(CreditLog.user_id, func.count(CreditLog.id).label("yesterday_count"))
+        .where(CreditLog.transaction_type == "usage", CreditLog.created_at >= yesterday_start, CreditLog.created_at < today_start)
+        .group_by(CreditLog.user_id)
+        .subquery()
+    )
+    
+    # Query users and join with usage aggregates
+    from sqlalchemy import outerjoin
+    stmt = (
+        select(
+            User.id,
+            User.email,
+            User.full_name,
+            func.coalesce(sq_today.c.today_count, 0).label("today_usage"),
+            func.coalesce(sq_yesterday.c.yesterday_count, 0).label("yesterday_usage")
+        )
+        .outerjoin(sq_today, User.id == sq_today.c.user_id)
+        .outerjoin(sq_yesterday, User.id == sq_yesterday.c.user_id)
+        .order_by(func.coalesce(sq_today.c.today_count, 0).desc())
+        .limit(100)
+    )
+    
+    res = await db.execute(stmt)
+    results = []
+    for row in res:
+        results.append({
+            "user_id": row.id,
+            "email": row.email,
+            "full_name": row.full_name,
+            "today_usage": row.today_usage,
+            "yesterday_usage": row.yesterday_usage
+        })
+        
+    return results
