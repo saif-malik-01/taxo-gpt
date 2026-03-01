@@ -499,10 +499,11 @@ async def _ask_gst_stream_core(
                     for i in range(0, len(header_text), chunk_size):
                         yield json.dumps({"type": "content", "delta": header_text[i:i+chunk_size]}) + "\n"
 
-                mode      = detect_mode(question)
-                recipient = structured.get("recipient")
-                sender    = structured.get("sender")
-                total     = len(issues_list)
+                mode        = detect_mode(question)
+                recipient   = structured.get("recipient")
+                sender      = structured.get("sender")
+                doc_summary = structured.get("summary", "")   # <-- ADDED
+                total       = len(issues_list)
 
                 full_issues_text  = ""
                 all_sources       = []
@@ -516,6 +517,7 @@ async def _ask_gst_stream_core(
                     all_chunks=ALL_CHUNKS,
                     recipient=recipient,
                     sender=sender,
+                    doc_summary=doc_summary,               # <-- ADDED
                     profile_summary=profile_summary,
                     max_parallel=3
                 ):
