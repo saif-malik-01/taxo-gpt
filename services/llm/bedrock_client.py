@@ -2,9 +2,7 @@ from botocore.config import Config
 import boto3
 from dotenv import load_dotenv
 import logging
-
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 bedrock_config = Config(
@@ -24,18 +22,14 @@ bedrock = boto3.client(
 
 MODEL_ID = "qwen.qwen3-next-80b-a3b"
 
-
 from typing import Iterator, List, Optional
+
 
 def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> str:
     """
-    Call Qwen model on AWS Bedrock using converse() with error handling
-    Args:
-        prompt: The user message content
-        system_prompts: Optional list of system prompt strings
-        temperature: Inference temperature (0.0 for deterministic)
+    Call Qwen model on AWS Bedrock using converse() with error handling.
+    Output tokens updated from 4096 to 8192 to utilise full model capacity.
     """
-
     messages = [
         {
             "role": "user",
@@ -44,7 +38,7 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
             ]
         }
     ]
-    
+
     system_block = []
     if system_prompts:
         for sp in system_prompts:
@@ -52,7 +46,7 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
 
     inference_config = {
         "temperature": temperature,
-        "maxTokens": 4096,
+        "maxTokens": 8192,
         "topP": 0.9
     }
 
@@ -67,6 +61,7 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
 
         response = bedrock.converse(**kwargs)
         return response["output"]["message"]["content"][0]["text"]
+
     except Exception as e:
         logger.error(f"Bedrock call failed: {str(e)}")
         return "NONE"
@@ -74,7 +69,8 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
 
 def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> Iterator[str]:
     """
-    Call Qwen model on AWS Bedrock using converse_stream()
+    Call Qwen model on AWS Bedrock using converse_stream().
+    Output tokens updated from 4096 to 8192 to utilise full model capacity.
     """
     messages = [
         {
@@ -92,7 +88,7 @@ def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None,
 
     inference_config = {
         "temperature": temperature,
-        "maxTokens": 4096,
+        "maxTokens": 8192,
         "topP": 0.9
     }
 
@@ -106,12 +102,12 @@ def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None,
             kwargs["system"] = system_block
 
         response = bedrock.converse_stream(**kwargs)
-
         stream = response.get("stream")
         if stream:
             for event in stream:
                 if "contentBlockDelta" in event:
                     yield event["contentBlockDelta"]["delta"]["text"]
+
     except Exception as e:
         logger.error(f"Bedrock stream failed: {str(e)}")
         yield "\n[Error: Connection to AI lost. Please try again or check your parameters.]"

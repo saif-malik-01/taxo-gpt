@@ -50,13 +50,73 @@ STRICT GUIDELINES:
 """
 
 
+# Character limit for token-aware trimming
+# 128k token context, 8192 reserved for output → ~120k tokens for input
+# At ~4 chars per token: 120,000 * 4 = 480,000 chars, using 360,000 as safe limit
+_MAX_HISTORY_CHARS = 360_000
+
+# Maximum Q&A pairs to fetch from history
+_MAX_HISTORY_PAIRS = 10
+
+
+def _trim_history_to_token_budget(
+    history: list,
+    system_prompt: str,
+    question: str,
+    primary_text: str,
+    supporting_text: str,
+) -> list:
+    """
+    Trims history pairs from oldest to newest until the combined character
+    count of all prompt components fits within _MAX_HISTORY_CHARS.
+
+    Minimum floor: 2 Q&A pairs (4 messages). Below that, history is dropped entirely.
+
+    Parameters
+    ----------
+    history       : list of {role, content} dicts, already capped at 10 pairs (20 msgs)
+    system_prompt : rendered system prompt string
+    question      : current user question
+    primary_text  : rendered primary chunks string
+    supporting_text: rendered supporting chunks string
+
+    Returns
+    -------
+    Trimmed history list (may be empty if even 2 pairs exceed the budget)
+    """
+    # Fixed components that do not change regardless of history size
+    fixed_chars = len(system_prompt) + len(question) + len(primary_text) + len(supporting_text)
+
+    # Work with a mutable copy; history is ordered oldest → newest
+    working = list(history)
+
+    while working:
+        history_chars = sum(len(m.get("content", "")) for m in working)
+        if fixed_chars + history_chars <= _MAX_HISTORY_CHARS:
+            break
+
+        # Need to trim — but enforce minimum floor of 4 messages (2 pairs)
+        if len(working) <= 4:
+            # Below floor — drop all history
+            working = []
+            break
+
+        # Drop oldest pair (first user message + first assistant message)
+        working = working[2:]
+
+    return working
+
+
 def build_structured_prompt(query, primary, supporting, history=[], profile_summary=None, document_context=None):
     """
     Builds the USER message content (Dynamic Context).
 
-    Supports optional document_context for analyzing uploaded documents.
-    If document_context is provided, it is integrated as the highest priority context.
+    - History is trimmed to the most recent 10 Q&A pairs before rendering.
+    - If combined character count exceeds 360k, oldest pairs are dropped
+      until within budget (floor: 2 pairs; below that, history is dropped).
+    - Supports optional document_context for analyzing uploaded documents.
     """
+
     def render(chunks):
         rendered_list = []
         for c in chunks:
@@ -125,12 +185,36 @@ def build_structured_prompt(query, primary, supporting, history=[], profile_summ
 
         return "\n\n".join(rendered_list)
 
-    def render_history(history):
-        if not history:
+    def render_history(msgs):
+        if not msgs:
             return "No previous context."
-        return "\n".join(f"{h['role'].upper()}: {h['content']}" for h in history[-10:])
+        return "\n".join(f"{h['role'].upper()}: {h['content']}" for h in msgs)
 
+    # ----------------------------------------------------------------
+    # Cap history to last _MAX_HISTORY_PAIRS pairs (20 messages)
+    # Each pair = 1 user message + 1 assistant message
+    # ----------------------------------------------------------------
+    max_messages = _MAX_HISTORY_PAIRS * 2
+    capped_history = list(history[-max_messages:]) if history else []
+
+    # ----------------------------------------------------------------
+    # Token-aware trimming
+    # ----------------------------------------------------------------
+    primary_text   = render(primary)
+    supporting_text = render(supporting)
+    system_prompt  = get_system_prompt(profile_summary)
+
+    trimmed_history = _trim_history_to_token_budget(
+        history=capped_history,
+        system_prompt=system_prompt,
+        question=query,
+        primary_text=primary_text,
+        supporting_text=supporting_text,
+    )
+
+    # ----------------------------------------------------------------
     # Build document context section if provided
+    # ----------------------------------------------------------------
     document_section = ""
     if document_context:
         document_section = f"""
@@ -141,7 +225,15 @@ DOCUMENT CONTEXT (UPLOADED BY USER - HIGHEST PRIORITY):
 
     user_message = f"""
 CONVERSATION HISTORY:
-{render_history(history)}
+{render_history(trimmed_history)}
+
+HISTORY USAGE INSTRUCTION:
+The conversation history above is provided as recent chat context.
+Use it naturally to maintain continuity. If a case, judgment, or legal position
+appears in the history, reference it in your response ONLY if it is directly
+relevant to the current question. If the current question is on a different
+topic or legal provision, do not reference prior cases from history.
+When in doubt, do not use it — the retrieved chunks below are the primary source.
 
 QUESTION:
 {query}
@@ -154,10 +246,10 @@ QUESTION:
 - Document analysis or specific questions about provided documents
 
 PRIMARY LEGAL MATERIAL (MOST RELEVANT):
-{render(primary)}
+{primary_text}
 
 SUPPORTING LEGAL MATERIAL (USE ONLY IF IT ADDS REAL VALUE):
-{render(supporting)}
+{supporting_text}
 
 Using the above material (especially the PRIMARY material{', and the document context if provided,' if document_context else ''}), answer the professional query.
 Use only the data that is actually present and relevant. Do not add sections or references for data that was not retrieved.

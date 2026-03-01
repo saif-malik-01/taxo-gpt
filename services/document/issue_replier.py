@@ -18,12 +18,6 @@ MODE_IN_FAVOUR = "in_favour"
 
 # ============================================================================
 # CHUNK TYPE SCORING
-# Priority (document issues only — does not affect regular query flow):
-#   Priority 1 — judgment                          → 40 pts (+ decision bonus)
-#   Priority 2 — draft_reply                       → 35 pts
-#   Priority 3 — notification, circular, act,
-#                rule, section                     → 25 pts (all same level)
-#   Priority 4 — everything else                   → 10 pts (all same level)
 # ============================================================================
 
 CHUNK_TYPE_SCORES = {
@@ -33,7 +27,7 @@ CHUNK_TYPE_SCORES = {
 
 LEGAL_SOURCE_TYPES = {"notification", "circular", "act", "rule", "section"}
 LEGAL_SOURCE_SCORE = 25
-DEFAULT_SCORE      = 10  # analytical_review, contemporary_issues, and all others
+DEFAULT_SCORE      = 10
 
 DECISION_BONUS = {
     MODE_DEFENSIVE: {
@@ -47,7 +41,7 @@ DECISION_BONUS = {
 }
 
 # ============================================================================
-# STATIC RETRIEVAL QUERY TEMPLATES (one per mode — no LLM call needed)
+# STATIC RETRIEVAL QUERY TEMPLATES
 # ============================================================================
 
 DEFENSIVE_TEMPLATE = (
@@ -61,14 +55,25 @@ IN_FAVOUR_TEMPLATE = (
 )
 
 
-def build_retrieval_query(issue: str, mode: str) -> str:
-    """Generate the static mode-specific retrieval query for an issue."""
+def build_retrieval_query(issue: str, mode: str, doc_summary: str = None) -> str:
+    """
+    Generate the mode-specific retrieval query for an issue.
+    If doc_summary is provided, append key facts from it to enrich retrieval.
+    """
     template = DEFENSIVE_TEMPLATE if mode == MODE_DEFENSIVE else IN_FAVOUR_TEMPLATE
-    return template.format(issue=issue)
+    base_query = template.format(issue=issue)
+
+    if doc_summary:
+        # Append a trimmed summary snippet to ground retrieval in document facts
+        # Keep it short — retrieval query should be concise
+        summary_snippet = doc_summary[:300].strip()
+        return f"{base_query}. Context: {summary_snippet}"
+
+    return base_query
 
 
 # ============================================================================
-# MODE DETECTION — keyword based, default defensive
+# MODE DETECTION
 # ============================================================================
 
 _IN_FAVOUR_KEYWORDS = [
@@ -81,11 +86,6 @@ _IN_FAVOUR_KEYWORDS = [
 
 
 def detect_mode(question: str) -> str:
-    """
-    Keyword-based mode detection from user question.
-    Checks in-favour keywords — if any match, return MODE_IN_FAVOUR.
-    Default — MODE_DEFENSIVE if no keyword matched.
-    """
     q = question.lower()
     if any(kw in q for kw in _IN_FAVOUR_KEYWORDS):
         logger.info("Mode detected: in_favour")
@@ -99,15 +99,8 @@ def detect_mode(question: str) -> str:
 # ============================================================================
 
 def score_chunk(chunk: dict, mode: str) -> float:
-    """
-    Score a chunk based on:
-      - Chunk type base score (priority hierarchy)
-      - Decision field bonus (judgments only, mode-dependent)
-      - Semantic similarity from retrieval (normalised 0–20 pts)
-    """
     chunk_type = chunk.get("chunk_type", "").lower()
 
-    # Base score
     if chunk_type == "judgment":
         base = CHUNK_TYPE_SCORES["judgment"]
     elif chunk_type == "draft_reply":
@@ -117,13 +110,11 @@ def score_chunk(chunk: dict, mode: str) -> float:
     else:
         base = DEFAULT_SCORE
 
-    # Decision field bonus — only for judgments
     decision_bonus = 0
     if chunk_type == "judgment":
         decision = chunk.get("metadata", {}).get("decision", "")
         decision_bonus = DECISION_BONUS.get(mode, {}).get(decision, 0)
 
-    # Semantic similarity score — carry forward from retrieval, normalise to 0–20
     similarity       = chunk.get("_score", 0.5)
     similarity_score = min(float(similarity) * 20, 20)
 
@@ -131,14 +122,10 @@ def score_chunk(chunk: dict, mode: str) -> float:
 
 
 # ============================================================================
-# SOURCE FORMATTER — same shape as non-document query sources
+# SOURCE FORMATTER
 # ============================================================================
 
 def _format_sources(chunks: list) -> list:
-    """
-    Format retrieved chunks into the same source shape returned by chat_stream
-    for non-document queries — id, chunk_type, text, metadata.
-    """
     sources = []
     for c in chunks:
         sources.append({
@@ -155,14 +142,6 @@ def _format_sources(chunks: list) -> list:
 # ============================================================================
 
 def get_sibling_chunks(retrieved_chunks: list, all_chunks: list) -> list:
-    """
-    For each retrieved chunk, fetch all other chunks sharing the same
-    section_number or source document from all_chunks.
-
-    Purpose: capture provisos, exceptions, and sub-clauses within the same
-    provision that semantic search may have missed — these are the most
-    common sources of defensive arguments in GST law.
-    """
     sibling_keys = set()
     for chunk in retrieved_chunks:
         meta    = chunk.get("metadata", {})
@@ -205,17 +184,14 @@ def _retrieve_and_rank_for_issue(
     mode: str,
     store,
     all_chunks: list,
+    doc_summary: str = None,
 ) -> Tuple[list, list]:
     """
     Three-pass retrieval for a single issue.
-
-    Pass 1 — reframed mode-specific query
-    Pass 2 — original issue text
-    Pass 3 — sibling chunk expansion on Pass 2 results
-
-    All chunks are deduplicated, scored, and sorted. Top 15 → primary, next 10 → supporting.
+    Pass 1 and Pass 2 queries are enriched with doc_summary key facts if available.
+    Pass 3 (sibling expansion) is unchanged.
     """
-    reframed_query = build_retrieval_query(issue, mode)
+    reframed_query = build_retrieval_query(issue, mode, doc_summary)
 
     pass1    = retrieve(query=reframed_query, vector_store=store, all_chunks=all_chunks, k=15)
     pass2    = retrieve(query=issue,          vector_store=store, all_chunks=all_chunks, k=15)
@@ -252,14 +228,25 @@ def _build_issue_prompt(
     issue: str,
     issue_number: int,
     total_issues: int,
+    all_issues: list,
     primary: list,
     supporting: list,
     mode: str,
     recipient: str = None,
     sender: str = None,
+    doc_summary: str = None,
     profile_summary: str = None,
 ) -> str:
-    """Build the user-turn prompt for generating a single issue reply."""
+    """
+    Build the user-turn prompt for a single issue reply.
+
+    Sends to LLM in this order:
+      1. Document details — sender, recipient, document type context
+      2. Full document summary — all factual details
+      3. All other issues in the notice — for consistency across replies
+      4. Current issue verbatim
+      5. Retrieved legal chunks — primary and supporting
+    """
 
     def render(chunks):
         parts = []
@@ -292,26 +279,56 @@ def _build_issue_prompt(
             "- Conclude by establishing that the obligation squarely applies to the recipient's facts and the allegation is legally sustainable."
         )
 
-    context_lines = []
-    if recipient:
-        context_lines.append(f"Notice Recipient: {recipient}")
+    # ---- Document details block ----
+    doc_details_lines = []
     if sender:
-        context_lines.append(f"Issuing Authority: {sender}")
-    context_block = "\n".join(context_lines)
+        doc_details_lines.append(f"Issuing Authority / Sender: {sender}")
+    if recipient:
+        doc_details_lines.append(f"Notice Recipient: {recipient}")
+    doc_details_block = "\n".join(doc_details_lines) if doc_details_lines else "Not specified"
+
+    # ---- Document summary block ----
+    doc_summary_block = doc_summary.strip() if doc_summary else "Not available"
+
+    # ---- All other issues block (for consistency awareness) ----
+    other_issues = [iss for idx, iss in enumerate(all_issues) if idx != issue_number - 1]
+    if other_issues:
+        other_issues_block = "\n".join(
+            f"{i + 1}. {iss}" for i, iss in enumerate(other_issues)
+        )
+    else:
+        other_issues_block = "This is the only issue in the notice."
 
     return f"""You are preparing the reply for Issue {issue_number} of {total_issues} from a legal notice.
 
-{context_block}
+============================================================
+DOCUMENT DETAILS
+============================================================
+{doc_details_block}
 
-ISSUE {issue_number}:
+============================================================
+DOCUMENT SUMMARY (factual context for this notice)
+============================================================
+{doc_summary_block}
+
+============================================================
+ALL OTHER ISSUES IN THIS NOTICE (for consistency)
+============================================================
+{other_issues_block}
+
+============================================================
+CURRENT ISSUE TO REPLY — Issue {issue_number} of {total_issues}
+============================================================
 {issue}
 
-INSTRUCTION:
+============================================================
+INSTRUCTION
+============================================================
 {mode_instruction}
 
 Your reply for this issue must:
-1. Acknowledge the allegation precisely.
-2. Provide counter-arguments using the legal material below.
+1. Acknowledge the allegation precisely, referencing the actual facts from the document summary above.
+2. Provide counter-arguments using the legal material below, grounded in the specific facts of this notice.
 3. Cite specific sections, provisos, notifications, circulars, or judgments that support the position.
 4. For judgments, state the decision and explain how it applies to this issue.
 5. Conclude with a clear statement on why this issue should be decided in the client's favour.
@@ -335,38 +352,40 @@ def _process_single_issue(
     issue: str,
     issue_number: int,
     total_issues: int,
+    all_issues: list,
     mode: str,
     store,
     all_chunks: list,
     recipient: str = None,
     sender: str = None,
+    doc_summary: str = None,
     profile_summary: str = None,
 ) -> Tuple[int, str, list, dict]:
     """
-    Full pipeline for one issue — runs in a thread pool:
-      retrieve → rank → build prompt → call LLM → compute full_judgments → return
-
+    Full pipeline for one issue — runs in a thread pool.
+    Now receives all_issues and doc_summary for full document context.
     Returns (issue_number, reply_text, sources, full_judgments).
-
-    sources       — primary chunks in same shape as non-document query sources
-    full_judgments — complete judgment data for all judgment chunks in primary,
-                     same shape as returned by chat_stream for non-document queries
     """
     try:
         logger.info(f"🔍 Processing Issue {issue_number}/{total_issues}: {issue[:80]}...")
 
-        primary, supporting = _retrieve_and_rank_for_issue(issue, mode, store, all_chunks)
+        # Enriched retrieval — pass doc_summary to improve query targeting
+        primary, supporting = _retrieve_and_rank_for_issue(
+            issue, mode, store, all_chunks, doc_summary=doc_summary
+        )
 
         system_prompt = get_system_prompt(profile_summary)
         user_prompt   = _build_issue_prompt(
             issue=issue,
             issue_number=issue_number,
             total_issues=total_issues,
+            all_issues=all_issues,
             primary=primary,
             supporting=supporting,
             mode=mode,
             recipient=recipient,
             sender=sender,
+            doc_summary=doc_summary,
             profile_summary=profile_summary,
         )
 
@@ -376,11 +395,7 @@ def _process_single_issue(
             temperature=0.0
         )
 
-        # Sources — same shape as non-document query sources
-        sources = _format_sources(primary)
-
-        # Full judgments — same shape as get_full_judgments in engine.py
-        # Only pass primary chunks to limit assembly cost per issue
+        sources        = _format_sources(primary)
         full_judgments = get_full_judgments(primary, all_chunks)
 
         logger.info(
@@ -391,14 +406,11 @@ def _process_single_issue(
 
     except Exception as e:
         logger.error(f"❌ Issue {issue_number} failed: {e}", exc_info=True)
-        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", {}, {}
+        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [], {}
 
 
 # ============================================================================
 # STREAMING ORCHESTRATOR
-# — processes all issues in parallel (max_parallel concurrent)
-# — yields results IN ORDER (issue 1 first, then 2, then 3...)
-# — streams each issue to client as soon as it is ready in sequence
 # ============================================================================
 
 async def process_issues_streaming(
@@ -408,18 +420,17 @@ async def process_issues_streaming(
     all_chunks: list,
     recipient: str = None,
     sender: str = None,
+    doc_summary: str = None,
     profile_summary: str = None,
     max_parallel: int = 3,
 ) -> AsyncGenerator[Tuple[int, str, list, dict], None]:
     """
     Async generator — yields (issue_number, reply_text, sources, full_judgments) in strict order.
 
-    All issues run in parallel (capped at max_parallel via semaphore).
-    Each issue result is stored in a per-issue Future.
-    The generator awaits futures in order (1, 2, 3...) so:
-      - Issue 1 is always yielded first even if issue 2 finishes sooner.
-      - Streaming starts as soon as issue 1 is ready — no wait for all issues.
-      - No mixing of issue streams possible.
+    Added parameter: doc_summary — passed through to each issue processor
+    so the LLM has full document context when drafting each reply.
+
+    All other behaviour (parallel processing, semaphore, ordered yielding) unchanged.
     """
     total     = len(issues)
     semaphore = asyncio.Semaphore(max_parallel)
@@ -434,9 +445,17 @@ async def process_issues_streaming(
             try:
                 result = await run_in_threadpool(
                     _process_single_issue,
-                    issue, issue_number, total,
-                    mode, store, all_chunks,
-                    recipient, sender, profile_summary
+                    issue,
+                    issue_number,
+                    total,
+                    issues,        # all_issues — full list for consistency
+                    mode,
+                    store,
+                    all_chunks,
+                    recipient,
+                    sender,
+                    doc_summary,   # document summary for factual grounding
+                    profile_summary
                 )
                 futures[issue_number].set_result(result)
             except Exception as e:
