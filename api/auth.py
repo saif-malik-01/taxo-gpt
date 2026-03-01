@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -20,6 +21,7 @@ from api.config import settings
 import uuid
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+logger = logging.getLogger(__name__)
 
 class LoginRequest(BaseModel):
     email: str
@@ -110,8 +112,10 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
         return {"access_token": token}
 
     except ValueError as e:
+        logger.warning(f"Google login failed for {payload.credential[:10]}...: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
     except Exception as e:
+        logger.error(f"Unexpected error during Google login: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/facebook", response_model=LoginResponse)
@@ -201,6 +205,7 @@ async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depen
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Unexpected error during Facebook login: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 class RegisterRequest(BaseModel):
@@ -217,6 +222,7 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     # Check if user exists
     result = await db.execute(select(User).where(func.lower(User.email) == email))
     if result.scalars().first():
+        logger.warning(f"Registration attempt failed: Email {email} already registered")
         raise HTTPException(status_code=400, detail="Email already registered")
     
     # Create user
@@ -263,6 +269,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     user = result.scalars().first()
 
     if not user or not verify_password(payload.password, user.password_hash):
+        logger.warning(f"Failed login attempt for email: {email}")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     session_id = str(uuid.uuid4())

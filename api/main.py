@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+import logging
 
 os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
 os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), '..', '.hf_cache')
@@ -35,33 +36,53 @@ from services.jobs import start_scheduler, stop_scheduler, list_jobs
 
 app = FastAPI(title="GST Expert API", version="2.1.0")
 
+# ---------------- LOGGING SETUP ---------------- #
+
+from services.logging_config import setup_logging
+from api.config import settings
+
+setup_logging(log_level=settings.LOG_LEVEL, log_file=settings.LOG_FILE)
+logger = logging.getLogger(__name__)
+
 # ---------------- LIFECYCLE EVENTS ---------------- #
 
 @app.on_event("startup")
 async def startup_event():
-    import logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__)
     logger.info("🚀 Starting GST Expert API...")
     try:
         start_scheduler()
         logger.info("✅ Background jobs initialized")
     except Exception as e:
-        logger.error(f"❌ Failed to start scheduler: {e}")
+        logger.error(f"❌ Failed to start scheduler: {e}", exc_info=True)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    import logging
-    logger = logging.getLogger(__name__)
     logger.info("👋 Shutting down GST Expert API...")
     try:
         stop_scheduler()
     except Exception as e:
-        logger.error(f"❌ Failed to stop scheduler: {e}")
+        logger.error(f"❌ Failed to stop scheduler: {e}", exc_info=True)
+
+# ---------------- MIDDLEWARE ---------------- #
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    import time
+    start_time = time.time()
+    
+    # Log incoming request info (method, path)
+    logger.info(f"REQ - {request.method} {request.url.path}")
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        logger.info(f"RES - {response.status_code} - {request.method} {request.url.path} ({process_time:.4f}s)")
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(f"ERR - UNHANDLED EXCEPTION in {request.method} {request.url.path} ({process_time:.4f}s): {str(e)}", exc_info=True)
+        raise e
 
 # ---------------- CORS ---------------- #
 
@@ -228,6 +249,7 @@ async def ask_gst(
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
+    logger.info(f"Chat request received. User: {user.get('sub')}, Session: {payload.session_id}")
     session_id = payload.session_id or str(uuid.uuid4())
 
     email = user.get("sub")
@@ -244,6 +266,7 @@ async def ask_gst(
     # --- CREDIT CHECK ---
     allowed, error_msg = await check_credits(user_id, session_id, False, db)
     if not allowed:
+        logger.warning(f"Credit check failed for user {user_id}: {error_msg}")
         raise HTTPException(status_code=402, detail=error_msg)
 
     profile         = await get_user_profile(user_id)
@@ -323,8 +346,7 @@ async def _ask_gst_stream_core(
     user,
     db: AsyncSession
 ):
-    import logging
-    logger = logging.getLogger(__name__)
+# session_id logic
 
     session_id = session_id or str(uuid.uuid4())
 
