@@ -18,6 +18,7 @@ from services.database import get_db
 from services.models import User, UserProfile, UserUsage
 from services.redis import add_session, remove_session
 from api.config import settings
+from services.email import EmailService
 import uuid
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -216,7 +217,11 @@ class RegisterRequest(BaseModel):
     country: Optional[str] = None
     role: str = "user" # Optional, default to user
 
-@router.post("/register", response_model=LoginResponse)
+class RegisterResponse(BaseModel):
+    message: str
+    is_success: bool
+
+@router.post("/register", response_model=RegisterResponse)
 async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
     email = payload.email.lower()
     # Check if user exists
@@ -225,6 +230,9 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         logger.warning(f"Registration attempt failed: Email {email} already registered")
         raise HTTPException(status_code=400, detail="Email already registered")
     
+    # Generate verification token
+    verification_token = str(uuid.uuid4())
+    
     # Create user
     new_user = User(
         email=email, 
@@ -232,7 +240,9 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         full_name=payload.full_name,
         mobile_number=payload.mobile_number,
         country=payload.country,
-        role=payload.role
+        role=payload.role,
+        is_verified=False,
+        verification_token=verification_token
     )
     db.add(new_user)
     await db.commit()
@@ -247,19 +257,70 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     
     await db.commit()
 
-    # Create session
-    session_id = str(uuid.uuid4())
-    await add_session(new_user.id, session_id, new_user.max_sessions)
+    # Send verification email asynchronously (in background task or simple call)
+    EmailService.send_verification_email(
+        email=email,
+        token=verification_token,
+        full_name=payload.full_name
+    )
 
-    # Generate token
-    token = create_access_token({
-        "sub": new_user.email,
-        "id": new_user.id,
-        "role": new_user.role,
-        "session_id": session_id
-    })
+    return {
+        "message": "Registration successful. Please check your email to verify your account.",
+        "is_success": True
+    }
 
-    return {"access_token": token}
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+class ResendVerificationRequest(BaseModel):
+    email: str
+
+@router.post("/resend-verification")
+async def resend_verification(payload: ResendVerificationRequest, db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower()
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    user = result.scalars().first()
+    
+    if not user:
+        # For security, we might not want to reveal if a user exists, 
+        # but for UX in this specific flow, simple feedback is usually better.
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.is_verified:
+        return {"message": "Email is already verified. Please login.", "is_success": True}
+    
+    # Generate new token
+    new_token = str(uuid.uuid4())
+    user.verification_token = new_token
+    await db.commit()
+    
+    # Send email
+    EmailService.send_verification_email(
+        email=user.email,
+        token=new_token,
+        full_name=user.full_name
+    )
+    
+    return {"message": "Verification email resent successfully.", "is_success": True}
+
+@router.post("/verify-email")
+async def verify_email(payload: VerifyEmailRequest, db: AsyncSession = Depends(get_db)):
+    # Find user by token
+    result = await db.execute(select(User).where(User.verification_token == payload.token))
+    user = result.scalars().first()
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+    
+    if user.is_verified:
+        return {"message": "Email already verified", "is_success": True}
+    
+    # Mark as verified
+    user.is_verified = True
+    user.verification_token = None # Clear token once verified
+    await db.commit()
+    
+    return {"message": "Email verified successfully", "is_success": True}
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -271,6 +332,10 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user or not verify_password(payload.password, user.password_hash):
         logger.warning(f"Failed login attempt for email: {email}")
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not user.is_verified:
+        logger.warning(f"Login attempt for unverified email: {email}")
+        raise HTTPException(status_code=403, detail="Email not verified. Please check your inbox.")
 
     session_id = str(uuid.uuid4())
     await add_session(user.id, session_id, user.max_sessions)

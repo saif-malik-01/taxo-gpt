@@ -14,16 +14,12 @@ import logging
 from sqlalchemy import select
 from services.database import AsyncSessionLocal
 from services.models import Feedback, ChatMessage, User, ChatSession
+from services.email import EmailService
+from api.config import settings
 
 logger = logging.getLogger(__name__)
 
-
-# Email Configuration from environment variables
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-RECIPIENT_EMAIL = os.getenv("FEEDBACK_RECIPIENT_EMAIL", "atul@gmail.com")
+RECIPIENT_EMAIL = settings.FEEDBACK_RECIPIENT_EMAIL
 
 
 async def get_daily_feedback():
@@ -54,21 +50,33 @@ def format_feedback_html(feedback_data):
         <html>
             <head>
                 <style>
-                    body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                    .header {{ background-color: #4CAF50; color: white; padding: 20px; text-align: center; }}
-                    .content {{ padding: 20px; }}
-                    .no-feedback {{ text-align: center; color: #666; padding: 40px; }}
+                    body {{ 
+                        background-color: #0a0a0a; 
+                        margin: 0; 
+                        padding: 0; 
+                        font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                        color: #ffffff;
+                    }}
+                    .container {{ 
+                        max-width: 600px; 
+                        margin: 40px auto; 
+                        padding: 40px; 
+                        background-color: #121212; 
+                        border: 1px solid rgba(251, 146, 60, 0.2); 
+                        border-radius: 16px; 
+                        text-align: center;
+                    }}
+                    .brand {{ color: #fb923c; font-size: 24px; font-weight: 600; margin-bottom: 32px; }}
+                    .no-feedback {{ color: #a1a1aa; padding: 40px; font-size: 18px; }}
                 </style>
             </head>
             <body>
-                <div class="header">
-                    <h1>📊 Daily Feedback Report</h1>
-                    <p>{datetime.now().strftime('%B %d, %Y')}</p>
-                </div>
-                <div class="content">
+                <div class="container">
+                    <div class="brand">TaxoBuddy</div>
+                    <h1>Daily Feedback Report</h1>
+                    <p style="color: #52525b;">{datetime.now().strftime('%B %d, %Y')}</p>
                     <div class="no-feedback">
-                        <h2>No feedback received today</h2>
-                        <p>There were no feedback submissions in the last 24 hours.</p>
+                        No feedback submissions received in the last 24 hours.
                     </div>
                 </div>
             </body>
@@ -88,13 +96,13 @@ def format_feedback_html(feedback_data):
                 <span class="date">{feedback.created_at.strftime('%Y-%m-%d %H:%M:%S IST')}</span>
             </div>
             <div class="user-info">
-                <strong>User:</strong> {user.email}
+                <span style="color: #fb923c;">User:</span> {user.email}
             </div>
             <div class="message-preview">
-                <strong>Message:</strong>
-                <p>{message.content[:200]}{'...' if len(message.content) > 200 else ''}</p>
+                <div style="color: #a1a1aa; font-size: 12px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em;">Message</div>
+                <p style="margin: 0;">{message.content[:200]}{'...' if len(message.content) > 200 else ''}</p>
             </div>
-            {f'<div class="comment"><strong>Comment:</strong> <p>{feedback.comment}</p></div>' if feedback.comment else ''}
+            {f'<div class="comment"><div style="color: #fb923c; font-size: 12px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em;">Comment</div><p style="margin: 0;">{feedback.comment}</p></div>' if feedback.comment else ''}
         </div>
         """
         feedback_items.append(item_html)
@@ -106,120 +114,117 @@ def format_feedback_html(feedback_data):
     <html>
         <head>
             <style>
-                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                .header {{ background-color: #4CAF50; color: white; padding: 20px; text-align: center; }}
-                .stats {{ background-color: #f4f4f4; padding: 15px; margin: 20px 0; border-radius: 5px; }}
-                .stats-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }}
-                .stat-item {{ text-align: center; }}
-                .stat-value {{ font-size: 24px; font-weight: bold; color: #4CAF50; }}
-                .stat-label {{ color: #666; font-size: 14px; }}
-                .content {{ padding: 20px; }}
+                body {{ 
+                    background-color: #0a0a0a; 
+                    margin: 0; 
+                    padding: 0; 
+                    font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                    color: #ffffff;
+                }}
+                .container {{ 
+                    max-width: 800px; 
+                    margin: 40px auto; 
+                    padding: 40px; 
+                    background-color: #121212; 
+                    border: 1px solid rgba(251, 146, 60, 0.1); 
+                    border-radius: 20px; 
+                }}
+                .brand {{ color: #fb923c; font-size: 24px; font-weight: 600; margin-bottom: 8px; text-align: center; }}
+                h1 {{ text-align: center; margin-top: 0; font-weight: 600; letter-spacing: -0.025em; }}
+                .report-date {{ text-align: center; color: #52525b; margin-bottom: 40px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.1em; }}
+                
+                .stats {{ 
+                    display: table; 
+                    width: 100%; 
+                    margin-bottom: 40px; 
+                    border-collapse: separate; 
+                    border-spacing: 15px 0;
+                }}
+                .stat-card {{ 
+                    display: table-cell; 
+                    background-color: rgba(255, 255, 255, 0.03); 
+                    border: 1px solid rgba(255, 255, 255, 0.05);
+                    padding: 24px; 
+                    border-radius: 12px; 
+                    text-align: center;
+                    width: 50%;
+                }}
+                .stat-value {{ font-size: 32px; font-weight: 600; color: #fb923c; line-height: 1; }}
+                .stat-label {{ color: #a1a1aa; font-size: 13px; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.05em; }}
+                
                 .feedback-item {{ 
-                    border: 1px solid #ddd; 
-                    border-radius: 5px; 
-                    padding: 15px; 
-                    margin-bottom: 15px;
-                    background-color: #fff;
+                    background-color: rgba(255, 255, 255, 0.02);
+                    border: 1px solid rgba(255, 255, 255, 0.05); 
+                    border-radius: 12px; 
+                    padding: 24px; 
+                    margin-bottom: 24px;
                 }}
                 .feedback-header {{ 
-                    display: flex; 
-                    justify-content: space-between; 
-                    margin-bottom: 10px;
-                    border-bottom: 1px solid #eee;
-                    padding-bottom: 10px;
+                    display: block;
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+                    padding-bottom: 16px;
+                    margin-bottom: 16px;
                 }}
                 .rating {{ font-size: 18px; }}
-                .date {{ color: #666; font-size: 14px; }}
-                .user-info {{ margin-bottom: 10px; color: #555; }}
+                .date {{ float: right; color: #52525b; font-size: 13px; }}
+                .user-info {{ margin-bottom: 16px; font-size: 14px; color: #e5e5e5; }}
                 .message-preview {{ 
-                    background-color: #f9f9f9; 
-                    padding: 10px; 
-                    border-left: 3px solid #4CAF50;
-                    margin: 10px 0;
+                    background-color: rgba(0, 0, 0, 0.2); 
+                    padding: 16px; 
+                    border-radius: 8px;
+                    margin: 16px 0;
+                    border-left: 3px solid #fb923c;
+                    font-size: 14px;
+                    color: #d4d4d8;
                 }}
                 .comment {{ 
-                    background-color: #fff3cd; 
-                    padding: 10px; 
-                    border-left: 3px solid #ffc107;
-                    margin: 10px 0;
+                    background-color: rgba(251, 146, 60, 0.05); 
+                    padding: 16px; 
+                    border-radius: 8px;
+                    margin: 16px 0;
+                    border-left: 3px solid #fb923c;
+                    font-size: 14px;
+                    color: #ffffff;
                 }}
                 .footer {{ 
                     text-align: center; 
-                    padding: 20px; 
-                    color: #666; 
+                    margin-top: 60px; 
+                    color: #3f3f46; 
                     font-size: 12px;
-                    border-top: 1px solid #ddd;
-                    margin-top: 20px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;
                 }}
             </style>
         </head>
         <body>
-            <div class="header">
-                <h1>📊 Daily Feedback Report</h1>
-                <p>{datetime.now().strftime('%B %d, %Y')}</p>
-            </div>
-            
-            <div class="content">
+            <div class="container">
+                <div class="brand">TaxoBuddy</div>
+                <h1>Daily Feedback Report</h1>
+                <div class="report-date">{datetime.now().strftime('%B %d, %Y')}</div>
+                
                 <div class="stats">
-                    <h2>Summary</h2>
-                    <div class="stats-grid">
-                        <div class="stat-item">
-                            <div class="stat-value">{total_feedback}</div>
-                            <div class="stat-label">Total Feedback</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-value">{avg_rating:.1f} / 5</div>
-                            <div class="stat-label">Average Rating</div>
-                        </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{total_feedback}</div>
+                        <div class="stat-label">Total Submissions</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{avg_rating:.1f} / 5</div>
+                        <div class="stat-label">Average Rating</div>
                     </div>
                 </div>
                 
-                <h2>Feedback Details</h2>
+                <h2 style="font-size: 18px; color: #fb923c; margin-bottom: 24px; text-transform: uppercase; letter-spacing: 0.1em;">Recent Activity</h2>
                 {''.join(feedback_items)}
-            </div>
-            
-            <div class="footer">
-                <p>This is an automated report generated by the GST Expert API system.</p>
-                <p>Report generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}</p>
+                
+                <div class="footer">
+                    Automated Insight System • TaxoBuddy Intelligence
+                </div>
             </div>
         </body>
     </html>
     """
     
     return html
-
-
-def send_email(subject, html_content, recipient):
-    """Send email using SMTP."""
-    
-    if not SMTP_USERNAME or not SMTP_PASSWORD:
-        logger.error("SMTP credentials not configured. Skipping email.")
-        return False
-    
-    try:
-        # Create message
-        message = MIMEMultipart("alternative")
-        message["Subject"] = subject
-        message["From"] = SMTP_USERNAME
-        message["To"] = recipient
-        
-        # Attach HTML content
-        html_part = MIMEText(html_content, "html")
-        message.attach(html_part)
-        
-        # Send email
-        logger.info(f"Connecting to {SMTP_SERVER}:{SMTP_PORT}...")
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(message)
-        
-        logger.info(f"Email sent successfully to {recipient}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
-        return False
 
 
 async def send_daily_feedback_report():
@@ -245,7 +250,7 @@ async def send_daily_feedback_report():
         
         # Send email
         logger.info(f"Sending email to {RECIPIENT_EMAIL}...")
-        success = send_email(subject, html_content, RECIPIENT_EMAIL)
+        success = EmailService.send_email(subject, html_content, RECIPIENT_EMAIL)
         
         if success:
             logger.info("Daily feedback report sent successfully!")

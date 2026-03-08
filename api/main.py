@@ -12,6 +12,7 @@ import shutil
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
+from services.memory import update_message_tokens # Import the new helper
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
@@ -273,7 +274,7 @@ async def ask_gst(
     profile_summary = profile.dynamic_summary if profile else None
     history         = await get_session_history(session_id)
 
-    answer, sources, full_judgments, party_citations_dict = await chat(
+    answer, sources, full_judgments, party_citations_dict, usage = await chat(
         query=payload.question,
         store=vector_store,
         all_chunks=ALL_CHUNKS,
@@ -282,9 +283,15 @@ async def ask_gst(
     )
 
     await add_message(session_id, "user", payload.question, user_id)
-    await add_message(session_id, "assistant", answer, user_id)
+    await add_message(
+        session_id, "assistant", answer, user_id, 
+        prompt_tokens=usage.get("inputTokens", 0), 
+        response_tokens=usage.get("outputTokens", 0)
+    )
     
-    await track_usage(user_id, session_id, db)
+    # Smart deduction: only if it's the first message in the session
+    is_new_session = len(history) == 0
+    await track_usage(user_id, session_id, db, usage=usage, force_deduct=is_new_session)
 
     background_tasks.add_task(auto_update_profile, user_id, payload.question, answer)
 
@@ -323,19 +330,6 @@ async def ask_gst_stream_draft(
     db: AsyncSession = Depends(get_db)
 ):
     return await _ask_gst_stream_core("draft", background_tasks, question, session_id, files, user, db)
-
-@app.post("/chat/stream")
-@app.post("/chat/ask/stream")
-async def ask_gst_stream_legacy(
-    background_tasks: BackgroundTasks,
-    question: str = Form(...),
-    session_id: Optional[str] = Form(None),
-    files: List[UploadFile] = File(default=[]),
-    user=Depends(auth_guard),
-    db: AsyncSession = Depends(get_db)
-):
-    chat_mode = "draft" if files and any(f.filename for f in files) else "simple"
-    return await _ask_gst_stream_core(chat_mode, background_tasks, question, session_id, files, user, db)
 
 async def _ask_gst_stream_core(
     chat_mode: str,
@@ -391,6 +385,9 @@ async def _ask_gst_stream_core(
 
     async def stream_generator():
         try:
+            # Fetch history BEFORE adding new message to check if session is brand new
+            history = await get_session_history(session_id)
+            
             # ----------------------------------------------------------------
             # Save user message immediately
             # ----------------------------------------------------------------
@@ -401,13 +398,15 @@ async def _ask_gst_stream_core(
             
             await add_message(session_id, "user", user_message, user_id, chat_mode=chat_mode)
             
-            # TRACK USAGE IMMEDIATELY after message is saved and session is upgraded
-            # This ensures we charge for the "Draft" feature as soon as the work begins
-            await track_usage(user_id, session_id, db)
+            # Smart Credit Deduction: Only if new session or new document upload
+            is_new_session = len(history) == 0
+            force_deduct = is_new_session or has_files
+            await track_usage(user_id, session_id, db, force_deduct=force_deduct)
 
             profile         = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
-            history         = await get_session_history(session_id)
+            # Update history to include the message we just added for the LLM context later
+            history = await get_session_history(session_id)
 
             # ----------------------------------------------------------------
             # DOCUMENT PATH — extraction + analysis run in thread pool
@@ -533,8 +532,10 @@ async def _ask_gst_stream_core(
                 all_sources       = []
                 all_full_judgments = {}
                 seen_source_ids   = set()
+                total_input_tokens = 0
+                total_output_tokens = 0
 
-                async for issue_number, reply, sources, full_judgments in process_issues_streaming(
+                async for issue_number, reply, sources, full_judgments, usage in process_issues_streaming(
                     issues=issues_list,
                     mode=mode,
                     store=vector_store,
@@ -545,6 +546,10 @@ async def _ask_gst_stream_core(
                     profile_summary=profile_summary,
                     max_parallel=3
                 ):
+                    # Log tokens for each issue processed
+                    await track_usage(user_id, session_id, db, usage=usage)
+                    total_input_tokens += usage.get("inputTokens", 0)
+                    total_output_tokens += usage.get("outputTokens", 0)
                     issue_text = issues_list[issue_number - 1]
 
                     # ---- Issue header (formatted) ----
@@ -578,6 +583,21 @@ async def _ask_gst_stream_core(
                     # Aggregate full judgments (deduplicated by external_id)
                     _merge_full_judgments(all_full_judgments, full_judgments)
 
+                    # --- Mid-stream FUP check ---
+                    # Check if the session or monthly limit was hit after this issue
+                    # Pass the current running tally as extra_tokens
+                    allowed, error_msg = await check_credits(
+                        user_id, session_id, False, db, 
+                        chat_mode=chat_mode, 
+                        extra_tokens=total_input_tokens + total_output_tokens
+                    )
+                    if not allowed:
+                        warning = f"\n\n---\n\n*ℹ️ Note: {error_msg} Generation stopped at this stage.*"
+                        yield json.dumps({"type": "content", "delta": warning}) + "\n"
+                        full_issues_text += warning
+                        logger.warning(f"Mid-stream FUP hit for user {user_id} at issue {issue_number}: {error_msg}")
+                        break
+
                 # ---- Single closing block after all issues ----
                 closing_block = (
                     "\n\n---\n\n"
@@ -593,34 +613,58 @@ async def _ask_gst_stream_core(
 
                 # ---- Knowledge base supplement if needed ----
                 if needs_knowledge:
-                    yield json.dumps({
-                        "type":  "content",
-                        "delta": "\n\n---\n\n**Answer to your query:**\n\n"
-                    }) + "\n"
+                    allowed, error_msg = await check_credits(
+                        user_id, session_id, False, db, 
+                        chat_mode=chat_mode,
+                        extra_tokens=total_input_tokens + total_output_tokens
+                    )
+                    if not allowed:
+                        msg = f"\n\n---\n\n*ℹ️ Note: {error_msg} Knowledge base supplement skipped.*"
+                        yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                        full_issues_text += msg
+                    else:
+                        yield json.dumps({
+                            "type":  "content",
+                            "delta": "\n\n---\n\n**Answer to your query:**\n\n"
+                        }) + "\n"
 
-                    knowledge_answer = ""
-                    async for chunk in chat_stream(
-                        query=question,
-                        store=vector_store,
-                        all_chunks=ALL_CHUNKS,
-                        history=history,
-                        profile_summary=profile_summary,
-                        document_context=extracted_text
-                    ):
-                        ctype = chunk.get("type")
-                        if ctype == "content":
-                            delta = chunk.get("delta", "")
-                            knowledge_answer += delta
-                            yield json.dumps({"type": "content", "delta": delta}) + "\n"
-                        elif ctype == "retrieval":
-                            _merge_sources(all_sources, chunk.get("sources", []) or [], seen_source_ids)
-                            _merge_full_judgments(all_full_judgments, chunk.get("full_judgments", {}) or {})
+                        knowledge_answer = ""
+                        async for chunk in chat_stream(
+                            query=question,
+                            store=vector_store,
+                            all_chunks=ALL_CHUNKS,
+                            history=history,
+                            profile_summary=profile_summary,
+                            document_context=extracted_text
+                        ):
+                            ctype = chunk.get("type")
+                            if ctype == "content":
+                                delta = chunk.get("delta", "")
+                                knowledge_answer += delta
+                                yield json.dumps({"type": "content", "delta": delta}) + "\n"
+                            elif ctype == "retrieval":
+                                _merge_sources(all_sources, chunk.get("sources", []) or [], seen_source_ids)
+                                _merge_full_judgments(all_full_judgments, chunk.get("full_judgments", {}) or {})
+                            elif ctype == "usage":
+                                # Track knowledge base tokens
+                                usage_dict = chunk.get("usage", {})
+                                await track_usage(user_id, session_id, db, usage=usage_dict)
+                                if 'last_message_id' in locals() and last_message_id:
+                                    await update_message_tokens(
+                                        last_message_id, 
+                                        usage_dict.get("inputTokens", 0), 
+                                        usage_dict.get("outputTokens", 0)
+                                    )
 
-                    full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
+                        full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
 
-                # Save combined answer
+                # Save combined answer with total tokens from all issues
                 combined_answer = (formatted_response or "") + full_issues_text
-                assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
+                assistant_msg   = await add_message(
+                    session_id, "assistant", combined_answer, user_id,
+                    prompt_tokens=total_input_tokens,
+                    response_tokens=total_output_tokens
+                )
                 message_id      = getattr(assistant_msg, "id", None)
 
                 # Retrieval event — sources + full_judgments in same shape as non-document
@@ -669,7 +713,8 @@ async def _ask_gst_stream_core(
                         # Yield retrieval immediately — no buffering
                         combined_answer = (formatted_response or "") + "\n\n---\n\n**Answer to your query:**\n\n" + full_rag_answer
                         assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
-                        message_id      = getattr(assistant_msg, "id", None)
+                        last_message_id = getattr(assistant_msg, "id", None)
+                        message_id      = last_message_id
 
                         retrieval_obj = {
                             "type":              "retrieval",
@@ -688,6 +733,17 @@ async def _ask_gst_stream_core(
                             "type":           "citations",
                             "party_citations": chunk.get("party_citations", {})
                         }) + "\n"
+
+                    elif ctype == "usage":
+                        # Track knowledge base tokens
+                        usage_dict = chunk.get("usage", {})
+                        await track_usage(user_id, session_id, db, usage=usage_dict)
+                        if 'last_message_id' in locals() and last_message_id:
+                            await update_message_tokens(
+                                last_message_id, 
+                                usage_dict.get("inputTokens", 0), 
+                                usage_dict.get("outputTokens", 0)
+                            )
 
                 background_tasks.add_task(
                     auto_update_profile, user_id, question,
@@ -724,7 +780,8 @@ async def _ask_gst_stream_core(
                     # Save message once — get message_id for the retrieval event
                     if not message_saved:
                         assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
-                        message_id    = getattr(assistant_msg, "id", None)
+                        last_message_id = getattr(assistant_msg, "id", None)
+                        message_id    = last_message_id
                         message_saved = True
                     else:
                         message_id = None
@@ -744,6 +801,17 @@ async def _ask_gst_stream_core(
                         "type":           "citations",
                         "party_citations": chunk.get("party_citations", {})
                     }) + "\n"
+
+                elif ctype == "usage":
+                    llm_usage = chunk.get("usage", {})
+                    # Update message with tokens if it exists
+                    await track_usage(user_id, session_id, db, usage=llm_usage)
+                    if 'last_message_id' in locals() and last_message_id:
+                        await update_message_tokens(
+                            last_message_id, 
+                            llm_usage.get("inputTokens", 0), 
+                            llm_usage.get("outputTokens", 0)
+                        )
 
             # Ensure message is saved even if retrieval event never came
             if not message_saved:

@@ -360,7 +360,7 @@ def _process_single_issue(
     sender: str = None,
     doc_summary: str = None,
     profile_summary: str = None,
-) -> Tuple[int, str, list, dict]:
+) -> Tuple[int, str, list, dict, dict]:
     """
     Full pipeline for one issue — runs in a thread pool.
     Now receives all_issues and doc_summary for full document context.
@@ -389,7 +389,7 @@ def _process_single_issue(
             profile_summary=profile_summary,
         )
 
-        reply = call_bedrock(
+        reply, usage = call_bedrock(
             prompt=user_prompt,
             system_prompts=[system_prompt],
             temperature=0.0
@@ -402,11 +402,11 @@ def _process_single_issue(
             f"✅ Issue {issue_number} reply ready "
             f"({len(reply)} chars, {len(sources)} sources, {len(full_judgments)} judgments)"
         )
-        return issue_number, reply, sources, full_judgments
+        return issue_number, reply, sources, full_judgments, usage
 
     except Exception as e:
         logger.error(f"❌ Issue {issue_number} failed: {e}", exc_info=True)
-        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [], {}
+        return issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [], {}, {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
 
 
 # ============================================================================
@@ -423,7 +423,7 @@ async def process_issues_streaming(
     doc_summary: str = None,
     profile_summary: str = None,
     max_parallel: int = 3,
-) -> AsyncGenerator[Tuple[int, str, list, dict], None]:
+) -> AsyncGenerator[Tuple[int, str, list, dict, dict], None]:
     """
     Async generator — yields (issue_number, reply_text, sources, full_judgments) in strict order.
 
@@ -461,7 +461,7 @@ async def process_issues_streaming(
             except Exception as e:
                 logger.error(f"Issue {issue_number} task failed: {e}", exc_info=True)
                 futures[issue_number].set_result(
-                    (issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [], {})
+                    (issue_number, f"[Error generating reply for Issue {issue_number}: {str(e)}]", [], {}, {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0})
                 )
 
     logger.info(f"🚀 Processing {total} issues in parallel (max {max_parallel} concurrent)")
@@ -472,8 +472,8 @@ async def process_issues_streaming(
     ]
 
     for issue_num in range(1, total + 1):
-        issue_number, reply, sources, full_judgments = await futures[issue_num]
-        yield issue_number, reply, sources, full_judgments
+        issue_number, reply, sources, full_judgments, usage = await futures[issue_num]
+        yield issue_number, reply, sources, full_judgments, usage
 
     await asyncio.gather(*tasks, return_exceptions=True)
     logger.info(f"✅ All {total} issues processed and streamed")

@@ -16,6 +16,8 @@ class User(Base):
     facebook_id = Column(String, unique=True, index=True, nullable=True)
     role = Column(String, default="user")
     max_sessions = Column(Integer, default=1)  # Dynamic session limit
+    is_verified = Column(Boolean, default=False)
+    verification_token = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -64,6 +66,11 @@ class UserUsage(Base):
     # Lifetime usage (For analytics)
     simple_query_used = Column(Integer, default=0)
     draft_reply_used = Column(Integer, default=0)
+    
+    # Token Tracking (Global FUP)
+    input_tokens_used = Column(BigInteger, default=0)
+    output_tokens_used = Column(BigInteger, default=0)
+    total_tokens_used = Column(BigInteger, default=0)
     
     last_updated = Column(DateTime(timezone=True), onupdate=func.now())
     
@@ -131,6 +138,11 @@ class ChatMessage(Base):
     session_id = Column(String, ForeignKey("chat_sessions.id"), nullable=False)
     role = Column(String, nullable=False) # 'user' or 'assistant'
     content = Column(Text, nullable=False)
+    
+    # Token Tracking (Session FUP)
+    prompt_tokens = Column(Integer, default=0)
+    response_tokens = Column(Integer, default=0)
+    
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
     session = relationship("ChatSession", back_populates="messages")

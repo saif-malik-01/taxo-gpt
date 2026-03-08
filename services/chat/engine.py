@@ -206,7 +206,7 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None, docum
     )
 
     # Step 4: Call LLM (Inference Params: Temp=0)
-    raw_answer = call_bedrock(
+    raw_answer, usage = call_bedrock(
         prompt=user_prompt,
         system_prompts=[system_prompt],
         temperature=0.0
@@ -232,8 +232,8 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None, docum
     # Step 6: Get complete judgments
     full_judgments = get_full_judgments(retrieved, all_chunks)
 
-    # Return enhanced answer (with citations appended) and party_citations metadata
-    return enhanced_answer, retrieved, full_judgments, party_citations
+    # Return enhanced answer (with citations appended), party_citations metadata, and token usage
+    return enhanced_answer, retrieved, full_judgments, party_citations, usage
 
 
 async def chat_stream(query, store, all_chunks, history=[], profile_summary=None, document_context=None):
@@ -297,12 +297,16 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
     collected_response = ""
     collection_start = time.time()
     
-    for chunk in call_bedrock_stream(
+    llm_usage = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+    for event in call_bedrock_stream(
         prompt=user_prompt,
         system_prompts=[system_prompt],
         temperature=0.0
     ):
-        collected_response += chunk
+        if event["type"] == "content":
+            collected_response += event["text"]
+        elif event["type"] == "usage":
+            llm_usage = event["usage"]
     
     collection_time = time.time() - collection_start
     logger.info(f"✓ LLM response collected in {collection_time:.2f}s ({len(collected_response)} chars)")
@@ -399,6 +403,12 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         
         total_cits = sum(len(cits) for cits in party_citations.values())
         logger.info(f"✓ Sent {len(party_citations_json)} citation groups ({total_cits} total citations)")
+
+    # Step 11: Send usage metadata
+    yield {
+        "type": "usage",
+        "usage": llm_usage
+    }
     
     total_time = time.time() - start_time
     print("=" * 80)

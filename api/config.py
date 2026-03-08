@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     # Razorpay Configuration
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
+    
+    # Frontend Configuration
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # FUP (Fair Usage Policy) Configurations
+    GLOBAL_MONTHLY_TOKEN_LIMIT: int = 1000000 # 1 Million tokens / month
+    SESSION_TOKEN_LIMIT_DRAFT: int = 30000    # 30k tokens / draft chat
+    SESSION_TOKEN_LIMIT_SIMPLE: int = 50000   # 50k tokens / simple chat
 
     # Logging Configuration
     LOG_LEVEL: str = "INFO"

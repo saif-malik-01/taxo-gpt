@@ -7,6 +7,7 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from services.jobs.feedback_emailer import send_daily_feedback_report
+from services.jobs.mis_emailer import send_daily_mis_report
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,17 @@ def start_scheduler():
         replace_existing=True
     )
     
+    # Add daily MIS report email job - runs at 11:30 PM IST every day
+    scheduler.add_job(
+        send_daily_mis_report,
+        trigger=CronTrigger(hour=23, minute=30),  # 11:30 PM IST
+        id="daily_mis_report",
+        name="Daily MIS Email Report",
+        replace_existing=True
+    )
+    
     logger.info("✅ Scheduled: Daily Feedback Email - 11:30 PM IST")
+    logger.info("✅ Scheduled: Daily MIS Email - 11:30 PM IST")
     
     # Start the scheduler
     scheduler.start()

@@ -25,10 +25,11 @@ MODEL_ID = "qwen.qwen3-next-80b-a3b"
 from typing import Iterator, List, Optional
 
 
-def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> str:
+def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> tuple:
     """
     Call Qwen model on AWS Bedrock using converse() with error handling.
     Output tokens updated from 4096 to 8192 to utilise full model capacity.
+    Returns: (text, usage_dict)
     """
     messages = [
         {
@@ -60,17 +61,19 @@ def call_bedrock(prompt: str, system_prompts: Optional[List[str]] = None, temper
             kwargs["system"] = system_block
 
         response = bedrock.converse(**kwargs)
-        return response["output"]["message"]["content"][0]["text"]
+        text = response["output"]["message"]["content"][0]["text"]
+        usage = response.get("usage", {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0})
+        return text, usage
 
     except Exception as e:
         logger.error(f"Bedrock call failed: {str(e)}")
-        return "NONE"
+        return "NONE", {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
 
 
-def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> Iterator[str]:
+def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None, temperature: float = 0.0) -> Iterator[dict]:
     """
     Call Qwen model on AWS Bedrock using converse_stream().
-    Output tokens updated from 4096 to 8192 to utilise full model capacity.
+    Yields: {"type": "content", "text": str} OR {"type": "usage", "usage": dict}
     """
     messages = [
         {
@@ -106,8 +109,10 @@ def call_bedrock_stream(prompt: str, system_prompts: Optional[List[str]] = None,
         if stream:
             for event in stream:
                 if "contentBlockDelta" in event:
-                    yield event["contentBlockDelta"]["delta"]["text"]
+                    yield {"type": "content", "text": event["contentBlockDelta"]["delta"]["text"]}
+                elif "metadata" in event:
+                    yield {"type": "usage", "usage": event["metadata"].get("usage", {})}
 
     except Exception as e:
         logger.error(f"Bedrock stream failed: {str(e)}")
-        yield "\n[Error: Connection to AI lost. Please try again or check your parameters.]"
+        yield {"type": "content", "text": "\n[Error: Connection to AI lost. Please try again or check your parameters.]"}
