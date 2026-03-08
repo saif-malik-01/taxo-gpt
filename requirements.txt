@@ -19,3 +19,5 @@ google-auth
 requests
 razorpay
 fpdf2
+bcrypt
+greenlet
