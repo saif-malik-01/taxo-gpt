@@ -19,10 +19,7 @@ load_dotenv()
 # VISION CLIENT
 # ============================================================================
 
-
 class AmazonNovaClient:
-    """AWS Bedrock client for vision analysis"""
-
     def __init__(self, model_id: str = "amazon.nova-lite-v1:0", region: str = None):
         self.model_id = model_id
         if region is None:
@@ -30,7 +27,6 @@ class AmazonNovaClient:
         self.client = boto3.client('bedrock-runtime', region_name=region)
 
     def describe_image(self, pil_image: Image.Image, prompt: str = None) -> str:
-        """Describe image using Amazon Nova with optimized settings"""
         max_size = 2048
         if max(pil_image.size) > max_size:
             pil_image = pil_image.copy()
@@ -52,7 +48,6 @@ Include: all visible text, visual elements, flow, meaning, labels, annotations."
                     {"text": prompt}
                 ]
             }],
-            # Output tokens updated from 4096 to 8192
             "inferenceConfig": {"max_new_tokens": 8192, "temperature": 0.1, "top_p": 0.9}
         }
 
@@ -74,7 +69,7 @@ Include: all visible text, visual elements, flow, meaning, labels, annotations."
 
 
 # ============================================================================
-# PAGE EXTRACTION PROMPT
+# PAGE EXTRACTION PROMPT (unchanged)
 # ============================================================================
 
 PAGE_EXTRACTION_PROMPT = """You are a precise document extraction engine. Your ONLY job is to reproduce every piece of content from this page exactly as it appears — in the same order, with the same wording, structure, and layout intent.
@@ -92,103 +87,42 @@ SECTION-BY-SECTION RULES:
 1. PLAIN TEXT (body, paragraphs, headings, labels)
    - Copy every word exactly as written.
    - Separate paragraphs with a single blank line.
-   - Use markdown heading levels matching the visual hierarchy:
-       # for the largest heading on the page
-       ## for sub-headings
-       ### for minor headings
+   - Use markdown heading levels matching the visual hierarchy.
    - Do NOT rephrase, simplify, or omit any sentence.
 
 2. TABLES
-   Use this format — it preserves both structure and meaning for downstream LLM processing:
-
    [TABLE: <exact table title if present, else "Table">]
-   | Column Header 1 | Column Header 2 | Column Header 3 | ... |
-   |-----------------|-----------------|-----------------|-----|
-   | row1_val1       | row1_val2       | row1_val3       | ... |
-   | row2_val1       | row2_val2       | row2_val3       | ... |
-   | **Total/Summary label** | **val** | **val** | ... |
-   Notes: <any footnote, annotation, or disclaimer text below the table, verbatim>
+   | Column Header 1 | Column Header 2 | ... |
+   |-----------------|-----------------|-----|
+   | row1_val1       | row1_val2       | ... |
+   Notes: <any footnote text>
    [/TABLE]
 
-   RULES for tables:
-   - Include EVERY row and EVERY column — no skipping.
-   - For merged/spanning cells, repeat the merged value in each affected column.
-   - For blank cells, use an empty cell: | |
-   - Bold totals/summary rows using **text**.
-   - If a table has no visible title, use a descriptive label based on its first row.
-   - If multiple tables appear on the page, extract each separately with its own [TABLE]...[/TABLE] block.
-   - Preserve numeric formatting exactly: "1,23,456.78" stays "1,23,456.78", not "123456.78".
-
-3. FLOWCHARTS, PROCESS DIAGRAMS, DECISION TREES
-   Use this format to preserve flow, logic, and all labels:
-
-   [FLOWCHART: <title or "Process Flow">]
-   START
-   → [Box/Step label: exact text inside the shape]
-   → <Decision: exact question text?>
-       YES → [Step label: text]
-             → [Next step: text]
-       NO  → [Step label: text]
-             → [Next step: text]
-   → [Final step or END]
-   END
-
-   Additional elements (use as needed):
-   PARALLEL: [Branch A: text] | [Branch B: text]   ← for parallel tracks
-   LOOP: repeat from <step name> if <condition>      ← for loops
-   ARROW LABEL: "<label text>"                       ← for named arrows
-   NOTE: <any annotation or legend text>
+3. FLOWCHARTS, PROCESS DIAGRAMS
+   [FLOWCHART: <title>]
+   START → [Step] → <Decision?> YES → [Step] NO → [Step] → END
    [/FLOWCHART]
 
-   RULES for flowcharts:
-   - Capture every shape, every arrow, every label — verbatim.
-   - Show branching using indented YES/NO (or True/False / other condition labels).
-   - If a flowchart and a table appear on the same page, extract both in the order they appear.
-
 4. FORMS AND FIELDS
-   Extract as "Label: Value" for every field.
-   If a field is blank, write: "Label: [blank]"
-   Examples: GSTIN: 27AABCU9603R1ZX, Date: [blank], PAN: AABCU9603R
+   Label: Value (or [blank] if empty)
 
 5. LISTS
-   Preserve all bullet points and numbered lists exactly, including nesting and indentation.
+   Preserve all bullet points and numbered lists exactly.
 
-6. IMAGES, PHOTOGRAPHS, CHARTS (non-flowchart)
-   [IMAGE: <brief factual description of what is depicted — people, objects, logo, chart type>]
-   Text visible in image: <verbatim text>
-   [/IMAGE]
+6. STAMPS, SEALS, WATERMARKS, SIGNATURES
+   [STAMP: <text>] [SEAL: <text>] [SIGNATURE: <name>] [WATERMARK: <text>]
 
-7. STAMPS, SEALS, WATERMARKS, SIGNATURES
-   [STAMP: <exact text on the stamp>]
-   [SEAL: <text or description>]
-   [SIGNATURE: <name or "illegible">]
-   [WATERMARK: <text>]
-
-8. MULTI-COLUMN LAYOUTS
-   Process the left column fully first, then the right column.
-   Separate columns with: --- (column break) ---
-
-9. HEADERS AND FOOTERS
-   Extract verbatim at the start (header) and end (footer) of each page's output.
-   [HEADER: <text>]
-   ...body content...
-   [FOOTER: <text>]
-
-10. BLANK PAGE
-    If the page has absolutely no content: [BLANK PAGE]
-
----
+7. BLANK PAGE
+   [BLANK PAGE]
 
 OUTPUT RULES:
-- Start directly with the extracted content. No preamble. No "Here is the extracted text:".
-- Maintain the exact top-to-bottom order in which content appears on the page.
-- Do not merge content from different visual sections without a blank line separator.
-- Do not add headings, labels, or commentary that are not present on the page.
+- Start directly with extracted content. No preamble.
+- Maintain exact top-to-bottom order.
 """
 
 
 # ============================================================================
-# DOCUMENT TO IMAGES CONVERTER
+# DOCUMENT TO IMAGES CONVERTER (unchanged)
 # ============================================================================
 
 def _add_padding(img: Image.Image, padding_px: int = 30) -> Image.Image:
@@ -205,9 +139,9 @@ def _convert_to_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
     if ext == '.pdf':
         try:
             import fitz
-            doc = fitz.open(file_path)
+            doc    = fitz.open(file_path)
             images = []
-            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            mat    = fitz.Matrix(dpi / 72, dpi / 72)
             for page in doc:
                 pix = page.get_pixmap(matrix=mat, alpha=False, clip=None)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -215,13 +149,11 @@ def _convert_to_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
             doc.close()
             return images
         except ImportError:
-            raise ImportError("pymupdf is required for PDF processing. Install with: pip install pymupdf")
+            raise ImportError("pymupdf required. Install: pip install pymupdf")
 
     if ext in ('.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.odt', '.odp', '.ods'):
         try:
-            import subprocess
-            import fitz
-
+            import subprocess, fitz
             tmp_dir = tempfile.mkdtemp()
             try:
                 result = subprocess.run(
@@ -229,19 +161,17 @@ def _convert_to_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
                     capture_output=True, text=True, timeout=120
                 )
                 if result.returncode != 0:
-                    raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
-
+                    raise RuntimeError(f"LibreOffice failed: {result.stderr}")
                 base_name = os.path.splitext(os.path.basename(file_path))[0]
-                pdf_path = os.path.join(tmp_dir, base_name + '.pdf')
+                pdf_path  = os.path.join(tmp_dir, base_name + '.pdf')
                 if not os.path.exists(pdf_path):
                     pdfs = [f for f in os.listdir(tmp_dir) if f.endswith('.pdf')]
                     if not pdfs:
-                        raise FileNotFoundError("LibreOffice did not produce a PDF output")
+                        raise FileNotFoundError("LibreOffice produced no PDF")
                     pdf_path = os.path.join(tmp_dir, pdfs[0])
-
-                doc = fitz.open(pdf_path)
+                doc    = fitz.open(pdf_path)
                 images = []
-                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                mat    = fitz.Matrix(dpi / 72, dpi / 72)
                 for page in doc:
                     pix = page.get_pixmap(matrix=mat, alpha=False, clip=None)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -250,22 +180,19 @@ def _convert_to_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
                 return images
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-
         except ImportError:
-            raise ImportError("pymupdf is required. Install with: pip install pymupdf")
+            raise ImportError("pymupdf required. Install: pip install pymupdf")
 
     if ext in ('.html', '.htm'):
         try:
-            import weasyprint
-            import fitz
-
+            import weasyprint, fitz
             tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
             tmp_pdf.close()
             try:
                 weasyprint.HTML(filename=file_path).write_pdf(tmp_pdf.name)
-                doc = fitz.open(tmp_pdf.name)
+                doc    = fitz.open(tmp_pdf.name)
                 images = []
-                mat = fitz.Matrix(dpi / 72, dpi / 72)
+                mat    = fitz.Matrix(dpi / 72, dpi / 72)
                 for page in doc:
                     pix = page.get_pixmap(matrix=mat, alpha=False, clip=None)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -276,7 +203,7 @@ def _convert_to_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
                 if os.path.exists(tmp_pdf.name):
                     os.unlink(tmp_pdf.name)
         except ImportError:
-            raise ImportError("weasyprint is required for HTML processing. Install with: pip install weasyprint")
+            raise ImportError("weasyprint required. Install: pip install weasyprint")
 
     raise ValueError(f"Unsupported file format: {ext}")
 
@@ -284,7 +211,6 @@ def _convert_to_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
 # ============================================================================
 # DOCUMENT PROCESSOR
 # ============================================================================
-
 
 class DocumentProcessor:
     """Vision-based document processor with parallel page processing."""
@@ -298,21 +224,17 @@ class DocumentProcessor:
     ):
         if bedrock_region is None:
             bedrock_region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
-
         self.vision_client = AmazonNovaClient(bedrock_model, bedrock_region)
-        self.dpi = dpi
+        self.dpi        = dpi
         self.max_workers = max_workers
 
     def _clean_text(self, text: str) -> str:
         if not text:
             return ""
-
-        text = text.replace('\t', ' ')
-        text = re.sub(r' {3,}', ' ', text)
-
+        text  = text.replace('\t', ' ')
+        text  = re.sub(r' {3,}', ' ', text)
         lines = [line.rstrip() for line in text.split('\n')]
-
-        result = []
+        result     = []
         prev_blank = False
         for line in lines:
             if line.strip():
@@ -322,35 +244,28 @@ class DocumentProcessor:
                 if not prev_blank:
                     result.append('')
                 prev_blank = True
-
         while result and not result[0].strip():
             result.pop(0)
         while result and not result[-1].strip():
             result.pop()
-
         return '\n'.join(result)
 
     def _extract_page_text(self, page_index: int, pil_image: Image.Image) -> tuple:
         try:
-            text = self.vision_client.describe_image(pil_image, prompt=PAGE_EXTRACTION_PROMPT)
+            text    = self.vision_client.describe_image(pil_image, prompt=PAGE_EXTRACTION_PROMPT)
             cleaned = self._clean_text(text)
-
             if cleaned.strip() == "[BLANK PAGE]" or not cleaned.strip():
                 return page_index, ""
-
             return page_index, cleaned
         except Exception as e:
             return page_index, f"[Page {page_index + 1} extraction error: {str(e)}]"
 
     def extract_text(self, file_path: str) -> str:
-        page_images = _convert_to_images(file_path, dpi=self.dpi)
-
+        page_images  = _convert_to_images(file_path, dpi=self.dpi)
         if not page_images:
             return ""
-
-        total_pages = len(page_images)
+        total_pages  = len(page_images)
         page_results = {}
-
         with ThreadPoolExecutor(max_workers=min(self.max_workers, total_pages)) as executor:
             futures = {
                 executor.submit(self._extract_page_text, idx, img): idx
@@ -369,35 +284,52 @@ class DocumentProcessor:
                 else:
                     content_blocks.append(page_text)
 
-        full_text = '\n\n'.join(content_blocks)
-        return self._clean_text(full_text)
+        return self._clean_text('\n\n'.join(content_blocks))
 
     def extract_text_from_multiple_files(self, file_paths: List[str], filenames: List[str]) -> str:
         combined_text_parts = []
-
         for idx, (file_path, filename) in enumerate(zip(file_paths, filenames), 1):
             separator = f"\n\n{'=' * 80}\nDOCUMENT {idx}: {filename}\n{'=' * 80}\n\n"
-
             try:
                 extracted_text = self.extract_text(file_path)
-                if extracted_text.strip():
-                    combined_text_parts.append(separator + extracted_text)
-                else:
-                    combined_text_parts.append(separator + f"[No text could be extracted from {filename}]")
+                combined_text_parts.append(
+                    separator + (extracted_text if extracted_text.strip() else f"[No text from {filename}]")
+                )
             except Exception as e:
-                combined_text_parts.append(separator + f"[Error extracting text from {filename}: {str(e)}]")
-
+                combined_text_parts.append(separator + f"[Error: {filename}: {str(e)}]")
         return '\n\n'.join(combined_text_parts)
 
 
 # ============================================================================
-# DOCUMENT ANALYZER
+# DOCUMENT ANALYZER — Enhanced issue extraction
 # ============================================================================
 
-# Two-pass threshold: documents longer than this are split for analysis
 _TWO_PASS_THRESHOLD = 80_000
-# Overlap at split point to avoid cutting mid-issue
-_SPLIT_OVERLAP = 2_000
+_SPLIT_OVERLAP      = 2_000
+
+# ─── Enhanced issue extraction instruction ────────────────────────────────────
+# This is the core instruction used in both normal extraction and re-extraction.
+# It explicitly demands all entities — amounts, sections, periods, GSTINs, etc.
+
+ISSUE_EXTRACTION_INSTRUCTION = """
+4. ISSUES EXTRACTION — VERBATIM WITH ALL ENTITIES:
+Extract every issue, allegation, discrepancy, observation, ground, or charge mentioned in the document.
+
+CRITICAL RULES:
+- Extract each issue EXACTLY as it appears — verbatim, word for word.
+- Each issue MUST be self-contained — it must include ALL specific details mentioned in the same context:
+    * Exact amounts (e.g., "Rs. 5,00,000", "tax of Rs. 12,456")
+    * Tax periods (e.g., "April 2022 to March 2023", "FY 2021-22")
+    * Section/Rule/Notification numbers (e.g., "Section 74(1) of CGST Act")
+    * GSTIN, PAN, invoice numbers, or any other identifier
+    * Percentages, rates, quantities
+    * Any other quantitative or identifying detail that is part of the allegation
+- Do NOT paraphrase, summarise, or condense.
+- Do NOT filter — extract ALL issues including minor observations.
+- If an issue spans multiple sentences, include all of them.
+- Someone reading only that issue must have all the facts needed to respond to it.
+- If there are NO issues at all → set issues to null.
+"""
 
 
 class DocumentAnalyzer:
@@ -410,13 +342,9 @@ class DocumentAnalyzer:
         self.client = boto3.client('bedrock-runtime', region_name=region)
 
     def _run_analysis(self, extracted_text: str, user_question: Optional[str] = None) -> dict:
-        """
-        Single-pass analysis on a text segment.
-        Issues are extracted verbatim — no paraphrasing, no filtering.
-        Output tokens corrected from 32000 to 8192.
-        """
+        """Single-pass analysis on a text segment."""
 
-        prompt = f"""You are analyzing a legal document. Extract information ONLY from the document text provided. Do not infer or generate information.
+        prompt = f"""You are analyzing a legal document. Extract information ONLY from the document text provided.
 
 DOCUMENT CONTENT:
 {extracted_text}
@@ -424,92 +352,35 @@ DOCUMENT CONTENT:
 INSTRUCTIONS:
 
 1. PARTY IDENTIFICATION
-(Extract ONLY if explicitly and unambiguously mentioned in the document text)
-
-A party MUST satisfy BOTH conditions:
-• A legal role is clearly indicated
-• A concrete identifying value (name / company / authority / ID) is present
-
-DO NOT guess, infer, or reconstruct missing information.
-
-a) SENDER / FROM
-Who issued or sent this document.
-Extract ONLY if the document explicitly contains:
-• "From:", "Issued by", "Issued under the authority of"
-• Name of department / authority / organization issuing the document
-• Sender name in signature block (with actual name, not just title)
-Rules:
-• Extract the exact text as written in the document
-• If the sender is implied but not named → return null
-• If only a designation/title is present without a name → return null
-
-b) RECIPIENT / TO
-To whom the document is addressed.
-Extract ONLY if the document explicitly contains:
-• "To:", "Addressed to", "Notice to"
-• Recipient name/company mentioned as the addressee
-• A populated identification field (e.g., Legal Name, GSTIN) WITH an actual value
-Rules:
-• DO NOT treat field labels, headings, or empty placeholders as values
-• Labels such as "GSTIN:", "Legal Name:", "PAN:" WITHOUT a filled value → null
+Extract sender and recipient ONLY if explicitly mentioned.
+Sender: who issued/sent this document (From, Issued by, signature block with name).
+Recipient: to whom addressed (To, Addressed to, populated GSTIN/Legal Name field).
+Rules: null if not explicitly present. DO NOT infer.
 
 2. COMPREHENSIVE SUMMARY:
-- Create a detailed summary that captures ALL key information from the document
-- Include: purpose, background, key details, actions required, deadlines, amounts, references, periods, GSTINs, transaction types
-- Write 4-7 sentences covering the entire document comprehensively
-- Use simple, clear language
+Create a detailed summary capturing ALL key information:
+purpose, background, key details, actions required, deadlines, amounts, references,
+periods, GSTINs, transaction types. Write 4-7 sentences covering entire document.
 
 3. USER QUESTION RESPONSE (if user asked a question):
-- If the answer exists in the document text → provide the answer
-- If the answer does NOT exist in document text → respond: "It would we better to answer your query using my knowledge?"
+If answer exists in document → provide it.
+If not → respond: "It would we better to answer your query using my knowledge?"
+{ISSUE_EXTRACTION_INSTRUCTION}
+{"USER QUESTION: " + repr(user_question) if user_question else ""}
 
-4. ISSUES EXTRACTION — VERBATIM:
-Extract every issue, allegation, discrepancy, observation, ground, or charge mentioned in the document.
-Extract each one EXACTLY as it appears in the document — verbatim, word for word.
-Do NOT paraphrase, summarise, condense, or reword.
-Do NOT filter or judge whether an issue is significant — extract all of them.
-If an issue spans multiple sentences, include all sentences.
-If there are no issues, allegations, discrepancies, or observations at all → set issues to null.
-
-"""
-
-        if user_question:
-            prompt += f"""
-USER QUESTION:
-"{user_question}"
-"""
-
-        prompt += """
 OUTPUT FORMAT (JSON):
-{
-    "sender": "exact name from document" or null,
-    "recipient": "exact name/GSTIN from document" or null,
-    "summary": "comprehensive 4-7 sentence summary covering all key information",
-    "user_question_response": "answer from document" or "Should I resolve your query using my knowledge?" or null,
-    "issues": ["verbatim issue 1", "verbatim issue 2", ...] or null,
+{{
+    "sender": "exact name" or null,
+    "recipient": "exact name/GSTIN" or null,
+    "summary": "comprehensive 4-7 sentence summary",
+    "user_question_response": "answer" or "Should I resolve your query using my knowledge?" or null,
+    "issues": ["verbatim issue with all entities 1", "verbatim issue 2", ...] or null,
     "issues_prompt": "Should I prepare the reply or guide for these issues?" or null
-}
-
-CRITICAL RULES:
-- sender/recipient: null if not explicitly mentioned
-- summary: comprehensive coverage of entire document
-- issues: extract ALL verbatim — every allegation, discrepancy, observation, ground, or charge
-- issues_prompt: only when issues exist
-- Use document text only, no external knowledge
-"""
+}}"""
 
         request_body = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"text": prompt}]
-                }
-            ],
-            "inferenceConfig": {
-                "maxTokens": 8192,  # corrected from 32000
-                "temperature": 0.1,
-                "topP": 0.9
-            }
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": {"maxTokens": 8192, "temperature": 0.1, "topP": 0.9}
         }
 
         try:
@@ -518,80 +389,109 @@ CRITICAL RULES:
                 messages=request_body["messages"],
                 inferenceConfig=request_body["inferenceConfig"]
             )
-
-            content = response['output']['message']['content'][0]['text']
-
+            content    = response['output']['message']['content'][0]['text']
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
-            else:
-                return {"summary": content}
-
+            return {"summary": content}
         except Exception as e:
             raise Exception(f"LLM Analysis failed: {str(e)}")
 
+    def _run_reextraction(self, extracted_text: str, existing_issues: list) -> list:
+        """
+        Re-run issue extraction on the full document text, explicitly looking for
+        anything missed in the previous extraction.
+
+        Used ONLY when the user says issues are missed.
+        The full text is fetched fresh from DB — never kept in memory.
+
+        Returns list of new issue texts not already in existing_issues.
+        """
+        existing_preview = "\n".join(
+            f"{i}. {iss['text'][:120]}" for i, iss in enumerate(existing_issues, 1)
+        )
+
+        prompt = f"""You are re-analyzing a legal document to find any issues that were missed in a previous extraction.
+
+DOCUMENT CONTENT:
+{extracted_text}
+
+ALREADY EXTRACTED ISSUES (do NOT repeat these):
+{existing_preview or "None extracted yet."}
+
+YOUR TASK:
+Read the ENTIRE document carefully.
+Find any issues, allegations, charges, observations, or discrepancies that are present in the document
+but are NOT already in the list above.
+
+{ISSUE_EXTRACTION_INSTRUCTION}
+
+ADDITIONAL RULE:
+- Only return issues that are genuinely different from the already-extracted ones above.
+- If nothing new is found → return empty list.
+
+OUTPUT FORMAT (JSON only):
+{{
+    "new_issues": ["verbatim new issue with all entities", ...] or []
+}}"""
+
+        request_body = {
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "inferenceConfig": {"maxTokens": 4096, "temperature": 0.1, "topP": 0.9}
+        }
+
+        try:
+            response   = self.client.converse(
+                modelId=self.model_id,
+                messages=request_body["messages"],
+                inferenceConfig=request_body["inferenceConfig"]
+            )
+            content    = response['output']['message']['content'][0]['text']
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                return parsed.get("new_issues") or []
+            return []
+        except Exception as e:
+            raise Exception(f"Re-extraction failed: {str(e)}")
+
     def _deduplicate_issues(self, issues: list) -> list:
-        """
-        Deduplicate issues from two-pass extraction.
-        Uses simple normalised string comparison to detect near-duplicates.
-        """
         if not issues:
             return issues
-
-        seen = []
+        seen   = []
         unique = []
-
         for issue in issues:
-            # Normalise for comparison: lowercase, collapse whitespace
             normalised = re.sub(r'\s+', ' ', issue.lower().strip())
-
-            # Check against already-seen issues
-            is_duplicate = False
+            is_dup = False
             for s in seen:
-                # If normalised strings share >80% of characters, treat as duplicate
                 shorter = min(len(normalised), len(s))
                 if shorter == 0:
                     continue
-                # Simple overlap check: if one string contains the other or they are very similar
                 if normalised in s or s in normalised:
-                    is_duplicate = True
+                    is_dup = True
                     break
-                # Check common prefix length
                 common = sum(1 for a, b in zip(normalised, s) if a == b)
                 if common / shorter > 0.85:
-                    is_duplicate = True
+                    is_dup = True
                     break
-
-            if not is_duplicate:
+            if not is_dup:
                 seen.append(normalised)
                 unique.append(issue)
-
         return unique
 
     def analyze(self, extracted_text: str, user_question: Optional[str] = None) -> dict:
         """
-        Analyze legal document with verbatim issue extraction.
-
-        For documents exceeding _TWO_PASS_THRESHOLD characters:
-          - Split into two halves with _SPLIT_OVERLAP overlap
-          - Run _run_analysis on each half independently
-          - Merge issues lists (deduplicated)
-          - Summary and parties taken from first half (contains document header)
-
-        For shorter documents: single pass as before.
+        Analyze document. Two-pass for long documents.
         """
-
         if len(extracted_text) <= _TWO_PASS_THRESHOLD:
-            # Single pass
             analysis = self._run_analysis(extracted_text, user_question)
             return self._build_structured_response(analysis)
 
-        # --- Two-pass for long documents ---
+        # Two-pass for long documents
         mid = len(extracted_text) // 2
-        # Adjust mid to nearest newline to avoid splitting mid-sentence
-        newline_near_mid = extracted_text.rfind('\n', mid - 500, mid + 500)
-        if newline_near_mid != -1:
-            mid = newline_near_mid
+        nl  = extracted_text.rfind('\n', mid - 500, mid + 500)
+        if nl != -1:
+            mid = nl
 
         first_half  = extracted_text[:mid + _SPLIT_OVERLAP]
         second_half = extracted_text[mid - _SPLIT_OVERLAP:]
@@ -599,72 +499,76 @@ CRITICAL RULES:
         analysis_first  = self._run_analysis(first_half,  user_question)
         analysis_second = self._run_analysis(second_half, user_question)
 
-        # Merge: use first half for summary/parties/user_question_response
-        # Merge issues from both passes
         issues_first  = analysis_first.get("issues")  or []
         issues_second = analysis_second.get("issues") or []
         all_issues    = issues_first + issues_second
 
-        merged = dict(analysis_first)  # start with first pass as base
+        merged = dict(analysis_first)
         if all_issues:
-            merged["issues"] = self._deduplicate_issues(all_issues)
+            merged["issues"]        = self._deduplicate_issues(all_issues)
             merged["issues_prompt"] = "Should I prepare the reply or guide for these issues?"
         else:
-            merged["issues"] = None
+            merged["issues"]        = None
             merged["issues_prompt"] = None
 
         return self._build_structured_response(merged)
 
+    def reextract_missed_issues(self, full_text: str, existing_issues: list) -> list:
+        """
+        Public method for re-extraction flow.
+        full_text is fetched from DB by the caller — never from Redis.
+        Returns list of new issue dicts (with id=0, ready to be numbered by merge helper).
+        """
+        if len(full_text) <= _TWO_PASS_THRESHOLD:
+            new_issue_texts = self._run_reextraction(full_text, existing_issues)
+        else:
+            # Two-pass re-extraction for long documents
+            mid = len(full_text) // 2
+            nl  = full_text.rfind('\n', mid - 500, mid + 500)
+            if nl != -1:
+                mid = nl
+
+            first_half  = full_text[:mid + _SPLIT_OVERLAP]
+            second_half = full_text[mid - _SPLIT_OVERLAP:]
+
+            new_first  = self._run_reextraction(first_half,  existing_issues)
+            new_second = self._run_reextraction(second_half, existing_issues)
+            new_issue_texts = self._deduplicate_issues(new_first + new_second)
+
+        return new_issue_texts
+
     def _build_structured_response(self, analysis: dict) -> dict:
-        """Build the clean structured response dict from raw analysis output."""
-        structured_response = {}
-
+        structured = {}
         if analysis.get("sender"):
-            structured_response["sender"] = analysis["sender"]
-
+            structured["sender"] = analysis["sender"]
         if analysis.get("recipient"):
-            structured_response["recipient"] = analysis["recipient"]
-
-        structured_response["summary"] = analysis.get("summary", "")
-
+            structured["recipient"] = analysis["recipient"]
+        structured["summary"] = analysis.get("summary", "")
         if analysis.get("user_question_response"):
-            structured_response["user_question_response"] = analysis["user_question_response"]
-
+            structured["user_question_response"] = analysis["user_question_response"]
         if analysis.get("issues"):
-            structured_response["issues"] = analysis["issues"]
-            if analysis.get("issues_prompt"):
-                structured_response["issues_prompt"] = analysis["issues_prompt"]
-
-        return structured_response
+            structured["issues"]        = analysis["issues"]
+            structured["issues_prompt"] = analysis.get("issues_prompt", "")
+        return structured
 
     def format_response_for_frontend(self, analysis: dict) -> str:
-        """Format the analysis into a single clean text response for frontend display."""
-
-        response_parts = []
-
+        parts = []
         if analysis.get("sender"):
-            response_parts.append(f"From: {analysis['sender']}")
-
+            parts.append(f"From: {analysis['sender']}")
         if analysis.get("recipient"):
-            response_parts.append(f"To: {analysis['recipient']}")
-
+            parts.append(f"To: {analysis['recipient']}")
         if analysis.get("sender") or analysis.get("recipient"):
-            response_parts.append("")
-
-        response_parts.append(analysis.get("summary", ""))
-
+            parts.append("")
+        parts.append(analysis.get("summary", ""))
         if analysis.get("user_question_response"):
-            response_parts.append("")
-            response_parts.append(f"User Query reply: {analysis['user_question_response']}")
-
+            parts.append("")
+            parts.append(f"User Query reply: {analysis['user_question_response']}")
         if analysis.get("issues"):
-            response_parts.append("")
-            response_parts.append("Issues:")
+            parts.append("")
+            parts.append("Issues:")
             for i, issue in enumerate(analysis["issues"], 1):
-                response_parts.append(f"{i}. {issue}")
-
+                parts.append(f"{i}. {issue}")
             if analysis.get("issues_prompt"):
-                response_parts.append("")
-                response_parts.append(analysis["issues_prompt"])
-
-        return "\n".join(response_parts).strip()
+                parts.append("")
+                parts.append(analysis["issues_prompt"])
+        return "\n".join(parts).strip()

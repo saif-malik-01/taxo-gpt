@@ -12,7 +12,7 @@ import shutil
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
-from services.memory import update_message_tokens # Import the new helper
+from services.memory import update_message_tokens
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
@@ -30,12 +30,25 @@ from services.memory import get_session_history, add_message, get_user_profile, 
 from services.models import Feedback, User, ChatSession, UserProfile, ChatMessage, UserUsage
 from services.chat.memory_updater import auto_update_profile
 from services.document.processor import DocumentProcessor, DocumentAnalyzer
-from services.document.issue_replier import process_issues_streaming, MODE_DEFENSIVE, MODE_IN_FAVOUR, detect_mode
+from services.document.issue_replier import process_issues_streaming, _process_single_issue, MODE_DEFENSIVE, MODE_IN_FAVOUR, detect_mode
 from services.jobs import start_scheduler, stop_scheduler, list_jobs
+
+# ── New document context imports ───────────────────────────────────────────────
+from services.document.doc_context import (
+    get_doc_context, set_doc_context, clear_doc_context,
+    create_empty_context, create_new_case, get_active_case,
+    get_next_case_id, add_case_to_context, archive_active_case, switch_active_case,
+    get_pending_issues, merge_new_issues_with_existing, apply_issue_update,
+)
+from services.document.doc_classifier import classify_document, determine_routing
+from services.document.intent_classifier import classify_intent, parse_issue_update
+from services.document.session_doc_store import (
+    save_document_text, get_primary_texts, get_reference_texts, delete_session_documents,
+)
 
 # ---------------- INIT ---------------- #
 
-app = FastAPI(title="GST Expert API", version="2.1.0")
+app = FastAPI(title="GST Expert API", version="3.0.0")
 
 # ---------------- LOGGING SETUP ---------------- #
 
@@ -71,10 +84,7 @@ async def shutdown_event():
 async def log_requests(request, call_next):
     import time
     start_time = time.time()
-    
-    # Log incoming request info (method, path)
     logger.info(f"REQ - {request.method} {request.url.path}")
-    
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
@@ -205,14 +215,12 @@ def _check_needs_knowledge(analysis: dict) -> bool:
 
 
 def _merge_full_judgments(target: dict, source: dict) -> None:
-    """Merge source full_judgments into target — no duplicates (keyed by external_id)."""
     for ext_id, judgment in source.items():
         if ext_id not in target:
             target[ext_id] = judgment
 
 
 def _merge_sources(existing: list, new_sources: list, seen_ids: set) -> None:
-    """Append new sources to existing list, deduplicated by id."""
     for s in new_sources:
         sid = s.get("id", "")
         if sid not in seen_ids:
@@ -243,6 +251,8 @@ async def trigger_feedback_report(user=Depends(auth_guard)):
         raise HTTPException(status_code=500, detail=f"Failed to send feedback report: {str(e)}")
 
 
+# ---------------- NON-STREAMING CHAT ---------------- #
+
 @app.post("/chat/ask", response_model=ChatResponse)
 async def ask_gst(
     payload: ChatRequest,
@@ -263,8 +273,7 @@ async def ask_gst(
         raise HTTPException(status_code=404, detail="User not found")
 
     user_id = db_user.id
-    
-    # --- CREDIT CHECK ---
+
     allowed, error_msg = await check_credits(user_id, session_id, False, db)
     if not allowed:
         logger.warning(f"Credit check failed for user {user_id}: {error_msg}")
@@ -284,12 +293,11 @@ async def ask_gst(
 
     await add_message(session_id, "user", payload.question, user_id)
     await add_message(
-        session_id, "assistant", answer, user_id, 
-        prompt_tokens=usage.get("inputTokens", 0), 
+        session_id, "assistant", answer, user_id,
+        prompt_tokens=usage.get("inputTokens", 0),
         response_tokens=usage.get("outputTokens", 0)
     )
-    
-    # Smart deduction: only if it's the first message in the session
+
     is_new_session = len(history) == 0
     await track_usage(user_id, session_id, db, usage=usage, force_deduct=is_new_session)
 
@@ -308,6 +316,8 @@ async def ask_gst(
     }
 
 
+# ---------------- STREAMING ENTRY POINTS ---------------- #
+
 @app.post("/chat/stream/simple")
 @app.post("/chat/ask/stream/simple")
 async def ask_gst_stream_simple(
@@ -319,17 +329,21 @@ async def ask_gst_stream_simple(
 ):
     return await _ask_gst_stream_core("simple", background_tasks, question, session_id, [], user, db)
 
+
 @app.post("/chat/stream/draft")
 @app.post("/chat/ask/stream/draft")
 async def ask_gst_stream_draft(
     background_tasks: BackgroundTasks,
-    question: str = Form(...),
+    question: str = Form(default=""),
     session_id: Optional[str] = Form(None),
     files: List[UploadFile] = File(default=[]),
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
     return await _ask_gst_stream_core("draft", background_tasks, question, session_id, files, user, db)
+
+
+# ---------------- CORE STREAMING HANDLER ---------------- #
 
 async def _ask_gst_stream_core(
     chat_mode: str,
@@ -340,8 +354,6 @@ async def _ask_gst_stream_core(
     user,
     db: AsyncSession
 ):
-# session_id logic
-
     session_id = session_id or str(uuid.uuid4())
 
     email  = user.get("sub")
@@ -350,20 +362,15 @@ async def _ask_gst_stream_core(
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
     user_id = db_user.id
- 
-    # --- CREDIT CHECK ---
-    # Robust file detection: some clients send parts with empty filenames
+
     has_files_pre = any(f.filename for f in files) if files else False
-    
     allowed, error_msg = await check_credits(user_id, session_id, has_files_pre, db, chat_mode=chat_mode)
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
-    # ---- Save uploaded files to temp paths before stream starts ----
-    # File objects are only valid during the request scope; save them now.
-    supported  = {'.pdf', '.docx', '.pptx', '.xlsx', '.html', '.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
-    temp_file_paths = []  # (tmp_path, ext, filename, content_type, size)
-    has_files = files and len(files) > 0
+    supported       = {'.pdf', '.docx', '.pptx', '.xlsx', '.html', '.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
+    temp_file_paths = []
+    has_files       = bool(files and len(files) > 0)
 
     if has_files:
         try:
@@ -385,441 +392,267 @@ async def _ask_gst_stream_core(
 
     async def stream_generator():
         try:
-            # Fetch history BEFORE adding new message to check if session is brand new
             history = await get_session_history(session_id)
-            
-            # ----------------------------------------------------------------
-            # Save user message immediately
-            # ----------------------------------------------------------------
+
+            # ── Save user message ──────────────────────────────────────────────
             user_message = question
             if has_files and temp_file_paths:
-                filenames = [fp[2] for fp in temp_file_paths]
+                filenames     = [fp[2] for fp in temp_file_paths]
                 user_message += f"\n\n[Documents: {', '.join(filenames)}]"
-            
             await add_message(session_id, "user", user_message, user_id, chat_mode=chat_mode)
-            
-            # Smart Credit Deduction: Only if new session or new document upload
+
             is_new_session = len(history) == 0
-            force_deduct = is_new_session or has_files
+            force_deduct   = is_new_session or has_files
             await track_usage(user_id, session_id, db, force_deduct=force_deduct)
 
             profile         = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
-            # Update history to include the message we just added for the LLM context later
-            history = await get_session_history(session_id)
+            history         = await get_session_history(session_id)
 
-            # ----------------------------------------------------------------
-            # DOCUMENT PATH — extraction + analysis run in thread pool
-            # User sees a status event immediately; no waiting before stream opens
-            # ----------------------------------------------------------------
-            document_analysis  = None
-            extracted_text     = None
-            formatted_response = None
-            document_metadata  = None
-            structured         = {}
-            has_issues         = False
-            needs_knowledge    = False
-            issues_list        = []
+            # ── Load doc context from Redis ────────────────────────────────────
+            doc_context = await get_doc_context(session_id) or create_empty_context()
 
+            # ── Process uploaded files ─────────────────────────────────────────
             if has_files and temp_file_paths:
-                try:
-                    file_paths    = [fp[0] for fp in temp_file_paths]
-                    filenames     = [fp[2] for fp in temp_file_paths]
-                    total_size    = sum(fp[4] for fp in temp_file_paths)
-                    content_types = [fp[3] for fp in temp_file_paths]
-
-                    def _extract_and_analyse():
-                        """
-                        Extraction immediately followed by analysis in one synchronous
-                        function — no event-loop round-trip between the two steps.
-                        Runs entirely in a single threadpool call.
-                        """
-                        if len(file_paths) == 1:
-                            text = doc_processor.extract_text(file_paths[0])
-                        else:
-                            text = doc_processor.extract_text_from_multiple_files(file_paths, filenames)
-
-                        if not text or not text.strip():
-                            return None, None, None
-
-                        structured_result = doc_analyzer.analyze(text, question)
-                        formatted_result  = doc_analyzer.format_response_for_frontend(structured_result)
-                        return text, structured_result, formatted_result
-
-                    # Single await — no round-trip between extraction finishing and analysis starting
-                    extracted_text, analysis, formatted_response = await run_in_threadpool(_extract_and_analyse)
-
-                    if not extracted_text:
-                        yield json.dumps({"type": "error", "message": "No text could be extracted from the document(s)."}) + "\n"
+                async for event in _process_uploaded_files(temp_file_paths, question, session_id, doc_context):
+                    if event.get("type") == "error":
+                        yield json.dumps(event) + "\n"
+                        return
+                    elif event.get("type") == "clarification_needed":
+                        msg      = event.get("message", "Could you clarify which case this document belongs to?")
+                        yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                        asst_msg = await add_message(session_id, "assistant", msg, user_id)
+                        await set_doc_context(session_id, doc_context)
+                        yield json.dumps({
+                            "type": "retrieval", "sources": [], "full_judgments": {},
+                            "message_id": getattr(asst_msg, "id", None),
+                            "session_id": session_id, "id": getattr(asst_msg, "id", None),
+                        }) + "\n"
                         return
 
-                    document_analysis = {"formatted": formatted_response, "structured": analysis}
+            # ── Get active case ────────────────────────────────────────────────
+            active_case = get_active_case(doc_context)
 
-                    document_metadata = {
-                        "num_files":        len(temp_file_paths),
-                        "filenames":        filenames,
-                        "content_types":    content_types,
-                        "total_size_bytes": total_size,
-                        "has_analysis":     True
-                    }
+            # ── Classify intent ────────────────────────────────────────────────
+            intent_result  = await run_in_threadpool(classify_intent, question, active_case, bool(temp_file_paths))
+            intent         = intent_result.get("intent", "query_general")
+            intent_mode    = intent_result.get("mode")
+            issue_nums     = [int(x) for x in (intent_result.get("issue_numbers") or [])]
+            target_case_id = intent_result.get("case_id")
 
-                    structured      = document_analysis["structured"]
-                    issues_list     = structured.get("issues") or []
-                    has_issues      = len(issues_list) > 0
-                    needs_knowledge = _check_needs_knowledge(structured)
+            # ── 3-case document upload routing ─────────────────────────────────
+            # Applied only when files were just uploaded in this request
+            if temp_file_paths:
+                if intent in ("query_document", "query_mixed", "query_general"):
+                    # Case C — user asked a question about the document content
+                    intent = "query_with_doc"
+                elif intent in ("draft_all", "draft_specific", "confirm_mode"):
+                    # Case B — user wants draft replies immediately
+                    # Show summary first, then draft if mode known
+                    intent = "summarize_then_draft"
+                else:
+                    # Case A — no specific action / "analyse" / "summarise" / empty
+                    intent = "summarize"
 
-                    logger.info(f"✓ Document analysed. Issues: {len(issues_list)}, needs_knowledge: {needs_knowledge}")
+            logger.info(f"✅ Intent: {intent} | mode={intent_mode} | issues={issue_nums}")
 
-                except Exception as e:
-                    logger.error(f"Document processing failed: {e}", exc_info=True)
-                    yield json.dumps({"type": "error", "message": f"Document processing error: {str(e)}"}) + "\n"
-                    return
-                finally:
-                    for tp, *_ in temp_file_paths:
-                        if os.path.exists(tp):
-                            try: os.unlink(tp)
-                            except OSError: pass
+            # ── Route to handler ───────────────────────────────────────────────
 
-            # ----------------------------------------------------------------
-            # SCENARIO 1: Document — no issues, no knowledge needed
-            # Stream formatted analysis directly
-            # ----------------------------------------------------------------
-            if document_analysis and not has_issues and not needs_knowledge:
-                logger.info("✅ Scenario 1: Document analysis only (no RAG)")
+            # ── CASE B: Upload + draft request ─────────────────────────────────
+            if intent == "summarize_then_draft":
+                if not active_case:
+                    msg = "No document found. Please upload a document first."
+                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                    await add_message(session_id, "assistant", msg, user_id)
+                else:
+                    # Always show summary + issues first
+                    async for chunk in _handle_summarize(active_case, session_id, user_id):
+                        yield chunk
+                    # If mode was detected in the question, immediately start drafting
+                    if intent_mode:
+                        active_case["mode"] = intent_mode
+                        pending = get_pending_issues(active_case)
+                        if pending:
+                            ref_text = await get_reference_texts(session_id, active_case["case_id"])
+                            async for chunk in _handle_draft_issues(
+                                active_case, pending, session_id, user_id,
+                                question, profile_summary, background_tasks, ref_text,
+                                db, chat_mode
+                            ):
+                                yield chunk
+                    # If no mode detected — summarize already asked "Defence or In Favour?"
 
-                chunk_size = 200
-                for i in range(0, len(formatted_response), chunk_size):
-                    yield json.dumps({"type": "content", "delta": formatted_response[i:i+chunk_size]}) + "\n"
+            # ── CASE C: Upload + document question ─────────────────────────────
+            elif intent == "query_with_doc":
+                if not active_case:
+                    async for chunk in _handle_regular_chat(
+                        question, session_id, user_id, history, profile_summary,
+                        None, background_tasks, db
+                    ):
+                        yield chunk
+                else:
+                    async for chunk in _handle_query_with_full_doc(
+                        active_case, question, session_id, user_id,
+                        history, profile_summary, background_tasks, db
+                    ):
+                        yield chunk
 
-                await add_message(session_id, "assistant", formatted_response, user_id)
+            # ── CASE A: Upload + no action / summarise ─────────────────────────
+            elif intent == "summarize":
+                if not active_case:
+                    msg = "No document uploaded yet. Please upload a document to get started."
+                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                    await add_message(session_id, "assistant", msg, user_id)
+                else:
+                    async for chunk in _handle_summarize(active_case, session_id, user_id):
+                        yield chunk
 
-                yield json.dumps({
-                    "type":              "retrieval",
-                    "sources":           [],
-                    "full_judgments":    {},
-                    "message_id":        None,
-                    "session_id":        session_id,
-                    "id":                None,
-                    "document_metadata": document_metadata,
-                    "document_analysis": structured
-                }) + "\n"
-
-                background_tasks.add_task(auto_update_profile, user_id, question, formatted_response)
-                return
-
-            # ----------------------------------------------------------------
-            # SCENARIO 2a: Document HAS ISSUES
-            # Parallel processing, ordered streaming, formatted per issue
-            # Sources + full_judgments aggregated and returned in retrieval event
-            # ----------------------------------------------------------------
-            if has_issues:
-                logger.info(f"✅ Scenario 2a: {len(issues_list)} issues — parallel processing, ordered streaming")
-
-                # Stream document analysis header
-                if formatted_response:
-                    chunk_size = 200
-                    header_text = f"**Document Analysis:**\n\n{formatted_response}\n\n---\n\n"
-                    for i in range(0, len(header_text), chunk_size):
-                        yield json.dumps({"type": "content", "delta": header_text[i:i+chunk_size]}) + "\n"
-
-                mode        = detect_mode(question)
-                recipient   = structured.get("recipient")
-                sender      = structured.get("sender")
-                doc_summary = structured.get("summary", "")   # <-- ADDED
-                total       = len(issues_list)
-
-                full_issues_text  = ""
-                all_sources       = []
-                all_full_judgments = {}
-                seen_source_ids   = set()
-                total_input_tokens = 0
-                total_output_tokens = 0
-
-                async for issue_number, reply, sources, full_judgments, usage in process_issues_streaming(
-                    issues=issues_list,
-                    mode=mode,
-                    store=vector_store,
-                    all_chunks=ALL_CHUNKS,
-                    recipient=recipient,
-                    sender=sender,
-                    doc_summary=doc_summary,               # <-- ADDED
-                    profile_summary=profile_summary,
-                    max_parallel=3
-                ):
-                    # Log tokens for each issue processed
-                    await track_usage(user_id, session_id, db, usage=usage)
-                    total_input_tokens += usage.get("inputTokens", 0)
-                    total_output_tokens += usage.get("outputTokens", 0)
-                    issue_text = issues_list[issue_number - 1]
-
-                    # ---- Issue header (formatted) ----
-                    header = f"\n\n---\n\n### Issue {issue_number} of {total}\n\n> {issue_text}\n\n"
-                    yield json.dumps({"type": "content", "delta": header}) + "\n"
-
-                    # Signal start to frontend (for any UI tracking)
-                    yield json.dumps({
-                        "type":         "issue_start",
-                        "issue_number": issue_number,
-                        "issue_text":   issue_text,
-                        "total_issues": total
-                    }) + "\n"
-
-                    # Stream reply in chunks
-                    chunk_size = 50
-                    for i in range(0, len(reply), chunk_size):
-                        yield json.dumps({"type": "content", "delta": reply[i:i+chunk_size]}) + "\n"
-
-                    # Signal end to frontend
-                    yield json.dumps({
-                        "type":         "issue_end",
-                        "issue_number": issue_number
-                    }) + "\n"
-
-                    full_issues_text += f"\n\n---\n\n### Issue {issue_number}: {issue_text}\n\n{reply}"
-
-                    # Aggregate sources (deduplicated)
-                    _merge_sources(all_sources, sources, seen_source_ids)
-
-                    # Aggregate full judgments (deduplicated by external_id)
-                    _merge_full_judgments(all_full_judgments, full_judgments)
-
-                    # --- Mid-stream FUP check ---
-                    # Check if the session or monthly limit was hit after this issue
-                    # Pass the current running tally as extra_tokens
-                    allowed, error_msg = await check_credits(
-                        user_id, session_id, False, db, 
-                        chat_mode=chat_mode, 
-                        extra_tokens=total_input_tokens + total_output_tokens
-                    )
-                    if not allowed:
-                        warning = f"\n\n---\n\n*ℹ️ Note: {error_msg} Generation stopped at this stage.*"
-                        yield json.dumps({"type": "content", "delta": warning}) + "\n"
-                        full_issues_text += warning
-                        logger.warning(f"Mid-stream FUP hit for user {user_id} at issue {issue_number}: {error_msg}")
-                        break
-
-                # ---- Single closing block after all issues ----
-                closing_block = (
-                    "\n\n---\n\n"
-                    "**Respectfully submitted.**\n\n"
-                    f"*For {recipient or 'the Taxpayer'}*\n\n"
-                    "Authorised Signatory / Chartered Accountant / Legal Representative\n\n"
-                    "Date: [Insert Date]"
-                )
-                chunk_size = 50
-                for i in range(0, len(closing_block), chunk_size):
-                    yield json.dumps({"type": "content", "delta": closing_block[i:i+chunk_size]}) + "\n"
-                full_issues_text += closing_block
-
-                # ---- Knowledge base supplement if needed ----
-                if needs_knowledge:
-                    allowed, error_msg = await check_credits(
-                        user_id, session_id, False, db, 
-                        chat_mode=chat_mode,
-                        extra_tokens=total_input_tokens + total_output_tokens
-                    )
-                    if not allowed:
-                        msg = f"\n\n---\n\n*ℹ️ Note: {error_msg} Knowledge base supplement skipped.*"
+            elif intent in ("confirm_mode", "draft_all"):
+                if not active_case:
+                    msg = "No active case found. Please upload a document first."
+                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                    await add_message(session_id, "assistant", msg, user_id)
+                else:
+                    if intent_mode and not active_case.get("mode"):
+                        active_case["mode"] = intent_mode
+                    if not active_case.get("mode"):
+                        msg = "\n\nShould I prepare the reply in **Defence** (protecting the recipient) or **In Favour** of the notice?"
                         yield json.dumps({"type": "content", "delta": msg}) + "\n"
-                        full_issues_text += msg
+                        active_case["state"] = "awaiting_mode"
+                        await add_message(session_id, "assistant", msg, user_id)
                     else:
-                        yield json.dumps({
-                            "type":  "content",
-                            "delta": "\n\n---\n\n**Answer to your query:**\n\n"
-                        }) + "\n"
+                        pending = get_pending_issues(active_case)
+                        if not pending:
+                            msg = "\n\nAll issues already have replies. Ask me to update any specific one."
+                            yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                            await add_message(session_id, "assistant", msg, user_id)
+                        else:
+                            ref_text = await get_reference_texts(session_id, active_case["case_id"])
+                            async for chunk in _handle_draft_issues(
+                                active_case, pending, session_id, user_id,
+                                question, profile_summary, background_tasks, ref_text,
+                                db, chat_mode
+                            ):
+                                yield chunk
 
-                        knowledge_answer = ""
-                        async for chunk in chat_stream(
-                            query=question,
-                            store=vector_store,
-                            all_chunks=ALL_CHUNKS,
-                            history=history,
-                            profile_summary=profile_summary,
-                            document_context=extracted_text
+            elif intent == "draft_specific":
+                if not active_case:
+                    msg = "No active case found. Please upload a document first."
+                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                    await add_message(session_id, "assistant", msg, user_id)
+                else:
+                    if intent_mode and not active_case.get("mode"):
+                        active_case["mode"] = intent_mode
+                    if not active_case.get("mode"):
+                        msg = "\n\nShould I prepare the reply in **Defence** or **In Favour** of the notice?"
+                        yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                        active_case["state"] = "awaiting_mode"
+                        active_case["_pending_issue_nums"] = issue_nums
+                        await add_message(session_id, "assistant", msg, user_id)
+                    else:
+                        all_issues    = active_case.get("issues", [])
+                        target_issues = [i for i in all_issues if i["id"] in issue_nums] if issue_nums else get_pending_issues(active_case)
+                        if not target_issues:
+                            msg = "\n\nNo matching issues found. Please check the issue numbers."
+                            yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                            await add_message(session_id, "assistant", msg, user_id)
+                        else:
+                            ref_text = await get_reference_texts(session_id, active_case["case_id"])
+                            async for chunk in _handle_draft_issues(
+                                active_case, target_issues, session_id, user_id,
+                                question, profile_summary, background_tasks, ref_text,
+                                db, chat_mode
+                            ):
+                                yield chunk
+
+            elif intent == "update_issues":
+                if not active_case:
+                    msg = "No active case found."
+                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                    await add_message(session_id, "assistant", msg, user_id)
+                else:
+                    async for chunk in _handle_update_issues(active_case, question, session_id, user_id):
+                        yield chunk
+
+            elif intent == "update_reply":
+                if not active_case:
+                    msg = "No active case found."
+                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                    await add_message(session_id, "assistant", msg, user_id)
+                else:
+                    target_id = issue_nums[0] if issue_nums else None
+                    if not target_id:
+                        msg = "Please specify which issue number you'd like me to update the reply for."
+                        yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                        await add_message(session_id, "assistant", msg, user_id)
+                    else:
+                        ref_text = await get_reference_texts(session_id, active_case["case_id"])
+                        async for chunk in _handle_update_reply(
+                            active_case, target_id, session_id, user_id,
+                            profile_summary, background_tasks, ref_text
                         ):
-                            ctype = chunk.get("type")
-                            if ctype == "content":
-                                delta = chunk.get("delta", "")
-                                knowledge_answer += delta
-                                yield json.dumps({"type": "content", "delta": delta}) + "\n"
-                            elif ctype == "retrieval":
-                                _merge_sources(all_sources, chunk.get("sources", []) or [], seen_source_ids)
-                                _merge_full_judgments(all_full_judgments, chunk.get("full_judgments", {}) or {})
-                            elif ctype == "usage":
-                                # Track knowledge base tokens
-                                usage_dict = chunk.get("usage", {})
-                                await track_usage(user_id, session_id, db, usage=usage_dict)
-                                if 'last_message_id' in locals() and last_message_id:
-                                    await update_message_tokens(
-                                        last_message_id, 
-                                        usage_dict.get("inputTokens", 0), 
-                                        usage_dict.get("outputTokens", 0)
-                                    )
+                            yield chunk
 
-                        full_issues_text += f"\n\n---\n\n**Answer to your query:**\n\n{knowledge_answer}"
+            elif intent in ("query_document", "query_mixed"):
+                if not active_case:
+                    async for chunk in _handle_regular_chat(
+                        question, session_id, user_id, history, profile_summary,
+                        None, background_tasks, db
+                    ):
+                        yield chunk
+                else:
+                    async for chunk in _handle_query_with_document(
+                        active_case, question, session_id, user_id,
+                        history, profile_summary, background_tasks, db
+                    ):
+                        yield chunk
 
-                # Save combined answer with total tokens from all issues
-                combined_answer = (formatted_response or "") + full_issues_text
-                assistant_msg   = await add_message(
-                    session_id, "assistant", combined_answer, user_id,
-                    prompt_tokens=total_input_tokens,
-                    response_tokens=total_output_tokens
-                )
-                message_id      = getattr(assistant_msg, "id", None)
-
-                # Retrieval event — sources + full_judgments in same shape as non-document
-                yield json.dumps({
-                    "type":              "retrieval",
-                    "sources":           all_sources,
-                    "full_judgments":    all_full_judgments,
-                    "message_id":        message_id,
-                    "session_id":        session_id,
-                    "id":                message_id,
-                    "document_metadata": document_metadata,
-                    "document_analysis": structured
-                }) + "\n"
-
-                background_tasks.add_task(auto_update_profile, user_id, question, combined_answer)
-                return
-
-            # ----------------------------------------------------------------
-            # SCENARIO 2b: Document — no issues but knowledge needed
-            # ----------------------------------------------------------------
-            if document_analysis and needs_knowledge:
-                logger.info("✅ Scenario 2b: Document + knowledge base")
-
-                if formatted_response:
-                    yield json.dumps({
-                        "type":  "content",
-                        "delta": f"**Document Analysis:**\n\n{formatted_response}\n\n---\n\n**Answer to your query:**\n\n"
-                    }) + "\n"
-
-                full_rag_answer = ""
-
-                async for chunk in chat_stream(
-                    query=question,
-                    store=vector_store,
-                    all_chunks=ALL_CHUNKS,
-                    history=history,
-                    profile_summary=profile_summary,
-                    document_context=extracted_text
-                ):
-                    ctype = chunk.get("type")
-                    if ctype == "content":
-                        delta = chunk.get("delta", "")
-                        full_rag_answer += delta
-                        yield json.dumps({"type": "content", "delta": delta}) + "\n"
-                    elif ctype == "retrieval":
-                        # Yield retrieval immediately — no buffering
-                        combined_answer = (formatted_response or "") + "\n\n---\n\n**Answer to your query:**\n\n" + full_rag_answer
-                        assistant_msg   = await add_message(session_id, "assistant", combined_answer, user_id)
-                        last_message_id = getattr(assistant_msg, "id", None)
-                        message_id      = last_message_id
-
-                        retrieval_obj = {
-                            "type":              "retrieval",
-                            "sources":           chunk.get("sources", []) or [],
-                            "full_judgments":    chunk.get("full_judgments", {}) or {},
-                            "message_id":        message_id,
-                            "session_id":        session_id,
-                            "id":                message_id,
-                            "document_metadata": document_metadata,
-                            "document_analysis": structured
-                        }
-                        yield json.dumps(retrieval_obj) + "\n"
-
-                    elif ctype == "citations":
-                        yield json.dumps({
-                            "type":           "citations",
-                            "party_citations": chunk.get("party_citations", {})
-                        }) + "\n"
-
-                    elif ctype == "usage":
-                        # Track knowledge base tokens
-                        usage_dict = chunk.get("usage", {})
-                        await track_usage(user_id, session_id, db, usage=usage_dict)
-                        if 'last_message_id' in locals() and last_message_id:
-                            await update_message_tokens(
-                                last_message_id, 
-                                usage_dict.get("inputTokens", 0), 
-                                usage_dict.get("outputTokens", 0)
-                            )
-
-                background_tasks.add_task(
-                    auto_update_profile, user_id, question,
-                    (formatted_response or "") + "\n\n" + full_rag_answer
-                )
-                return
-
-            # ----------------------------------------------------------------
-            # SCENARIO 3: Regular chat — no document
-            # Yield retrieval/metadata/citations inline as they arrive (no buffering)
-            # This eliminates the pause between content end and retrieval event
-            # ----------------------------------------------------------------
-            logger.info("✅ Scenario 3: Regular chat")
-
-            full_answer = ""
-            message_saved = False
-
-            async for chunk in chat_stream(
-                query=question,
-                store=vector_store,
-                all_chunks=ALL_CHUNKS,
-                history=history,
-                profile_summary=profile_summary,
-                document_context=None
-            ):
-                ctype = chunk.get("type")
-
-                if ctype == "content":
-                    delta = chunk.get("delta", "")
-                    full_answer += delta
-                    yield json.dumps({"type": "content", "delta": delta}) + "\n"
-
-                elif ctype == "retrieval":
-                    # Save message once — get message_id for the retrieval event
-                    if not message_saved:
-                        assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
-                        last_message_id = getattr(assistant_msg, "id", None)
-                        message_id    = last_message_id
-                        message_saved = True
-                    else:
-                        message_id = None
-
-                    # Yield retrieval immediately — no pause
-                    yield json.dumps({
-                        "type":           "retrieval",
-                        "sources":        chunk.get("sources", []) or [],
-                        "full_judgments": chunk.get("full_judgments", {}) or {},
-                        "message_id":     message_id,
-                        "session_id":     session_id,
-                        "id":             message_id
-                    }) + "\n"
-
-                elif ctype == "citations":
-                    yield json.dumps({
-                        "type":           "citations",
-                        "party_citations": chunk.get("party_citations", {})
-                    }) + "\n"
-
-                elif ctype == "usage":
-                    llm_usage = chunk.get("usage", {})
-                    # Update message with tokens if it exists
-                    await track_usage(user_id, session_id, db, usage=llm_usage)
-                    if 'last_message_id' in locals() and last_message_id:
-                        await update_message_tokens(
-                            last_message_id, 
-                            llm_usage.get("inputTokens", 0), 
-                            llm_usage.get("outputTokens", 0)
+            elif intent == "switch_case":
+                if target_case_id:
+                    switch_active_case(doc_context, target_case_id)
+                    switched = get_active_case(doc_context)
+                    if switched:
+                        p   = switched.get("parties", {})
+                        msg = (
+                            f"\n\nSwitched to **Case {target_case_id}** — "
+                            f"{p.get('sender', 'Unknown')} / {p.get('recipient', 'Unknown')}.\n\n"
+                            f"{(switched.get('summary') or '')[:200]}"
                         )
+                    else:
+                        msg = f"\n\nCase {target_case_id} not found."
+                else:
+                    cases = doc_context.get("cases", [])
+                    if len(cases) > 1:
+                        lines = [
+                            "- Case " + str(c["case_id"]) + " (" + c["status"] + "): "
+                            + c.get("parties", {}).get("sender", "?")
+                            + " / "
+                            + c.get("parties", {}).get("recipient", "?")
+                            for c in cases
+                        ]
+                        msg = "Available cases:\n" + "\n".join(lines) + "\n\nWhich case would you like to switch to?"
+                    else:
+                        msg = "Only one case exists in this session."
+                yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                await add_message(session_id, "assistant", msg, user_id)
 
-            # Ensure message is saved even if retrieval event never came
-            if not message_saved:
-                assistant_msg = await add_message(session_id, "assistant", full_answer, user_id)
+            elif intent == "new_case":
+                archive_active_case(doc_context)
+                doc_context["active_case_id"] = None
+                msg = "\n\nStarting fresh for a new case. Please upload the documents."
+                yield json.dumps({"type": "content", "delta": msg}) + "\n"
+                await add_message(session_id, "assistant", msg, user_id)
 
-            # track_usage moved to beginning of stream_generator
+            else:
+                # query_general — pure GST chat, no document
+                async for chunk in _handle_regular_chat(
+                    question, session_id, user_id, history, profile_summary,
+                    active_case, background_tasks, db
+                ):
+                    yield chunk
 
-            background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
+            # ── Save updated doc context back to Redis ─────────────────────────
+            await set_doc_context(session_id, doc_context)
 
         except Exception as e:
             logger.error(f"❌ stream_generator error: {str(e)}", exc_info=True)
@@ -829,7 +662,6 @@ async def _ask_gst_stream_core(
             }) + "\n"
 
         finally:
-            # Clean up any leftover temp files (safety net)
             for tp, *_ in temp_file_paths:
                 if os.path.exists(tp):
                     try: os.unlink(tp)
@@ -838,6 +670,603 @@ async def _ask_gst_stream_core(
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
+
+# =============================================================================
+# FILE PROCESSING
+# =============================================================================
+
+async def _process_uploaded_files(temp_file_paths, question, session_id, doc_context):
+    """
+    Extract → classify → route → save text to DB → update Redis memory.
+    Full text is NEVER stored in Redis. DB is write-once per document.
+    """
+    try:
+        file_data = []
+        for tmp_path, ext, filename, content_type, size in temp_file_paths:
+            try:
+                text = await run_in_threadpool(doc_processor.extract_text, tmp_path)
+                file_data.append((filename, text or ""))
+            except Exception as e:
+                yield {"type": "error", "message": f"Could not extract {filename}: {str(e)}"}
+                return
+
+        active_case = get_active_case(doc_context)
+
+        classified                = []
+        needs_clarification_files = []
+
+        for filename, text in file_data:
+            classification = await run_in_threadpool(
+                classify_document, text, filename, question, active_case
+            )
+            routing = determine_routing(classification, has_existing_case=bool(active_case))
+
+            if routing == "ask_user":
+                needs_clarification_files.append((filename, text, classification))
+            else:
+                classified.append((filename, text, classification, routing))
+
+        # All files ambiguous — ask user
+        if needs_clarification_files and not classified:
+            names = [f[0] for f in needs_clarification_files]
+            doc_context["_pending_clarification"] = [
+                {"filename": f[0], "routing_hint": "ambiguous"} for f in needs_clarification_files
+            ]
+            yield {
+                "type": "clarification_needed",
+                "message": (
+                    "I see you've uploaded **" + ", ".join(names) + "**. "
+                    "Is this related to the existing case or a new case?"
+                )
+            }
+            return
+
+        for filename, text, classification in needs_clarification_files:
+            classified.append((filename, text, classification, "add_to_existing"))
+
+        new_case_primary = [(f, t, c) for f, t, c, r in classified if r == "new_case"        and c.get("is_primary", True)]
+        new_case_ref     = [(f, t, c) for f, t, c, r in classified if r == "new_case"        and not c.get("is_primary", True)]
+        exist_primary    = [(f, t, c) for f, t, c, r in classified if r == "add_to_existing" and c.get("is_primary", True)]
+        exist_ref        = [(f, t, c) for f, t, c, r in classified if r == "add_to_existing" and not c.get("is_primary", True)]
+
+        if new_case_primary:
+            if active_case:
+                active_case["status"] = "archived"
+            new_case_id = get_next_case_id(doc_context)
+            parties     = new_case_primary[0][2].get("parties") or {"sender": None, "recipient": None}
+            new_case    = create_new_case(new_case_id, parties)
+            add_case_to_context(doc_context, new_case)
+            active_case = new_case
+
+            for filename, text, _ in new_case_primary:
+                await save_document_text(session_id, active_case["case_id"], filename, "primary", text)
+            for filename, text, _ in new_case_ref:
+                await save_document_text(session_id, active_case["case_id"], filename, "reference", text)
+
+        if exist_primary:
+            if not active_case:
+                new_case_id = get_next_case_id(doc_context)
+                parties     = exist_primary[0][2].get("parties") or {"sender": None, "recipient": None}
+                active_case = create_new_case(new_case_id, parties)
+                add_case_to_context(doc_context, active_case)
+
+            for filename, text, _ in exist_primary:
+                await save_document_text(session_id, active_case["case_id"], filename, "primary", text)
+
+        if exist_ref and active_case:
+            for filename, text, _ in exist_ref:
+                await save_document_text(session_id, active_case["case_id"], filename, "reference", text)
+
+        if active_case:
+            consolidated_text = await get_primary_texts(session_id, active_case["case_id"])
+            if consolidated_text.strip():
+                def _analyse():
+                    return doc_analyzer.analyze(consolidated_text, question)
+
+                analysis = await run_in_threadpool(_analyse)
+
+                active_case["summary"] = analysis.get("summary", "")
+                for field in ("sender", "recipient"):
+                    if not active_case["parties"].get(field) and analysis.get(field):
+                        active_case["parties"][field] = analysis[field]
+
+                new_issues_raw        = analysis.get("issues") or []
+                active_case["issues"] = merge_new_issues_with_existing(
+                    active_case.get("issues", []), new_issues_raw
+                )
+
+    except Exception as e:
+        logger.error(f"_process_uploaded_files error: {e}", exc_info=True)
+        yield {"type": "error", "message": f"Document processing error: {str(e)}"}
+
+
+# =============================================================================
+# INTENT HANDLERS
+# =============================================================================
+
+async def _handle_summarize(active_case, session_id, user_id):
+    """
+    Case A — show summary, parties, and all extracted issues.
+    If issues found → ask Defence or In Favour.
+    """
+    summary = active_case.get("summary", "")
+    issues  = active_case.get("issues", [])
+    parties = active_case.get("parties", {})
+
+    lines = []
+    if parties.get("sender"):
+        lines.append("**From:** " + parties["sender"])
+    if parties.get("recipient"):
+        lines.append("**To:** " + parties["recipient"])
+    if lines:
+        lines.append("")
+
+    lines.append(summary or "Summary not available.")
+
+    if issues:
+        lines.append("\n\n**Issues / Allegations:**\n")
+        for i in issues:
+            status_tag = " ✅" if i.get("reply") else ""
+            lines.append(str(i["id"]) + ". " + i["text"] + status_tag)
+        pending_count = sum(1 for i in issues if not i.get("reply"))
+        if pending_count:
+            lines.append(
+                "\n\nShould I prepare draft replies for these "
+                + str(pending_count)
+                + " issue(s)? "
+                "If yes — **Defence** (protecting the recipient) or **In Favour** of the notice?"
+            )
+        else:
+            lines.append("\n\nAll issues already have replies. You can ask me to update any specific one.")
+    else:
+        lines.append("\n\nNo specific issues or allegations were found in the document.")
+
+    full_text  = "\n".join(lines)
+    chunk_size = 200
+    for i in range(0, len(full_text), chunk_size):
+        yield json.dumps({"type": "content", "delta": full_text[i:i+chunk_size]}) + "\n"
+
+    active_case["state"] = "awaiting_decision"
+    asst_msg = await add_message(session_id, "assistant", full_text, user_id)
+    yield json.dumps({
+        "type":     "retrieval",
+        "sources":  [],
+        "full_judgments": {},
+        "message_id": getattr(asst_msg, "id", None),
+        "session_id": session_id,
+        "id":         getattr(asst_msg, "id", None),
+        "document_analysis": {
+            "summary": active_case.get("summary"),
+            "issues":  active_case.get("issues"),
+            "parties": active_case.get("parties"),
+        },
+    }) + "\n"
+
+
+async def _handle_draft_issues(
+    active_case, issues_to_draft, session_id, user_id,
+    question, profile_summary, background_tasks, ref_text,
+    db, chat_mode
+):
+    """Generate replies for the given list of issues, streaming each one."""
+    mode         = active_case.get("mode", MODE_DEFENSIVE)
+    recipient    = active_case.get("parties", {}).get("recipient")
+    sender       = active_case.get("parties", {}).get("sender")
+    doc_summary  = active_case.get("summary", "")
+    total_global = len(active_case["issues"])
+
+    all_sources         = []
+    all_full_judgments  = {}
+    seen_source_ids     = set()
+    full_reply_text     = ""
+    total_input_tokens  = 0
+    total_output_tokens = 0
+
+    active_case["state"] = "reply_in_progress"
+
+    async for issue_number, reply, sources, full_judgments, usage in process_issues_streaming(
+        issues=[i["text"] for i in issues_to_draft],
+        mode=mode, store=vector_store, all_chunks=ALL_CHUNKS,
+        recipient=recipient, sender=sender, doc_summary=doc_summary,
+        profile_summary=profile_summary, max_parallel=3,
+        reference_docs_text=ref_text,
+    ):
+        await track_usage(user_id, session_id, db, usage=usage)
+        total_input_tokens  += usage.get("inputTokens", 0)
+        total_output_tokens += usage.get("outputTokens", 0)
+
+        issue_obj  = issues_to_draft[issue_number - 1]
+        global_id  = issue_obj["id"]
+        issue_text = issue_obj["text"]
+
+        header = "\n\n---\n\n### Issue " + str(global_id) + " of " + str(total_global) + "\n\n> " + issue_text + "\n\n"
+        yield json.dumps({"type": "content", "delta": header}) + "\n"
+        yield json.dumps({
+            "type":         "issue_start",
+            "issue_number": global_id,
+            "issue_text":   issue_text,
+            "total_issues": total_global
+        }) + "\n"
+
+        chunk_size = 50
+        for i in range(0, len(reply), chunk_size):
+            yield json.dumps({"type": "content", "delta": reply[i:i+chunk_size]}) + "\n"
+
+        yield json.dumps({"type": "issue_end", "issue_number": global_id}) + "\n"
+
+        full_reply_text += "\n\n### Issue " + str(global_id) + ": " + issue_text + "\n\n" + reply
+
+        for iss in active_case["issues"]:
+            if iss["id"] == global_id:
+                iss["reply"]  = reply
+                iss["status"] = "replied"
+                break
+
+        _merge_sources(all_sources, sources, seen_source_ids)
+        _merge_full_judgments(all_full_judgments, full_judgments)
+
+        # Mid-stream FUP check
+        allowed, error_msg = await check_credits(
+            user_id, session_id, False, db,
+            chat_mode=chat_mode,
+            extra_tokens=total_input_tokens + total_output_tokens
+        )
+        if not allowed:
+            warning = "\n\n---\n\n*ℹ️ Note: " + error_msg + " Generation stopped at this stage.*"
+            yield json.dumps({"type": "content", "delta": warning}) + "\n"
+            full_reply_text += warning
+            logger.warning(f"Mid-stream FUP hit for user {user_id} at issue {global_id}: {error_msg}")
+            break
+
+    closing = (
+        "\n\n---\n\n**Respectfully submitted.**\n\n"
+        "*For " + (recipient or "the Taxpayer") + "*\n\n"
+        "Authorised Signatory / Chartered Accountant / Legal Representative\n\nDate: [Insert Date]"
+    )
+    for i in range(0, len(closing), 50):
+        yield json.dumps({"type": "content", "delta": closing[i:i+50]}) + "\n"
+    full_reply_text += closing
+
+    active_case["state"] = "complete"
+
+    asst_msg = await add_message(
+        session_id, "assistant", full_reply_text, user_id,
+        prompt_tokens=total_input_tokens,
+        response_tokens=total_output_tokens
+    )
+    message_id = getattr(asst_msg, "id", None)
+
+    yield json.dumps({
+        "type":           "retrieval",
+        "sources":        all_sources,
+        "full_judgments": all_full_judgments,
+        "message_id":     message_id,
+        "session_id":     session_id,
+        "id":             message_id,
+        "document_analysis": {
+            "summary": active_case.get("summary"),
+            "issues":  active_case.get("issues"),
+            "parties": active_case.get("parties"),
+        },
+    }) + "\n"
+    background_tasks.add_task(auto_update_profile, user_id, question, full_reply_text)
+
+
+async def _handle_update_issues(active_case, question, session_id, user_id):
+    current_issues = active_case.get("issues", [])
+    update = await run_in_threadpool(parse_issue_update, question, current_issues)
+    action = update.get("action")
+
+    if action == "reextract":
+        # Fetch full text from DB — never stored in Redis
+        full_text = await get_primary_texts(session_id, active_case["case_id"])
+
+        if not full_text.strip():
+            msg = "I couldn't find the original document text to re-analyse. Please share which issue is missing."
+            yield json.dumps({"type": "content", "delta": msg}) + "\n"
+            await add_message(session_id, "assistant", msg, user_id)
+            return
+
+        new_issue_texts = await run_in_threadpool(
+            doc_analyzer.reextract_missed_issues, full_text, current_issues
+        )
+
+        if new_issue_texts:
+            next_id = max((i["id"] for i in current_issues), default=0) + 1
+            for text in new_issue_texts:
+                current_issues.append({"id": next_id, "text": text, "reply": None, "status": "pending"})
+                next_id += 1
+
+            lines = ["I found the following additional issues in the document:\n"]
+            for t in new_issue_texts:
+                lines.append("- " + t)
+            lines.append("\n\nUpdated issues list:\n")
+            for i in current_issues:
+                status_tag = " ✅" if i.get("reply") else ""
+                lines.append(str(i["id"]) + ". " + i["text"] + status_tag)
+            lines.append("\n\nShould I generate replies for the new issues?")
+            response_text = "\n".join(lines)
+        else:
+            response_text = (
+                "I re-read the document carefully but could not find any additional issues "
+                "beyond what was already extracted.\n\n"
+                "Could you point me to the missing issue — you can quote the text or mention the paragraph?"
+            )
+
+        chunk_size = 200
+        for i in range(0, len(response_text), chunk_size):
+            yield json.dumps({"type": "content", "delta": response_text[i:i+chunk_size]}) + "\n"
+        asst_msg = await add_message(session_id, "assistant", response_text, user_id)
+        yield json.dumps({
+            "type": "retrieval", "sources": [], "full_judgments": {},
+            "message_id": getattr(asst_msg, "id", None),
+            "session_id": session_id, "id": getattr(asst_msg, "id", None),
+        }) + "\n"
+
+    else:
+        apply_issue_update(active_case, update)
+        issues = active_case.get("issues", [])
+        lines  = ["Issues list updated. Current issues:\n"]
+        for i in issues:
+            status_tag = " ✅" if i.get("reply") else ""
+            lines.append(str(i["id"]) + ". " + i["text"] + status_tag)
+        if get_pending_issues(active_case):
+            lines.append("\n\nShould I generate replies for the updated issue(s)?")
+
+        response_text = "\n".join(lines)
+        chunk_size = 200
+        for i in range(0, len(response_text), chunk_size):
+            yield json.dumps({"type": "content", "delta": response_text[i:i+chunk_size]}) + "\n"
+        asst_msg = await add_message(session_id, "assistant", response_text, user_id)
+        yield json.dumps({
+            "type": "retrieval", "sources": [], "full_judgments": {},
+            "message_id": getattr(asst_msg, "id", None),
+            "session_id": session_id, "id": getattr(asst_msg, "id", None),
+        }) + "\n"
+
+
+async def _handle_update_reply(
+    active_case, issue_id, session_id, user_id,
+    profile_summary, background_tasks, ref_text
+):
+    all_issues = active_case.get("issues", [])
+    target     = next((i for i in all_issues if i["id"] == issue_id), None)
+
+    if not target:
+        msg = "Issue " + str(issue_id) + " not found."
+        yield json.dumps({"type": "content", "delta": msg}) + "\n"
+        await add_message(session_id, "assistant", msg, user_id)
+        return
+
+    mode            = active_case.get("mode", MODE_DEFENSIVE)
+    recipient       = active_case.get("parties", {}).get("recipient")
+    sender          = active_case.get("parties", {}).get("sender")
+    doc_summary     = active_case.get("summary", "")
+    all_issue_texts = [i["text"] for i in all_issues]
+    issue_number    = (all_issue_texts.index(target["text"]) + 1
+                       if target["text"] in all_issue_texts else 1)
+
+    header = "\n\n---\n\n### Updated Reply — Issue " + str(issue_id) + "\n\n> " + target["text"] + "\n\n"
+    yield json.dumps({"type": "content", "delta": header}) + "\n"
+
+    _, reply, sources, full_judgments, usage = await run_in_threadpool(
+        _process_single_issue,
+        target["text"], issue_number, len(all_issues), all_issue_texts,
+        mode, vector_store, ALL_CHUNKS,
+        recipient, sender, doc_summary, profile_summary, ref_text,
+    )
+
+    chunk_size = 50
+    for i in range(0, len(reply), chunk_size):
+        yield json.dumps({"type": "content", "delta": reply[i:i+chunk_size]}) + "\n"
+
+    for iss in all_issues:
+        if iss["id"] == issue_id:
+            iss["reply"]  = reply
+            iss["status"] = "user_edited"
+            break
+
+    asst_msg = await add_message(
+        session_id, "assistant", reply, user_id,
+        prompt_tokens=usage.get("inputTokens", 0),
+        response_tokens=usage.get("outputTokens", 0)
+    )
+    yield json.dumps({
+        "type": "retrieval", "sources": sources, "full_judgments": full_judgments,
+        "message_id": getattr(asst_msg, "id", None),
+        "session_id": session_id, "id": getattr(asst_msg, "id", None),
+    }) + "\n"
+    background_tasks.add_task(auto_update_profile, user_id, target["text"], reply)
+
+
+async def _handle_query_with_document(
+    active_case, question, session_id, user_id,
+    history, profile_summary, background_tasks, db
+):
+    """Follow-up document query (no new file) — uses case summary as context."""
+    summary = active_case.get("summary", "")
+    doc_ctx = ("[Active case summary: " + summary + "]") if summary else None
+
+    full_answer     = ""
+    message_saved   = False
+    last_message_id = None
+
+    async for chunk in chat_stream(
+        query=question, store=vector_store, all_chunks=ALL_CHUNKS,
+        history=history, profile_summary=profile_summary, document_context=doc_ctx,
+    ):
+        ctype = chunk.get("type")
+        if ctype == "content":
+            delta = chunk.get("delta", "")
+            full_answer += delta
+            yield json.dumps({"type": "content", "delta": delta}) + "\n"
+        elif ctype == "retrieval":
+            if not message_saved:
+                asst_msg        = await add_message(session_id, "assistant", full_answer, user_id)
+                last_message_id = getattr(asst_msg, "id", None)
+                message_id      = last_message_id
+                message_saved   = True
+            else:
+                message_id = None
+            yield json.dumps({
+                "type":           "retrieval",
+                "sources":        chunk.get("sources", []) or [],
+                "full_judgments": chunk.get("full_judgments", {}) or {},
+                "message_id":     message_id,
+                "session_id":     session_id,
+                "id":             message_id,
+            }) + "\n"
+        elif ctype == "citations":
+            yield json.dumps({"type": "citations", "party_citations": chunk.get("party_citations", {})}) + "\n"
+        elif ctype == "usage":
+            usage_dict = chunk.get("usage", {})
+            await track_usage(user_id, session_id, db, usage=usage_dict)
+            if last_message_id:
+                await update_message_tokens(
+                    last_message_id,
+                    usage_dict.get("inputTokens", 0),
+                    usage_dict.get("outputTokens", 0)
+                )
+
+    if not message_saved:
+        await add_message(session_id, "assistant", full_answer, user_id)
+    background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
+
+
+async def _handle_query_with_full_doc(
+    active_case, question, session_id, user_id,
+    history, profile_summary, background_tasks, db
+):
+    """
+    Case C — user uploaded a doc AND asked a question about it.
+    Fetches full primary text from DB and passes it as document_context.
+    chat_stream also hits the knowledge base for anything not in the doc.
+    Token tracking identical to regular chat.
+    """
+    full_doc_text = await get_primary_texts(session_id, active_case["case_id"])
+    # Truncate to safe context window size — first 12000 chars
+    doc_ctx = full_doc_text[:12000] if full_doc_text.strip() else None
+
+    full_answer     = ""
+    message_saved   = False
+    last_message_id = None
+
+    async for chunk in chat_stream(
+        query=question, store=vector_store, all_chunks=ALL_CHUNKS,
+        history=history, profile_summary=profile_summary, document_context=doc_ctx,
+    ):
+        ctype = chunk.get("type")
+
+        if ctype == "content":
+            delta = chunk.get("delta", "")
+            full_answer += delta
+            yield json.dumps({"type": "content", "delta": delta}) + "\n"
+
+        elif ctype == "retrieval":
+            if not message_saved:
+                asst_msg        = await add_message(session_id, "assistant", full_answer, user_id)
+                last_message_id = getattr(asst_msg, "id", None)
+                message_id      = last_message_id
+                message_saved   = True
+            else:
+                message_id = None
+            yield json.dumps({
+                "type":           "retrieval",
+                "sources":        chunk.get("sources", []) or [],
+                "full_judgments": chunk.get("full_judgments", {}) or {},
+                "message_id":     message_id,
+                "session_id":     session_id,
+                "id":             message_id,
+            }) + "\n"
+
+        elif ctype == "citations":
+            yield json.dumps({
+                "type":            "citations",
+                "party_citations": chunk.get("party_citations", {})
+            }) + "\n"
+
+        elif ctype == "usage":
+            usage_dict = chunk.get("usage", {})
+            await track_usage(user_id, session_id, db, usage=usage_dict)
+            if last_message_id:
+                await update_message_tokens(
+                    last_message_id,
+                    usage_dict.get("inputTokens", 0),
+                    usage_dict.get("outputTokens", 0)
+                )
+
+    if not message_saved:
+        await add_message(session_id, "assistant", full_answer, user_id)
+    background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
+
+
+async def _handle_regular_chat(
+    question, session_id, user_id, history, profile_summary,
+    active_case, background_tasks, db
+):
+    """Pure GST chat — no document. Scenario 3 preserved exactly."""
+    doc_ctx = None
+    if active_case:
+        summary = active_case.get("summary", "")
+        if summary:
+            doc_ctx = "[Active case summary: " + summary[:500] + "]"
+
+    full_answer     = ""
+    message_saved   = False
+    last_message_id = None
+
+    async for chunk in chat_stream(
+        query=question, store=vector_store, all_chunks=ALL_CHUNKS,
+        history=history, profile_summary=profile_summary, document_context=doc_ctx,
+    ):
+        ctype = chunk.get("type")
+
+        if ctype == "content":
+            delta = chunk.get("delta", "")
+            full_answer += delta
+            yield json.dumps({"type": "content", "delta": delta}) + "\n"
+
+        elif ctype == "retrieval":
+            if not message_saved:
+                asst_msg        = await add_message(session_id, "assistant", full_answer, user_id)
+                last_message_id = getattr(asst_msg, "id", None)
+                message_id      = last_message_id
+                message_saved   = True
+            else:
+                message_id = None
+            yield json.dumps({
+                "type":           "retrieval",
+                "sources":        chunk.get("sources", []) or [],
+                "full_judgments": chunk.get("full_judgments", {}) or {},
+                "message_id":     message_id,
+                "session_id":     session_id,
+                "id":             message_id
+            }) + "\n"
+
+        elif ctype == "citations":
+            yield json.dumps({
+                "type":            "citations",
+                "party_citations": chunk.get("party_citations", {})
+            }) + "\n"
+
+        elif ctype == "usage":
+            llm_usage = chunk.get("usage", {})
+            await track_usage(user_id, session_id, db, usage=llm_usage)
+            if last_message_id:
+                await update_message_tokens(
+                    last_message_id,
+                    llm_usage.get("inputTokens", 0),
+                    llm_usage.get("outputTokens", 0)
+                )
+
+    if not message_saved:
+        await add_message(session_id, "assistant", full_answer, user_id)
+    background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
+
+
+# =============================================================================
+# REMAINING ROUTES — unchanged from original
+# =============================================================================
 
 @app.post("/chat/feedback")
 async def save_feedback(
@@ -934,24 +1363,24 @@ async def get_user_credits(
     email = user.get("sub")
     res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
     db_user = res.scalars().first()
-    
+
     res = await db.execute(select(UserUsage).where(UserUsage.user_id == db_user.id))
     usage = res.scalars().first()
-    
+
     if not usage:
         usage = UserUsage(user_id=db_user.id)
         db.add(usage)
         await db.commit()
         await db.refresh(usage)
-        
+
     return {
         "balance": {
             "simple": usage.simple_query_balance,
-            "draft": usage.draft_reply_balance
+            "draft":  usage.draft_reply_balance
         },
         "used": {
             "simple": usage.simple_query_used,
-            "draft": usage.draft_reply_used
+            "draft":  usage.draft_reply_used
         }
     }
 
@@ -979,10 +1408,10 @@ async def list_sessions(
 
     return [
         {
-            "id": s.id,
-            "title": s.title,
-            "created_at": s.created_at.isoformat() if s.created_at else None,
-            "session_type": getattr(s, "session_type", "simple")  # Fallback just in case
+            "id":           s.id,
+            "title":        s.title,
+            "created_at":   s.created_at.isoformat() if s.created_at else None,
+            "session_type": getattr(s, "session_type", "simple")
         }
         for s in sessions
     ]
@@ -1009,4 +1438,6 @@ async def delete_chat(
 
     from services.memory import delete_session
     await delete_session(session_id)
+    await clear_doc_context(session_id)
+    await delete_session_documents(session_id)
     return {"status": "deleted"}
