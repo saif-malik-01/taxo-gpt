@@ -518,13 +518,15 @@ NOW RETURN THE COMPLETE RESPONSE STARTING IMMEDIATELY WITH THE TEXT (NO HEADERS,
         # Import the streaming function
         from services.llm.bedrock_client import call_bedrock_stream
         
-        for chunk in call_bedrock_stream(
+        for event in call_bedrock_stream(
             prompt=prompt,
             system_prompts=[],
             temperature=0.0
         ):
-            collected_response += chunk
-            yield chunk
+            if event["type"] == "content":
+                text = event["text"]
+                collected_response += text
+                yield text
         
         # VALIDATION after streaming completes
         reattributed = collected_response.strip()

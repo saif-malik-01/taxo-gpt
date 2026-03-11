@@ -46,7 +46,7 @@ Return JSON only:
   "ongoing_goals": []
 }}"""
 
-            raw_output = await run_in_threadpool(call_bedrock, extraction_prompt)
+            raw_output, usage = await run_in_threadpool(call_bedrock, extraction_prompt)
 
             if not raw_output or "NONE" in raw_output.upper():
                 return False
