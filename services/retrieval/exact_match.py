@@ -106,37 +106,31 @@ def exact_match(query: str, chunks: list) -> list:
         return results
 
     # ------------------------------------------------------------------ #
-    #  3.  RULE                                                           #
+    #  3.  GSTAT - Check these first if keywords are present              #
     # ------------------------------------------------------------------ #
-    rule = re.search(r"rule\s+(\d+[a-z]?)", q)
-    if rule:
-        rule_num = rule.group(1)
-        if want_judgments:
-            judgment_chunks = [
-                chunk
-                for chunk in index.judgments_unique.values()
-                if str(chunk.get("metadata", {}).get("rule_number", "")).strip() == rule_num
-            ]
-            statutory = index.by_rule.get(rule_num, [])
-            return judgment_chunks + statutory
-        return index.by_rule.get(rule_num, [])
+    gstat_rule = re.search(r"gstat[-\s]+rule[-\s]*(\d+)", q, re.IGNORECASE)
+    if gstat_rule:
+        rule_number = gstat_rule.group(1).lstrip("0") or "0"
+        return index.by_gstat_rule.get(rule_number, [])
+
+    gstat_form = re.search(r"gstat[-\s]+form[-\s]*(\d+)", q, re.IGNORECASE)
+    if gstat_form:
+        form_number = gstat_form.group(1).lstrip("0") or "0"
+        return (
+            index.by_gstat_form.get(form_number.zfill(2), [])
+            or index.by_gstat_form.get(form_number, [])
+        )
+
+    gstat_cdr = re.search(r"gstat[-\s]+(?:cdr|register)[-\s]*(\d+)", q, re.IGNORECASE)
+    if gstat_cdr:
+        cdr_number = gstat_cdr.group(1).lstrip("0") or "0"
+        return (
+            index.by_gstat_cdr.get(cdr_number.zfill(2), [])
+            or index.by_gstat_cdr.get(cdr_number, [])
+        )
 
     # ------------------------------------------------------------------ #
-    #  4.  HSN                                                            #
-    # ------------------------------------------------------------------ #
-    hsn = re.search(r"hsn\s+(\d+)", q)
-    if hsn:
-        return index.by_hsn.get(hsn.group(1), [])
-
-    # ------------------------------------------------------------------ #
-    #  5.  SAC                                                            #
-    # ------------------------------------------------------------------ #
-    sac = re.search(r"sac\s+(\d+)", q)
-    if sac:
-        return index.by_sac.get(sac.group(1), [])
-
-    # ------------------------------------------------------------------ #
-    #  6.  NOTIFICATION                                                   #
+    #  4.  NOTIFICATION                                                   #
     # ------------------------------------------------------------------ #
     # Match: notification 32/2017, notif 32/2017, notification no 32/2017
     # Pattern designed to be robust to spaces: 32 / 2017
@@ -158,36 +152,37 @@ def exact_match(query: str, chunks: list) -> list:
             return results
 
     # ------------------------------------------------------------------ #
-    #  7.  GSTAT FORM                                                     #
+    #  5.  RULE (Statutory CGST/IGST)                                     #
     # ------------------------------------------------------------------ #
-    gstat_form = re.search(r"(?:gstat[-\s]*)?form[-\s]*(\d+)", q, re.IGNORECASE)
-    if gstat_form:
-        form_number = gstat_form.group(1).lstrip("0") or "0"
-        return (
-            index.by_gstat_form.get(form_number.zfill(2), [])
-            or index.by_gstat_form.get(form_number, [])
-        )
+    # Use negative lookbehind to avoid matching GSTAT Rule as a standard Rule
+    rule = re.search(r"(?<!gstat\s)(?<!gstat)rule\s+(\d+[a-z]?)", q)
+    if rule:
+        rule_num = rule.group(1)
+        if want_judgments:
+            judgment_chunks = [
+                chunk
+                for chunk in index.judgments_unique.values()
+                if str(chunk.get("metadata", {}).get("rule_number", "")).strip() == rule_num
+            ]
+            statutory = index.by_rule.get(rule_num, [])
+            return judgment_chunks + statutory
+        return index.by_rule.get(rule_num, [])
 
     # ------------------------------------------------------------------ #
-    #  7.  GSTAT RULE                                                     #
+    #  6.  HSN                                                            #
     # ------------------------------------------------------------------ #
-    gstat_rule = re.search(r"(?:gstat[-\s]*)?rule[-\s]*(\d+)", q, re.IGNORECASE)
-    if gstat_rule:
-        rule_number = gstat_rule.group(1).lstrip("0") or "0"
-        return index.by_gstat_rule.get(rule_number, [])
+    hsn = re.search(r"hsn\s+(\d+)", q)
+    if hsn:
+        return index.by_hsn.get(hsn.group(1), [])
 
     # ------------------------------------------------------------------ #
-    #  8.  GSTAT CDR / REGISTER                                          #
+    #  7.  SAC                                                            #
     # ------------------------------------------------------------------ #
-    gstat_cdr = re.search(
-        r"(?:gstat[-\s]*)?(?:cdr|register)[-\s]*(\d+)", q, re.IGNORECASE
-    )
-    if gstat_cdr:
-        cdr_number = gstat_cdr.group(1).lstrip("0") or "0"
-        return (
-            index.by_gstat_cdr.get(cdr_number.zfill(2), [])
-            or index.by_gstat_cdr.get(cdr_number, [])
-        )
+    sac = re.search(r"sac\s+(\d+)", q)
+    if sac:
+        return index.by_sac.get(sac.group(1), [])
+
+    # (Cleaned up: moved to top for priority)
 
     # ------------------------------------------------------------------ #
     #  9.  COUNCIL MEETING                                                #
