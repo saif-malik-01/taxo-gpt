@@ -373,6 +373,8 @@ def apply_legal_hierarchy(sorted_results):
         "case_scenario",    # Prioritize practical illustrations
         "case_study",
         "rule",
+        "notification",     # Moved up
+        "circular",         # Moved up
         "hsn",              # Added: Prioritize HSN codes
         "sac",              # Added: Prioritize SAC codes
         "council_decision", # GST Council Meeting minutes
@@ -382,8 +384,6 @@ def apply_legal_hierarchy(sorted_results):
         "draft_reply",      # Prioritize drafted responses
         "qa_pair",
         "faq",              # Prioritize FAQs
-        "notification",
-        "circular",
         "analytical_review"
     ]
     

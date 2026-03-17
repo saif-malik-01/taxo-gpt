@@ -136,7 +136,29 @@ def exact_match(query: str, chunks: list) -> list:
         return index.by_sac.get(sac.group(1), [])
 
     # ------------------------------------------------------------------ #
-    #  6.  GSTAT FORM                                                     #
+    #  6.  NOTIFICATION                                                   #
+    # ------------------------------------------------------------------ #
+    # Match: notification 32/2017, notif 32/2017, notification no 32/2017
+    # Pattern designed to be robust to spaces: 32 / 2017
+    notif = re.search(r"(?:notification|notif)(?:\s+no\.?)?\s*(\d+\s*/\s*\d{4})", q, re.IGNORECASE)
+    # Generic number/year fallback (e.g. 32/2017)
+    if not notif:
+        notif = re.search(r"\b(\d{1,4}\s*/\s*20\d{2})\b", q)
+
+    if notif:
+        n_num = notif.group(1).replace(" ", "").lower()
+        exact_results = index.by_notification.get(n_num, [])
+        
+        # Also find AMENDMENTS or notifications that MENTION this one
+        mentions = index.mentions_notification.get(n_num, [])
+        
+        # Merge results, keeping exact matches at the top
+        results = exact_results + [m for m in mentions if m not in exact_results]
+        if results:
+            return results
+
+    # ------------------------------------------------------------------ #
+    #  7.  GSTAT FORM                                                     #
     # ------------------------------------------------------------------ #
     gstat_form = re.search(r"(?:gstat[-\s]*)?form[-\s]*(\d+)", q, re.IGNORECASE)
     if gstat_form:

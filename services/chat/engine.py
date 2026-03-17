@@ -1,4 +1,5 @@
 import asyncio
+import re
 from services.retrieval.hybrid import retrieve
 from services.retrieval.citation_matcher import get_index
 from services.llm.bedrock_client import call_bedrock, call_bedrock_stream
@@ -23,6 +24,10 @@ def classify_query_intent(query: str) -> str:
     }
     if any(kw in q for kw in _JUDGMENT_KW):
         return "judgment"
+
+    # ── Notification / Circular ──────────────────────────────────────────
+    if "notification" in q or "notif" in q or "circular" in q or re.search(r"\d+/\d{4}", q):
+        return "notification"
 
     # ── Definition / explanation ─────────────────────────────────────────
     if "define" in q or "what is section" in q or "meaning of" in q:
@@ -66,7 +71,7 @@ def split_primary_and_supporting(chunks, intent):
     supporting = []
 
     for ch in chunks:
-        ctype = ch.get("chunk_type")
+        ctype = ch.get("chunk_type") or ""
         
         # Complete judgment chunks are ALWAYS primary
         if ch.get("_is_complete_judgment"):
@@ -87,6 +92,9 @@ def split_primary_and_supporting(chunks, intent):
             primary.append(ch)
 
         elif intent == "gstat" and ctype in ("gstat_rule", "gstat_form", "gstat_register"):
+            primary.append(ch)
+
+        elif intent == "notification" and (ctype in ("notification", "circular", "statutory") or "section" in ctype or "rule" in ctype):
             primary.append(ch)
 
         else:

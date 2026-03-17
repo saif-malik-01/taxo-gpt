@@ -10,6 +10,8 @@ class MetadataIndex:
         self.by_rule = {}
         self.by_hsn = {}
         self.by_sac = {}
+        self.by_notification = {}      # notification_num -> [chunks]
+        self.mentions_notification = {}# notification_num (mentioned) -> [chunks]
         self.by_citation = {}
         self.by_case_num = {}
         self.judgment_by_external_id = {}
@@ -94,7 +96,33 @@ class MetadataIndex:
                     self.by_sac[sa] = []
                 self.by_sac[sa].append(chunk)
 
-            # 4. Judgment Indexing
+            # 4. Notification Indexing
+            notif_num = (chunk.get("ext", {}).get("notification_number") or 
+                         chunk.get("ext", {}).get("notification_no") or
+                         metadata.get("notification_number") or 
+                         metadata.get("notification_no"))
+            if notif_num:
+                n_norm = str(notif_num).replace(" ", "").lower().strip()
+                if n_norm:
+                    if n_norm not in self.by_notification:
+                        self.by_notification[n_norm] = []
+                    self.by_notification[n_norm].append(chunk)
+
+            # Index Mentions (for amendments/cross-refs)
+            # Only index mentions in the text of notifications or circulars to keep index clean
+            if chunk_type in ["notification", "circular"]:
+                text = chunk.get("text", "")
+                mentioned_notifications = re.findall(r'(\d+\s*/\s*\d{4})', text)
+                for mn in mentioned_notifications:
+                    mn_norm = mn.replace(" ", "").lower().strip()
+                    if mn_norm:
+                        if mn_norm not in self.mentions_notification:
+                            self.mentions_notification[mn_norm] = []
+                        # Avoid duplicates in same chunk
+                        if chunk not in self.mentions_notification[mn_norm]:
+                            self.mentions_notification[mn_norm].append(chunk)
+
+            # 5. Judgment Indexing
             if chunk_type == "judgment":
                 ext_id = metadata.get("external_id")
                 if ext_id:

@@ -179,8 +179,22 @@ def build_structured_prompt(query, primary, supporting, history=[], profile_summ
                 rendered_list.append(f"{prefix}\n{c['text']}")
 
             else:
-                chunk_type = c.get('chunk_type', 'source').upper()
-                prefix     = f"[{chunk_type} | {source}]"
+                chunk_type = (c.get('chunk_type') or 'source').upper()
+                
+                # Enhanced prefix for Notifications and Circulars
+                notif_no = meta.get('notification_no') or meta.get('notification_number') or struct.get('notification_number')
+                circ_no = meta.get('circular_no') or meta.get('circular_number') or struct.get('circular_number')
+                
+                # Use normalized ctype for comparison if available
+                ctype = (c.get('chunk_type') or '').lower()
+                
+                if ctype == "notification" and notif_no:
+                    prefix = f"[NOTIFICATION {notif_no} | {source}]"
+                elif ctype == "circular" and circ_no:
+                    prefix = f"[CIRCULAR {circ_no} | {source}]"
+                else:
+                    prefix = f"[{chunk_type} | {source}]"
+                    
                 rendered_list.append(f"{prefix} {c['text']}")
 
         return "\n\n".join(rendered_list)
