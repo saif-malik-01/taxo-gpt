@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, BigInteger, String, Boolean, ForeignKey,
 from sqlalchemy.orm import relationship
 from sqlalchemy import func
 from services.database import Base
+from services.document.session_doc_store import SessionDocumentText
 
 class User(Base):
     __tablename__ = "users"
