@@ -249,4 +249,37 @@ def regex_fallback_extraction(query: str) -> dict:
         result["full_case_number"] = query  # Store original for reference
         logger.info(f"✅ Regex extracted case numbers: {case_numbers}")
     
+    # Party names / Case names
+    # Heuristics for common formats: "Safari Retreat vs State", "case of Suncraft", "Suncraft judgment"
+    
+    # 1. Try "ABC vs XYZ"
+    vs_match = re.search(r'([\w\s]{3,})\s+(?:vs\.?|versus)\s+([\w\s]{3,})', query, re.IGNORECASE)
+    if vs_match:
+        p1 = vs_match.group(1).strip()
+        p2 = vs_match.group(2).strip()
+        result["party_names"].extend([p1, p2])
+        result["case_name"] = f"{p1} vs {p2}"
+        logger.info(f"✅ Regex extracted party names (vs): {result['party_names']}")
+        
+    # 2. Try "case of X", "judgment in X", "gist of X", etc.
+    case_prefix_pattern = r'(?:case of|judgment (?:of|in)|gist of|ruling (?:of|in)|matter of|decision (?:of|in))\s+([\w\s&]{3,})'
+    case_of = re.search(case_prefix_pattern, query, re.IGNORECASE)
+    if case_of:
+        name = case_of.group(1).strip()
+        # Clean up common trailers like "judgment", "case", "ruling"
+        name = re.sub(r'\s+(?:judgment|case|ruling|matter|decision)$', '', name, flags=re.IGNORECASE)
+        if name and name not in result["party_names"]:
+            result["party_names"].append(name)
+            if not result["case_name"]:
+                result["case_name"] = name
+            logger.info(f"✅ Regex extracted party name (prefix): '{name}'")
+            
+    # 3. Handle simple "Suncraft judgment" or "Suncraft case" if nothing else matched
+    if not result["party_names"]:
+        simple_match = re.search(r'^([\w\s&]{3,})\s+(?:judgment|case|ruling)$', query, re.IGNORECASE)
+        if simple_match:
+            name = simple_match.group(1).strip()
+            result["party_names"].append(name)
+            logger.info(f"✅ Regex extracted party name (suffix match): '{name}'")
+
     return result

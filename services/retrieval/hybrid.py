@@ -229,26 +229,53 @@ def retrieve(query, vector_store, all_chunks, k=35):
     vector_hits = vector_store.search(embedding, top_k=50) # Now returns (chunk, score)
     
     vector_count = 0
+    statutory_count = 0 
+    judgment_count = 0
+
     for chunk, dist in vector_hits:
         chunk_id = chunk["id"]
         external_id = chunk.get("metadata", {}).get("external_id")
+        chunk_type = chunk.get("chunk_type")
         
         # Skip if this judgment already matched exactly/partially
         if external_id in seen_external_ids:
             continue
         
-        if chunk_id not in scored_results:
-            # L2 distance conversion to similarity score (approximate)
-            # If using IndexFlatIP, dist is already similarity
-            # If using IndexFlatL2, we might want inverse or 1/(1+dist)
-            # Assuming IndexFlatL2 as per store.py:
-            base_score = 1 / (1 + dist) 
+        # L2 distance conversion to similarity score (approximate)
+        base_score = 1 / (1 + dist) 
+        boost = substring_weights.get(chunk_id, 0)
+        final_score = base_score + boost
+
+        # ── Handle Judgment Chunks (Assemble full text) ──
+        if chunk_type == "judgment" and external_id:
+            seen_external_ids.add(external_id)
             
-            boost = substring_weights.get(chunk_id, 0)
-            scored_results[chunk_id] = (chunk, base_score + boost)
+            # Simple match_info for assembly
+            match_info = {
+                "external_id": str(external_id),
+                "score": final_score,
+                "matched_field": "vector_semantic",
+                "matched_value": query,
+                "citation": chunk.get("metadata", {}).get("citation", ""),
+                "case_number": chunk.get("metadata", {}).get("case_number", ""),
+                "petitioner": chunk.get("metadata", {}).get("petitioner", ""),
+                "respondent": chunk.get("metadata", {}).get("respondent", ""),
+            }
+            
+            complete_chunk = create_complete_judgment_chunk(match_info, all_chunks)
+            if complete_chunk:
+                cid = complete_chunk["id"]
+                if cid not in scored_results:
+                    scored_results[cid] = (complete_chunk, final_score)
+                    judgment_count += 1
+                    logger.info(f"📌 Vector judgment match: {external_id} (score: {final_score:.3f})")
+
+        # ── Handle Regular (Statutory/FAQ) Chunks ──
+        elif chunk_id not in scored_results:
+            scored_results[chunk_id] = (chunk, final_score)
             vector_count += 1
     
-    logger.info(f"Added {vector_count} vector search results")
+    logger.info(f"Added {vector_count} vector search results and {judgment_count} complete judgments")
     
     # ========== STEP 4: Add Semantic Score to Complete Judgments ==========
     # Calculate similarity ONLY for newly assembled complete judgment chunks.
