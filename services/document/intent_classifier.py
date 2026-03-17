@@ -6,6 +6,34 @@ from services.llm.bedrock_client import call_bedrock
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Keywords that strongly indicate a knowledge-base / case-law query
+# These should NEVER be routed to 'summarize' (which is for uploaded docs)
+# ---------------------------------------------------------------------------
+_JUDGMENT_SIGNALS = [
+    "judgment", "judgement", "case law", "case", "ruling", "court", "order",
+    "gist", "held", "decided", "decision", "verdict", "bench", "petitioner",
+    "respondent", "high court", "supreme court", "tribunal", "writ",
+    "taxo.online", "tmi", "section ", "rule ",
+]
+
+
+def _is_knowledge_query(message: str, has_files: bool, active_case) -> bool:
+    """
+    Return True when the message is clearly asking about the legal knowledge base
+    (judgments, act sections, etc.) rather than an uploaded document.
+
+    Fires when:
+    - No files are uploaded in this request, AND
+    - No active case document is in context, AND
+    - The message contains a judgment/knowledge keyword.
+    """
+    if has_files or active_case:
+        return False
+    q = message.lower()
+    return any(kw in q for kw in _JUDGMENT_SIGNALS)
+
+
 def classify_intent(
     message: str,
     active_case: dict = None,
@@ -21,6 +49,12 @@ def classify_intent(
         case_id       : int | null
         details       : brief reason
     """
+    # ―― Fast path: judgment / knowledge query with no document context ――
+    # Prevents "gist of sunscraft judgment" being routed to 'summarize'
+    if _is_knowledge_query(message, has_files, active_case):
+        logger.info("Intent → query_general (fast-path: knowledge query, no doc context)")
+        return {"intent": "query_general", "issue_numbers": [], "mode": None, "case_id": None, "details": "fast-path: judgment keyword, no uploaded doc"}
+
     case_state     = None
     issues_preview = ""
     has_issues     = False
@@ -51,8 +85,11 @@ def classify_intent(
         '- Mode already set: ' + str(current_mode or "not set") + '\n'
         + issues_block + '\n\n'
         'INTENT OPTIONS (pick exactly one):\n'
-        '  summarize       — show/update summary and issues\n'
-        '                    USE WHEN: files uploaded with no clear draft action, or user asks to see issues/summary\n'
+        '  summarize       — show/update summary and issues FOR AN UPLOADED DOCUMENT\n'
+        '                    USE ONLY WHEN: files were uploaded in this request, OR user explicitly\n'
+        '                    asks to summarise/show issues from a document they already uploaded.\n'
+        '                    DO NOT USE for questions about court judgments, case law, or GST law\n'
+        '                    when no document has been uploaded.\n'
         '  draft_all       — generate replies for ALL pending issues\n'
         '  draft_specific  — generate reply for specific issue numbers only\n'
         '  confirm_mode    — user confirming mode in any phrasing\n'
@@ -65,6 +102,8 @@ def classify_intent(
         '  query_document  — question answerable from the uploaded document\n'
         '  query_mixed     — needs both document content and GST knowledge base\n'
         '  query_general   — pure GST question, no document context needed\n'
+        '                    USE FOR: questions about judgments, case law, sections, rules, rates, etc.\n'
+        '                    when the user has NOT uploaded a document in this session.\n'
         '  switch_case     — user wants to work on a previously archived case\n'
         '  new_case        — user explicitly starting fresh for a different case\n\n'
         'Return ONLY this JSON:\n'

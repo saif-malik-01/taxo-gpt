@@ -500,9 +500,17 @@ async def _ask_gst_stream_core(
             # ── CASE A: Upload + no action / summarise ─────────────────────────
             elif intent == "summarize":
                 if not active_case:
-                    msg = "No document uploaded yet. Please upload a document to get started."
-                    yield json.dumps({"type": "content", "delta": msg}) + "\n"
-                    await add_message(session_id, "assistant", msg, user_id)
+                    # No document loaded → likely a knowledge-base question
+                    # (e.g. "give me gist of Sunscraft judgment").
+                    # Route to regular RAG pipeline so it can answer.
+                    logger.info(
+                        "\u26a0\ufe0f  intent=summarize but no active_case \u2192 routing to regular chat"
+                    )
+                    async for chunk in _handle_regular_chat(
+                        question, session_id, user_id, history, profile_summary,
+                        None, background_tasks, db
+                    ):
+                        yield chunk
                 else:
                     async for chunk in _handle_summarize(active_case, session_id, user_id):
                         yield chunk
