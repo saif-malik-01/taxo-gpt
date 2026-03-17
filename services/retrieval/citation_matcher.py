@@ -6,20 +6,47 @@ logger = logging.getLogger(__name__)
 
 class MetadataIndex:
     def __init__(self, chunks):
-        self.by_section = {}
+        self.by_section = {}           # (section_num, subsection) -> [statutory chunks]
         self.by_rule = {}
         self.by_hsn = {}
         self.by_sac = {}
         self.by_citation = {}
         self.by_case_num = {}
         self.judgment_by_external_id = {}
-        self.judgments_unique = {}  # external_id -> first_chunk (for metadata search)
+        self.judgments_unique = {}     # external_id -> first_chunk (for metadata search)
+        # Judgment-specific metadata indexes
+        self.judgments_by_section = {} # section_num -> {external_id -> first_chunk}
+        self.judgments_by_decision = {}# decision -> {external_id -> first_chunk}
+        self.judgments_by_year = {}    # year -> {external_id -> first_chunk}
+        self.judgments_by_state = {}   # state (normalised) -> {external_id -> first_chunk}
+        self.judgments_by_court = {}   # court (normalised) -> {external_id -> first_chunk}
         # GSTAT specific indices
         self.by_gstat_form = {}
         self.by_gstat_rule = {}
         self.by_gstat_cdr = {}
         self.by_council_meeting = {}
         self._build(chunks)
+
+    @staticmethod
+    def _parse_section_numbers(section_str: str) -> list:
+        """
+        Parse individual section numbers from a raw metadata string.
+
+        Handles formats such as:
+          'Section 7'
+          'Section 17,67,73,75,79 & Section 17,73'
+          '17 & 73'
+          'Section 17A'
+
+        Returns a deduplicated list of normalised strings, e.g. ['17', '67', '73'].
+        """
+        if not section_str or not isinstance(section_str, str):
+            return []
+        # Remove all occurrences of the word 'Section' (case-insensitive)
+        text = re.sub(r'\bSection\b', '', section_str, flags=re.IGNORECASE)
+        # Extract alphanumeric tokens that start with a digit (e.g. '17', '42A')
+        numbers = re.findall(r'\d+[A-Za-z]?', text)
+        return list(dict.fromkeys(numbers))  # deduplicate, preserve order
 
     def _build(self, chunks):
         count = 0
@@ -72,14 +99,15 @@ class MetadataIndex:
                 ext_id = metadata.get("external_id")
                 if ext_id:
                     eid = str(ext_id).strip()
-                    
+
                     # Group chunks by external_id
-                    if eid not in self.judgment_by_external_id:
+                    is_new_judgment = eid not in self.judgment_by_external_id
+                    if is_new_judgment:
                         self.judgment_by_external_id[eid] = []
                         self.judgments_unique[eid] = chunk  # Store first chunk for metadata
                         judgments_count += 1
                     self.judgment_by_external_id[eid].append(chunk)
-                    
+
                     # Index by Citation
                     citation = metadata.get("citation")
                     if citation:
@@ -99,6 +127,49 @@ class MetadataIndex:
                                 self.by_case_num[cn_norm] = []
                             if eid not in [c.get("metadata", {}).get("external_id") for c in self.by_case_num[cn_norm]]:
                                 self.by_case_num[cn_norm].append(chunk)
+
+                    # ── Judgment-specific metadata indexes (first chunk per judgment only) ──
+                    if is_new_judgment:
+                        # Index by Section Number(s) in judgment metadata
+                        sec_raw = metadata.get("section_number", "")
+                        for sec_num in self._parse_section_numbers(sec_raw):
+                            sec_key = sec_num.strip().upper()
+                            if sec_key:
+                                if sec_key not in self.judgments_by_section:
+                                    self.judgments_by_section[sec_key] = {}
+                                self.judgments_by_section[sec_key][eid] = chunk
+
+                        # Index by Decision (normalised)
+                        decision_raw = metadata.get("decision", "")
+                        if decision_raw:
+                            dec_key = decision_raw.strip().lower()
+                            if dec_key not in self.judgments_by_decision:
+                                self.judgments_by_decision[dec_key] = {}
+                            self.judgments_by_decision[dec_key][eid] = chunk
+
+                        # Index by Year
+                        year_raw = metadata.get("year", "")
+                        if year_raw:
+                            yr_key = str(year_raw).strip()
+                            if yr_key not in self.judgments_by_year:
+                                self.judgments_by_year[yr_key] = {}
+                            self.judgments_by_year[yr_key][eid] = chunk
+
+                        # Index by State (normalised)
+                        state_raw = metadata.get("state", "")
+                        if state_raw:
+                            st_key = state_raw.strip().lower()
+                            if st_key not in self.judgments_by_state:
+                                self.judgments_by_state[st_key] = {}
+                            self.judgments_by_state[st_key][eid] = chunk
+
+                        # Index by Court (normalised)
+                        court_raw = metadata.get("court", "")
+                        if court_raw:
+                            ct_key = court_raw.strip().lower()
+                            if ct_key not in self.judgments_by_court:
+                                self.judgments_by_court[ct_key] = {}
+                            self.judgments_by_court[ct_key][eid] = chunk
 
             # 5. GSTAT Indexing (Forms, Rules, Registers/CDR)
             doc_type = chunk.get("doc_type")
@@ -143,8 +214,13 @@ class MetadataIndex:
                     self.by_council_meeting[meeting_num_str].append(chunk)
 
         logger.info(f"🚀 Built MetadataIndex with {count} chunks")
-        logger.info(f"   Sections: {len(self.by_section)} | Rules: {len(self.by_rule)} | Judgments: {judgments_count}")
+        logger.info(f"   Sections(statutory): {len(self.by_section)} | Rules: {len(self.by_rule)} | Judgments: {judgments_count}")
         logger.info(f"   Citations: {len(self.by_citation)} | Case Numbers: {len(self.by_case_num)}")
+        logger.info(f"   Judgment Section Keys: {len(self.judgments_by_section)} | "
+                    f"Decision Keys: {len(self.judgments_by_decision)} | "
+                    f"Year Keys: {len(self.judgments_by_year)} | "
+                    f"State Keys: {len(self.judgments_by_state)} | "
+                    f"Court Keys: {len(self.judgments_by_court)}")
         logger.info(f"   GSTAT Forms: {len(self.by_gstat_form)} | GSTAT Rules: {len(self.by_gstat_rule)} | GSTAT CDR: {len(self.by_gstat_cdr)} | Council Meetings: {len(self.by_council_meeting)}")
 
 

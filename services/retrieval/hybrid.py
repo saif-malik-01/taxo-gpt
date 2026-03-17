@@ -10,40 +10,50 @@ logger = logging.getLogger(__name__)
 MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 
+# Maximum characters for a single complete-judgment chunk.
+# A typical judgment is ~5–15K chars; 30K is a generous cap that covers
+# even large cases and prevents context window overflow.
+_MAX_JUDGMENT_CHARS = 30_000
+
+# Maximum combined chars of ALL complete-judgment chunks sent to the LLM.
+# Keeps total prompt well within the 360K safe limit alongside other material.
+_MAX_TOTAL_JUDGMENT_CHARS = 150_000
+
+
 def create_complete_judgment_chunk(match_info, all_chunks):
     """
     Create a SINGLE chunk containing the complete judgment with metadata prepended
-    
+
     This chunk will be treated like any other chunk in retrieval results
-    
+
     Args:
         match_info: Dict from find_matching_judgments
         all_chunks: All chunks from database
-    
+
     Returns:
         Single chunk dict with complete judgment text
     """
     external_id = match_info["external_id"]
-    
+
     # OPTIMIZED: Use pre-built index to avoid scanning 450MB
     from services.retrieval.citation_matcher import get_index
     index = get_index(all_chunks)
     judgment_chunks = index.judgment_by_external_id.get(external_id, [])
-    
+
     if not judgment_chunks:
         logger.warning(f"No chunks found for judgment {external_id}")
         return None
-    
+
     # Build complete judgment text
     judgment_texts = [chunk.get('text', '') for chunk in judgment_chunks]
     complete_judgment_text = "\n\n".join(judgment_texts)
-    
+
     # Build metadata header
     citation = match_info.get('citation', '')
     case_number = match_info.get('case_number', '')
     petitioner = match_info.get('petitioner', '')
     respondent = match_info.get('respondent', '')
-    
+
     header_parts = []
     if citation:
         header_parts.append(f"Citation: {citation}")
@@ -53,18 +63,24 @@ def create_complete_judgment_chunk(match_info, all_chunks):
         header_parts.append(f"Petitioner: {petitioner}")
     if respondent:
         header_parts.append(f"Respondent: {respondent}")
-    
+
     header = "\n".join(header_parts) + "\n\n" if header_parts else ""
-    
+
     # Create the complete chunk with prepended metadata
     complete_text = header + complete_judgment_text
-    
+
+    # ―― Safety: truncate oversized judgments to prevent context overflow ――
+    was_truncated = False
+    if len(complete_text) > _MAX_JUDGMENT_CHARS:
+        complete_text = complete_text[:_MAX_JUDGMENT_CHARS] + "\n\n[...judgment truncated for context window...]"
+        was_truncated = True
+
     # Use the first chunk as a template
     first_chunk = judgment_chunks[0]
-    
+
     complete_chunk = {
         "id": f"{external_id}_complete",  # Unique ID
-        "text": complete_text,  # COMPLETE JUDGMENT WITH METADATA
+        "text": complete_text,            # COMPLETE JUDGMENT WITH METADATA
         "chunk_type": "judgment",
         "metadata": first_chunk.get("metadata", {}),
         "_is_complete_judgment": True,
@@ -73,19 +89,18 @@ def create_complete_judgment_chunk(match_info, all_chunks):
         "_matched_value": match_info.get("matched_value", ""),
         "_external_id": external_id
     }
-    
+
     logger.info(f"✅ Created complete judgment chunk for {external_id}")
     logger.info(f"   Citation: {citation}")
     logger.info(f"   Case Number: {case_number}")
-    logger.info(f"   Petitioner: {petitioner}")
-    logger.info(f"   Respondent: {respondent}")
-    logger.info(f"   Complete text length: {len(complete_text)} chars")
-    logger.info(f"   Header preview:\n{header}")
-    
+    logger.info(f"   Complete text length: {len(complete_text)} chars"
+                + (" (truncated)" if was_truncated else ""))
+
     return complete_chunk
 
 
-def retrieve(query, vector_store, all_chunks, k=25):
+
+def retrieve(query, vector_store, all_chunks, k=35):
     """
     Enhanced hybrid retrieval with exact judgment matching
     """
@@ -154,23 +169,60 @@ def retrieve(query, vector_store, all_chunks, k=25):
             substring_weights[chunk["id"]] = 0.1
     
     # ========== STEP 3: Regular Retrieval ==========
-    
-    # STEP 3a: Exact Statutory Matches
+
+    # STEP 3a: Exact Statutory / Judgment-Section Matches
     exact = exact_match(query, all_chunks)
     if exact:
+        judgment_eids_from_exact = set()
+        statutory_count = 0
+
         for chunk in exact:
             chunk_id = chunk["id"]
+            chunk_type = chunk.get("chunk_type")
             external_id = chunk.get("metadata", {}).get("external_id")
-            
+
             if external_id in seen_external_ids:
                 continue
-            
-            if chunk_id not in scored_results:
-                base_score = 0.95
-                boost = substring_weights.get(chunk_id, 0)
-                scored_results[chunk_id] = (chunk, base_score + boost)
-        
-        logger.info(f"Added {len(exact)} exact statutory matches")
+
+            # ── Judgment chunks returned from exact_match (section metadata match) ──
+            # Assemble as a complete judgment chunk so the LLM sees the full text.
+            if chunk_type == "judgment" and external_id:
+                if external_id not in judgment_eids_from_exact:
+                    judgment_eids_from_exact.add(external_id)
+                    seen_external_ids.add(external_id)
+
+                    match_info = {
+                        "external_id": str(external_id),
+                        "score": 0.90,
+                        "matched_field": "section_metadata",
+                        "matched_value": chunk.get("metadata", {}).get("section_number", ""),
+                        "citation": chunk.get("metadata", {}).get("citation", ""),
+                        "case_number": chunk.get("metadata", {}).get("case_number", ""),
+                        "petitioner": chunk.get("metadata", {}).get("petitioner", ""),
+                        "respondent": chunk.get("metadata", {}).get("respondent", ""),
+                    }
+                    complete_chunk = create_complete_judgment_chunk(match_info, all_chunks)
+                    if complete_chunk:
+                        cid = complete_chunk["id"]
+                        if cid not in scored_results:
+                            scored_results[cid] = (complete_chunk, 0.90)
+                            logger.info(
+                                f"📌 Section-metadata judgment match: {external_id} "
+                                f"(section: {match_info['matched_value']})"
+                            )
+
+            # ── Statutory Act / Rule chunks ────────────────────────────────────────
+            else:
+                if chunk_id not in scored_results:
+                    base_score = 0.95
+                    boost = substring_weights.get(chunk_id, 0)
+                    scored_results[chunk_id] = (chunk, base_score + boost)
+                    statutory_count += 1
+
+        logger.info(
+            f"Added {len(judgment_eids_from_exact)} judgment section-matches and "
+            f"{statutory_count} statutory exact matches"
+        )
     
     # STEP 3b: Vector Search
     embedding = MODEL.encode(query, normalize_embeddings=True)
@@ -243,10 +295,42 @@ def retrieve(query, vector_store, all_chunks, k=25):
     
     # ========== STEP 6: Apply Legal Hierarchy ==========
     final_results = apply_legal_hierarchy(sorted_results)
-    
+
     logger.info(f"Returning top {min(k, len(final_results))} out of {len(final_results)} chunks")
-    
-    return final_results[:k]
+
+    # ========== STEP 7: Guard Against Context Window Overflow ==========
+    # Complete judgment chunks can be very large (10K–30K chars each).
+    # Cap the total chars from complete judgments to avoid Bedrock timeouts.
+    safe_results = []
+    total_judgment_chars = 0
+    skipped_due_to_budget = 0
+
+    for chunk in final_results[:k]:
+        if chunk.get("_is_complete_judgment"):
+            chunk_chars = len(chunk.get("text", ""))
+            if total_judgment_chars + chunk_chars > _MAX_TOTAL_JUDGMENT_CHARS:
+                skipped_due_to_budget += 1
+                logger.warning(
+                    f"⚠️  Skipping judgment {chunk.get('_external_id')} "
+                    f"({chunk_chars} chars) — total judgment budget "
+                    f"({_MAX_TOTAL_JUDGMENT_CHARS}) would be exceeded."
+                )
+                continue
+            total_judgment_chars += chunk_chars
+        safe_results.append(chunk)
+
+    if skipped_due_to_budget:
+        logger.warning(
+            f"⚠️  Dropped {skipped_due_to_budget} judgment chunk(s) to stay within "
+            f"context budget. Kept {total_judgment_chars} chars of complete judgments."
+        )
+    else:
+        logger.info(
+            f"✅ Context budget OK: {total_judgment_chars} chars of complete judgments."
+        )
+
+    return safe_results
+
 
 
 def apply_legal_hierarchy(sorted_results):
@@ -322,5 +406,5 @@ def apply_legal_hierarchy(sorted_results):
         
         result.extend(similar_group)
         i = j
-    
+
     return result

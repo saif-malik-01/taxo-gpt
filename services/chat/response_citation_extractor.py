@@ -577,7 +577,7 @@ def format_citation_section(party_citations: Dict[Tuple[str, str], List[Dict]]) 
 def extract_and_attribute_citations(llm_response: str, all_chunks: list) -> Tuple[any, Dict]:
     """
     ✅ FULLY OPTIMIZED Main function - NOW WITH STREAMING
-    
+
     Optimizations Applied:
     1. ✅ Parallel party pair processing (3-5x faster)
     2. ✅ Calculate scores once (2-3x faster matching)
@@ -585,86 +585,81 @@ def extract_and_attribute_citations(llm_response: str, all_chunks: list) -> Tupl
     4. ✅ Top 5 citations per pair (50% smaller payload)
     5. ✅ Minimal 6-field payload to LLM (faster processing)
     6. ✅ STREAMING re-attribution (real-time response generation)
-    
+
     Returns:
         - Generator that yields enhanced response chunks
         - Dict of party citations
     """
-    
-    print("\n" + "="*100)
-    print(" "*30 + "🚀 OPTIMIZED CITATION ATTRIBUTION SYSTEM (STREAMING)")
-    print("="*100)
-    
+
+    def _stream_original(reason: str):
+        """Helper: yield original response in small chunks."""
+        logger.info(f"⚠️  {reason} - streaming original response")
+        chunk_size = 20
+        for i in range(0, len(llm_response), chunk_size):
+            yield llm_response[i:i+chunk_size]
+
+    logger.info("=" * 80)
+    logger.info("🚀 CITATION ATTRIBUTION SYSTEM")
+    logger.info("=" * 80)
+
+    # ―― Guard: detect LLM error responses ―――――――――――――――――――――――――――――――――――――――
+    _ERROR_SIGNALS = [
+        "[Error:",
+        "Connection to AI lost",
+        "check your parameters",
+        "model is currently unavailable",
+        "ServiceUnavailableException",
+        "ThrottlingException",
+    ]
+    if any(sig.lower() in llm_response.lower() for sig in _ERROR_SIGNALS):
+        logger.warning(
+            f"⚠️  LLM response looks like an error message - skipping citation pipeline. "
+            f"Preview: {llm_response[:200]}"
+        )
+        return _stream_original("LLM error response detected"), {}
+
     # STEP 1
-    print("\n📝 STEP 1: ORIGINAL LLM RESPONSE")
-    print("-"*100)
-    print(llm_response[:500] + "..." if len(llm_response) > 500 else llm_response)
-    print("-"*100)
-    
+    logger.info("📝 STEP 1: ORIGINAL LLM RESPONSE")
+    logger.info(llm_response[:500] + "..." if len(llm_response) > 500 else llm_response)
+
     # STEP 2
-    print("\n🔍 STEP 2: EXTRACTING PARTY PAIRS")
-    print("-"*100)
-    
+    logger.info("🔍 STEP 2: EXTRACTING PARTY PAIRS")
+
     party_pairs = extract_party_pairs_from_response(llm_response)
-    
-    print(f"\n✅ Extracted {len(party_pairs)} party pair(s):")
+
+    logger.info(f"✅ Extracted {len(party_pairs)} party pair(s):")
     for i, (p1, p2) in enumerate(party_pairs, 1):
-        print(f"   {i}. '{p1}' <-> '{p2}'")
-    
+        logger.info(f"   {i}. '{p1}' <-> '{p2}'")
+
     if not party_pairs:
-        print("\n⚠️  No party pairs - returning original response as stream")
-        print("="*100 + "\n")
-        
-        # Return generator that yields original response in small chunks
-        def original_generator():
-            chunk_size = 20  # Match streaming chunk size
-            logger.info(f"📤 Streaming original response ({len(llm_response)} chars) in {chunk_size}-char chunks")
-            for i in range(0, len(llm_response), chunk_size):
-                yield llm_response[i:i+chunk_size]
-        
-        return original_generator(), {}
-    
+        logger.info("⚠️  No party pairs - returning original response as stream")
+        return _stream_original("No party pairs found"), {}
+
     # STEP 3 - ✅ PARALLEL PROCESSING
-    print("\n🔍 STEP 3: FINDING CITATIONS (PARALLEL + OPTIMIZED MATCHING)")
-    print("-"*100)
-    
+    logger.info("🔍 STEP 3: FINDING CITATIONS (PARALLEL + OPTIMIZED MATCHING)")
+
     party_citations = find_citations_for_party_pairs(party_pairs, all_chunks)
-    
+
     total_citations = sum(len(citations) for citations in party_citations.values())
-    print(f"\n📊 FOUND {len(party_citations)} matching pair(s) with {total_citations} total citations (top 5 per pair):")
+    logger.info(f"📊 FOUND {len(party_citations)} matching pair(s) with {total_citations} total citations:")
     for (p1, p2), citations in party_citations.items():
-        print(f"\n   '{p1}' vs '{p2}': {len(citations)} citation(s)")
+        logger.info(f"   '{p1}' vs '{p2}': {len(citations)} citation(s)")
         for cit in citations:
-            print(f"      ✅ {cit['citation']} (score: {cit['match_score']:.2f})")
-    
+            logger.info(f"      ✅ {cit['citation']} (score: {cit['match_score']:.2f})")
+
     if not party_citations:
-        print("\n⚠️  No citations found - returning original response as stream")
-        print("="*100 + "\n")
-        
-        # Return generator that yields original response in small chunks
-        def original_generator():
-            chunk_size = 20
-            logger.info(f"📤 Streaming original response ({len(llm_response)} chars) - no citations found")
-            for i in range(0, len(llm_response), chunk_size):
-                yield llm_response[i:i+chunk_size]
-        
-        return original_generator(), {}
-    
+        logger.info("⚠️  No citations found - returning original response as stream")
+        return _stream_original("No citations matched"), {}
+
     # STEP 4 - ✅ STREAMING RE-ATTRIBUTION
-    print("\n✨ STEP 4: RE-ATTRIBUTING CITATIONS (STREAMING - MINIMAL 6-FIELD PAYLOAD)")
-    print("-"*100)
-    
-    print("\n📊 STARTING STREAMING RE-ATTRIBUTION:")
-    print(f"   Pairs extracted: {len(party_pairs)}")
-    print(f"   Citations sent to LLM: {total_citations} (top 5 per pair)")
-    print(f"   Original: {len(llm_response)} chars")
-    print(f"   Now streaming enhanced response as LLM generates it...")
-    
+    logger.info("✨ STEP 4: RE-ATTRIBUTING CITATIONS (STREAMING)")
+    logger.info(f"   Pairs extracted: {len(party_pairs)}")
+    logger.info(f"   Citations sent to LLM: {total_citations} (top 5 per pair)")
+    logger.info(f"   Original: {len(llm_response)} chars")
+
     # Return streaming generator
     enhanced_stream = reattribute_citations_in_response_stream(llm_response, party_citations)
-    
-    print("\n" + "="*100)
-    print(" "*25 + "✅ CITATION ATTRIBUTION READY (STREAMING)")
-    print("="*100 + "\n")
-    
-    return enhanced_stream, party_citations
+
+    logger.info("✅ Citation attribution generator ready (streaming)")
+
+    return enhanced_stream, party_citations

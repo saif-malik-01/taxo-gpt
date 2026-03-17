@@ -13,27 +13,42 @@ logger = logging.getLogger(__name__)
 def classify_query_intent(query: str) -> str:
     q = query.lower()
 
-    if "judgment" in q or "case law" in q or "court" in q:
+    # ── Judgment intent: check FIRST — highest priority ──────────────────
+    # Catches "give me section 17 judgments", "ruling on section 73", etc.
+    _JUDGMENT_KW = {
+        "judgment", "judgement", "case law", "case laws",
+        "ruling", "rulings", "court order", "court ruling",
+        "held by", "decided by", "in favour of",
+        "high court", "supreme court", "tribunal",
+    }
+    if any(kw in q for kw in _JUDGMENT_KW):
         return "judgment"
 
+    # ── Definition / explanation ─────────────────────────────────────────
     if "define" in q or "what is section" in q or "meaning of" in q:
         return "definition"
 
+    # ── RCM / Reverse Charge ─────────────────────────────────────────────
     if "rcm" in q or "reverse charge" in q:
         return "rcm"
 
+    # ── GST rates ─────────────────────────────────────────────────────────
     if "rate" in q or "gst rate" in q:
         return "rate"
 
+    # ── Procedure ─────────────────────────────────────────────────────────
     if "procedure" in q or "how to" in q:
         return "procedure"
 
-    if "difference" in q or "vs" in q:
+    # ── Comparison ────────────────────────────────────────────────────────
+    if "difference" in q or " vs " in q:
         return "comparison"
 
+    # ── GSTAT ─────────────────────────────────────────────────────────────
     if "gstat" in q or "form" in q or "register" in q or "cdr" in q:
         return "gstat"
 
+    # ── Council meetings ──────────────────────────────────────────────────
     if "council" in q or "meeting" in q:
         return "council"
 
@@ -186,7 +201,7 @@ async def chat(query, store, all_chunks, history=[], profile_summary=None, docum
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
-        k=25
+        k=35
     )
 
     # Step 2: Classify and split
@@ -266,7 +281,7 @@ async def chat_stream(query, store, all_chunks, history=[], profile_summary=None
         query=query,
         vector_store=store,
         all_chunks=all_chunks,
-        k=25
+        k=35
     )
     logger.info(f"✓ Retrieved {len(retrieved)} chunks")
 
