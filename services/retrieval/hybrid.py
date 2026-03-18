@@ -4,6 +4,7 @@ from services.retrieval.citation_extractor import extract_citation_from_query
 from services.retrieval.citation_matcher import find_matching_judgments
 import logging
 import numpy as np
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -232,8 +233,12 @@ def retrieve(query, vector_store, all_chunks, k=35):
     statutory_count = 0 
     judgment_count = 0
 
+    # Collect vector IDs for duplicate check
+    found_ids = set(scored_results.keys())
+
     for chunk, dist in vector_hits:
         chunk_id = chunk["id"]
+        found_ids.add(chunk_id)
         external_id = chunk.get("metadata", {}).get("external_id")
         chunk_type = chunk.get("chunk_type")
         
@@ -274,8 +279,55 @@ def retrieve(query, vector_store, all_chunks, k=35):
         elif chunk_id not in scored_results:
             scored_results[chunk_id] = (chunk, final_score)
             vector_count += 1
+
+    # STEP 3c: Keyword Scavenger (Crucial for short queries/synonyms like "gym" -> "fitness")
+    # This helps catch the specific SAC entry if vector search missed it
+    scavenger_count = 0
+    query_words = set(re.findall(r"\w+", query.lower()))
     
-    logger.info(f"Added {vector_count} vector search results and {judgment_count} complete judgments")
+    # Common GST synonyms to expand the scavenger
+    SYNONYMS = {
+        "gym": ["fitness", "health club", "gymnasium", "workout", "exercise"],
+        "fitness": ["gym", "health club", "gymnasium"],
+        "membership": ["fees", "subscription", "admission"],
+        "hospital": ["healthcare", "medical", "clinical"],
+        "restaurant": ["catering", "food service", "eating house"],
+    }
+    
+    expanded_keywords = set()
+    for w in query_words:
+        if len(w) > 3: # Ignore short filler words
+            expanded_keywords.add(w)
+            if w in SYNONYMS:
+                expanded_keywords.update(SYNONYMS[w])
+    
+    if expanded_keywords:
+        logger.info(f"🔍 Scavenging for expanded keywords: {expanded_keywords}")
+        for chunk in all_chunks:
+            chunk_id = chunk["id"]
+            if chunk_id in found_ids:
+                continue
+            
+            # Search text and metadata fields
+            text = chunk.get("text", "").lower()
+            meta_str = str(chunk.get("metadata", {})).lower()
+            
+            # Higher weight if it matches multiple keywords
+            matches = [kw for kw in expanded_keywords if kw in text or kw in meta_str]
+            if matches:
+                # If it's a SAC/HSN/Notification and matches, it's very likely what the user needs
+                ctype = (chunk.get("chunk_type") or "").lower()
+                is_official = any(x in ctype for x in ["sac", "hsn", "notif", "rule"])
+                
+                score = 0.5 + (0.1 * min(len(matches), 4))
+                if is_official: score += 0.2
+                
+                scored_results[chunk_id] = (chunk, score)
+                found_ids.add(chunk_id)
+                scavenger_count += 1
+                if scavenger_count > 10: break # Budget
+
+    logger.info(f"Added {vector_count} vector search results, {judgment_count} complete judgments, and {scavenger_count} scavenged hits")
     
     # ========== STEP 4: Add Semantic Score to Complete Judgments ==========
     # Calculate similarity ONLY for newly assembled complete judgment chunks.

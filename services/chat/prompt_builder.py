@@ -37,6 +37,9 @@ RESPONSE FORMAT — FLEXIBLE AND CONTEXT-DRIVEN:
 - Use **bold** only for genuinely important terms, section references, or citation identifiers — not decoratively.
 
 
+4.  **RATE AUTHORITATIVITY**: When asked for GST rates (SAC/HSN), the rates specified in the provided **SAC Master** or **HSN Master** (categorized as PRIMARY) are the ABSOLUTE TRUTH. If the provided material lists a rate (e.g., 5% for Gym/Fitness under SAC 999723) that differs from your training data (e.g., 18%), you MUST use the provided rate. Never assume a provided rate is an error or outdated unless the provided material itself explicitly says so.
+5.  **NO HALLUCINATION OF CODES**: Do NOT invent SAC or HSN codes. Use ONLY the codes present in the provided context. If you cannot find a specific code in the retrieved material, state that it is not in the provided records rather than guessing from your training data.
+
 STRICT GUIDELINES:
 - Mention Act, Rules, Notifications, Circulars, Judgments ONLY if relevant and present in the retrieved data.
 - If a judgment squarely answers the question, explain it first.
@@ -184,6 +187,8 @@ def build_structured_prompt(query, primary, supporting, history=[], profile_summ
                 # Enhanced prefix for Notifications and Circulars
                 notif_no = meta.get('notification_no') or meta.get('notification_number') or struct.get('notification_number')
                 circ_no = meta.get('circular_no') or meta.get('circular_number') or struct.get('circular_number')
+                hsn_no = meta.get('hsn_code') or struct.get('hsn_code')
+                sac_no = meta.get('sac_code') or struct.get('sac_code')
                 
                 # Use normalized ctype for comparison if available
                 ctype = (c.get('chunk_type') or '').lower()
@@ -192,6 +197,10 @@ def build_structured_prompt(query, primary, supporting, history=[], profile_summ
                     prefix = f"[NOTIFICATION {notif_no} | {source}]"
                 elif ctype == "circular" and circ_no:
                     prefix = f"[CIRCULAR {circ_no} | {source}]"
+                elif (ctype == "hsn" or hsn_no) and hsn_no:
+                    prefix = f"[HSN {hsn_no} | {source}]"
+                elif (ctype == "sac" or sac_no) and sac_no:
+                    prefix = f"[SAC {sac_no} | {source}]"
                 else:
                     prefix = f"[{chunk_type} | {source}]"
                     

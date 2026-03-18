@@ -17,6 +17,7 @@ from services.auth.deps import auth_guard
 from services.database import get_db
 from services.models import User, UserProfile, UserUsage
 from services.redis import add_session, remove_session
+from services.memory import check_credits
 from api.config import settings
 from services.email import EmailService
 import uuid
@@ -101,7 +102,11 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
                 await db.commit()
 
         session_id = str(uuid.uuid4())
-        await add_session(user.id, session_id, user.max_sessions)
+        try:
+            await add_session(user.id, session_id, user.max_sessions)
+        except ValueError as e:
+            logger.warning(f"Concurrent session limit hit for {user.email}: {str(e)}")
+            raise HTTPException(status_code=403, detail=str(e))
 
         token = create_access_token({
             "sub": user.email,
@@ -192,7 +197,11 @@ async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depen
                 await db.commit()
 
         session_id = str(uuid.uuid4())
-        await add_session(user.id, session_id, user.max_sessions)
+        try:
+            await add_session(user.id, session_id, user.max_sessions)
+        except ValueError as e:
+            logger.warning(f"Concurrent session limit hit for FB user {user.email}: {str(e)}")
+            raise HTTPException(status_code=403, detail=str(e))
 
         token = create_access_token({
             "sub": user.email,
@@ -338,7 +347,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Email not verified. Please check your inbox.")
 
     session_id = str(uuid.uuid4())
-    await add_session(user.id, session_id, user.max_sessions)
+    try:
+        await add_session(user.id, session_id, user.max_sessions)
+    except ValueError as e:
+        logger.warning(f"Concurrent session limit hit for {email}: {str(e)}")
+        raise HTTPException(status_code=403, detail=str(e))
 
     token = create_access_token({
         "sub": user.email,

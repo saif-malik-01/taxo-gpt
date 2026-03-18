@@ -281,7 +281,6 @@ async def check_credits(user_id: int, session_id: str, has_files: bool, db: Asyn
 
     # 3. Global Token Limit Check
     total_used = (usage.total_tokens_used or 0) + extra_tokens
-    from api.main import logger
     logger.info(f"FUP Check: user={user_id}, used={total_used}, limit={settings.GLOBAL_MONTHLY_TOKEN_LIMIT}, extra={extra_tokens}")
     
     if total_used > settings.GLOBAL_MONTHLY_TOKEN_LIMIT:

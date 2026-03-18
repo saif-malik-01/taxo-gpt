@@ -38,7 +38,7 @@ def classify_query_intent(query: str) -> str:
         return "rcm"
 
     # ── GST rates ─────────────────────────────────────────────────────────
-    if "rate" in q or "gst rate" in q:
+    if any(kw in q for kw in ("rate", "gst on", "at what gst", "sac", "hsn")):
         return "rate"
 
     # ── Procedure ─────────────────────────────────────────────────────────
@@ -96,6 +96,21 @@ def split_primary_and_supporting(chunks, intent):
 
         elif intent == "notification" and (ctype in ("notification", "circular", "statutory") or "section" in ctype or "rule" in ctype):
             primary.append(ch)
+
+        elif intent == "rate":
+            # Identify HSN/SAC even if chunk_type is missing
+            meta = ch.get("metadata", {})
+            is_rate_doc = (
+                ctype in ("hsn", "sac") or 
+                "hsn_code" in meta or 
+                "sac_code" in meta or
+                "gst rate" in ctype or
+                "notification" in ctype # Rate notifications
+            )
+            if is_rate_doc:
+                primary.append(ch)
+            else:
+                supporting.append(ch)
 
         else:
             supporting.append(ch)
