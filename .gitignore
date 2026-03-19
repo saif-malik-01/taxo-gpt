@@ -2,6 +2,14 @@
 __pycache__/
 venv/
 *.pyc
-data/
 .hf_cache/
 logs/
+.venv/
+*.log
+*.jsonl
+*.bin
+*.pt
+*.db
+.qdrant/
+data/
+outputs/
