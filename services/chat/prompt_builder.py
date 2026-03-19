@@ -42,6 +42,7 @@ RESPONSE FORMAT — FLEXIBLE AND CONTEXT-DRIVEN:
 
 STRICT GUIDELINES:
 - Mention Act, Rules, Notifications, Circulars, Judgments ONLY if relevant and present in the retrieved data.
+- If the retrieved material does not explicitly contain the answer to the user's specific question, clearly state that there is no relevant information in the provided material. Do NOT summarize or explain irrelevant retrieved documents just because they share keywords.
 - If a judgment squarely answers the question, explain it first.
 - If law is settled, state that clearly.
 - If interpretation depends on facts, say so explicitly.
@@ -275,7 +276,7 @@ SUPPORTING LEGAL MATERIAL (USE ONLY IF IT ADDS REAL VALUE):
 {supporting_text}
 
 Using the above material (especially the PRIMARY material{', and the document context if provided,' if document_context else ''}), answer the professional query.
-Use only the data that is actually present and relevant. Do not add sections or references for data that was not retrieved.
+Use only the data that is actually present and relevant. If the material does not cover the user's specific question, state that clearly instead of summarizing irrelevant information. Do not add sections or references for data that was not retrieved.
 Choose the response format — prose, headings, lists, or a combination — that best fits this specific question and the available data.
 """
     return user_message
