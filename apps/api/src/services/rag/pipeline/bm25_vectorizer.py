@@ -7,15 +7,12 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from apps.api.src.services.rag.config import CONFIG
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from apps.api.src.services.rag.pipeline.keyword_merger import MergeResult
+from apps.api.src.core.config import settings
+from apps.api.src.services.rag.retrieval.keyword_merger import MergeResult
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,10 +25,8 @@ class BM25Vectorizer:
         self._vocab_rev: Dict[int, str] = {}
         self._doc_freq:  Counter        = Counter()
         self._corpus_docs: int          = 0
-        self._k1 = CONFIG.bm25.k1
-        self._b  = CONFIG.bm25.b
-
-    # â”€â”€ Vocabulary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        self._k1 = settings.BM25_K1
+        self._b  = settings.BM25_B
 
     def _get_or_add(self, token: str) -> int:
         if token not in self._vocab:
@@ -56,8 +51,6 @@ class BM25Vectorizer:
     def _avg_dl(self) -> float:
         total = sum(self._doc_freq.values())
         return max(total / max(self._corpus_docs, 1), 1)
-
-    # â”€â”€ Sparse vector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def compute_sparse_vector(
         self, keyword_document: str
@@ -93,8 +86,6 @@ class BM25Vectorizer:
 
         return indices, values
 
-    # â”€â”€ Debug file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
     def write_debug_file(
         self,
         chunk_id:         str,
@@ -122,7 +113,7 @@ class BM25Vectorizer:
 
         lines += [
             sep,
-            f"BM25 TOKEN DEBUG  â€”  Chunk: {chunk_id}",
+            f"BM25 TOKEN DEBUG  -  Chunk: {chunk_id}",
             sep,
             f"Corpus docs: {self._corpus_docs}  |  Vocab size: {len(self._vocab)}  |  "
             f"Doc length: {doc_len}  |  Unique tokens in doc: {len(tf_counter)}",
@@ -157,28 +148,24 @@ class BM25Vectorizer:
                 f"{tf_norm:>8.4f} {idf:>8.4f} {bm25_score:>10.6f} {status:>12}"
             )
 
-        # Discarded section
         discarded = [r for r in merge_result.token_records if not r.grounded]
         if discarded:
-            lines += ["", "â”€â”€ DISCARDED (failed grounding check) â”€â”€"]
+            lines += ["", "-- DISCARDED (failed grounding check) --"]
             for r in discarded:
                 lines.append(f"  {r.token}  (L{r.layer})")
 
-        # Hypothetical queries
         if merge_result.hypothetical_queries:
-            lines += ["", "â”€â”€ HYPOTHETICAL QUERIES (appended as full phrases) â”€â”€"]
+            lines += ["", "-- HYPOTHETICAL QUERIES (appended as full phrases) --"]
             for i, hq in enumerate(merge_result.hypothetical_queries, 1):
                 lines.append(f"  {i}. {hq}")
 
-        # Keyword document preview
         lines += [
             "",
-            "â”€â”€ KEYWORD DOCUMENT (first 600 chars) â”€â”€",
+            "-- KEYWORD DOCUMENT (first 600 chars) --",
             keyword_document[:600] + ("..." if len(keyword_document) > 600 else ""),
         ]
 
-        # Sparse vector â€” top 20
-        lines += ["", f"â”€â”€ SPARSE VECTOR â€” {len(indices)} non-zero dimensions (top 20) â”€â”€"]
+        lines += ["", f"-- SPARSE VECTOR - {len(indices)} non-zero dimensions (top 20) --"]
         top20 = sorted(zip(indices, values), key=lambda x: x[1], reverse=True)[:20]
         for vid, val in top20:
             token = self._vocab_rev.get(vid, f"<id:{vid}>")
@@ -189,9 +176,7 @@ class BM25Vectorizer:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
 
-        logger.debug(f"  Debug file â†’ {filepath}")
-
-    # â”€â”€ Persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        logger.debug(f"  Debug file -> {filepath}")
 
     def save_corpus_stats(self, path: str):
         with open(path, "w", encoding="utf-8") as f:
@@ -200,11 +185,11 @@ class BM25Vectorizer:
                 "doc_freq":    dict(self._doc_freq),
                 "corpus_docs": self._corpus_docs,
             }, f)
-        logger.info(f"Corpus stats saved â†’ {path}  (vocab={len(self._vocab)}, docs={self._corpus_docs})")
+        logger.info(f"Corpus stats saved -> {path}  (vocab={len(self._vocab)}, docs={self._corpus_docs})")
 
     def load_corpus_stats(self, path: str):
         if not Path(path).exists():
-            logger.info("No existing corpus stats â€” starting fresh.")
+            logger.info("No existing corpus stats - starting fresh.")
             return
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -212,4 +197,4 @@ class BM25Vectorizer:
         self._vocab_rev   = {int(v): k for k, v in self._vocab.items()}
         self._doc_freq    = Counter(data.get("doc_freq", {}))
         self._corpus_docs = data.get("corpus_docs", 0)
-        logger.info(f"Corpus stats loaded â€” vocab={len(self._vocab)} docs={self._corpus_docs}")
+        logger.info(f"Corpus stats loaded - vocab={len(self._vocab)} docs={self._corpus_docs}")

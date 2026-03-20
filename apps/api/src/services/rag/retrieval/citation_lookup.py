@@ -4,14 +4,13 @@ Stage 3 — Citation lookup only.
 Citation is always separate from the RRF pool — pinned at rank 0.
 """
 
-import re
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
-from apps.api.src.services.rag.config import CONFIG
+from apps.api.src.core.config import settings
 from apps.api.src.services.rag.models import CitationResult, Stage2BResult
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,7 @@ class CitationLookup:
 
     def __init__(self, qdrant: QdrantClient):
         self._qdrant = qdrant
-        self._col    = CONFIG.qdrant.collection_name
+        self._col    = settings.QDRANT_COLLECTION
 
     def run(
         self,

@@ -26,6 +26,8 @@ class BedrockLLMClient:
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=settings.AWS_REGION,
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
         )
         logger.info(f"BedrockLLMClient ready — model: {MODEL_ID}")
 
@@ -42,7 +44,7 @@ class BedrockLLMClient:
                 resp = self._client.converse(
                     modelId=MODEL_ID,
                     messages=[{"role": "user", "content": [{"text": user_message}]}],
-                    system=[{"text": system_prompt}],
+                    system=[{"text": system_prompt or " "}],
                     inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
                 )
                 text = resp["output"]["message"]["content"][0]["text"]
@@ -79,7 +81,7 @@ class BedrockLLMClient:
                 resp = self._client.converse_stream(
                     modelId=MODEL_ID,
                     messages=[{"role": "user", "content": [{"text": user_message}]}],
-                    system=[{"text": system_prompt}],
+                    system=[{"text": system_prompt or " "}],
                     inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
                 )
                 stream = resp.get("stream")

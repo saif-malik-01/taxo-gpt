@@ -21,10 +21,11 @@ logger = logging.getLogger(__name__)
 class TitanEmbeddingGenerator:
 
     def __init__(self):
-        # Each instance gets its own client — safe for use in threads
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=settings.AWS_REGION,
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
         )
 
     def _invoke(self, text: str) -> Optional[List[float]]:

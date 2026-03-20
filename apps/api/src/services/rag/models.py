@@ -15,7 +15,7 @@ class SessionMessage:
 
 @dataclass
 class Stage2AResult:
-    normalised_tokens: List[str]   # section_14a, rule_89 etc — weight 1
+    normalised_tokens: List[str]   # section_14a, rule_89 etc  -  weight 1
     raw_tokens: List[str]          # whitespace-split remaining words
     citation: Optional[str] = None  # taxo.online / MANU citation if found
 
@@ -47,8 +47,8 @@ class Stage2BResult:
 @dataclass
 class IntentResult:
     intent: str                          # JUDGMENT / RATE / FORM / GENERAL
-    confidence: int                      # 0–100
-    score_weights: Dict[str, float]      # chunk_type → additive score boost
+    confidence: int                      # 0-100
+    score_weights: Dict[str, float]      # chunk_type  ->  additive score boost
     response_hierarchy: List[str]        # ordered labels for LLM response
 
 
@@ -58,7 +58,7 @@ class ScoredChunk:
     payload: Dict[str, Any]
     score: float
     source_sets: Set[str] = field(default_factory=set)
-    pinned: bool = False   # name/case/citation search result — guaranteed slot
+    pinned: bool = False   # name/case/citation search result  -  guaranteed slot
 
 
 @dataclass

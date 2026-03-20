@@ -1,6 +1,6 @@
 """
 apps/api/src/services/rag/retrieval/responder.py
-Stage 6 — Cross-reference enrichment + LLM response generation.
+Stage 6  -  Cross-reference enrichment + LLM response generation.
 """
 
 import re
@@ -10,8 +10,8 @@ from typing import Any, Dict, List, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
-from apps.api.src.services.rag.config import CONFIG
-from apps.api.src.services.rag.retrieval.bedrock_llm import BedrockLLMClient
+from apps.api.src.core.config import settings
+from apps.api.src.services.llm.bedrock import BedrockLLMClient
 from apps.api.src.services.rag.models import (
     CitationResult, FinalResponse, IntentResult,
     ScoredChunk, SessionMessage,
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 _MAX_CROSS_REFS  = 3
 _MAX_TOKENS_RESP = 4096
 
-# ── Hierarchy label map ───────────────────────────────────────────────────────
+# -- Hierarchy label map -------------------------------------------------------
 
 _HIERARCHY_LABELS = {
     "act": (
@@ -55,7 +55,7 @@ _HIERARCHY_LABELS = {
         "  Case name | Court | Citation\n"
         "  Facts: the material facts relevant to the issue\n"
         "  Issue: the precise legal question the court decided\n"
-        "  Held: the court's decision — quote the ratio decidendi directly if available\n"
+        "  Held: the court's decision  -  quote the ratio decidendi directly if available\n"
         "  Relevance: how this ruling applies to the query"
     ),
     "analytical_review": (
@@ -79,10 +79,10 @@ _HIERARCHY_LABELS = {
 }
 
 _BASE_RULES = """
-RULES — follow these strictly:
+RULES  -  follow these strictly:
 
 1. STRUCTURE: Present sections in the order given above.
-   If no relevant context exists for a section, skip it silently — do not mention its absence.
+   If no relevant context exists for a section, skip it silently  -  do not mention its absence.
    Every section that IS presented must be substantive and directly answer the query.
 
 2. CITATIONS: Every legal statement must cite its source.
@@ -98,7 +98,7 @@ RULES — follow these strictly:
 
 4. QUALITY BENCHMARK: Your answer must be more detailed, accurate, and useful
    than any analytical review present in the context.
-   The analytical review is the floor — not the ceiling.
+   The analytical review is the floor  -  not the ceiling.
 
 5. COMPLETENESS: Prepare a detailed and complete response.
    Do not truncate or summarise prematurely.
@@ -140,13 +140,13 @@ def _build_system_prompt(hierarchy: List[str], insufficient: bool = False) -> st
     return base
 
 
-# ── Cross-reference enrichment ────────────────────────────────────────────────
+# -- Cross-reference enrichment ------------------------------------------------
 
 class CrossRefEnricher:
 
     def __init__(self, qdrant: QdrantClient):
         self._qdrant = qdrant
-        self._col    = CONFIG.qdrant.collection_name
+        self._col    = settings.QDRANT_COLLECTION
 
     def enrich(self, top_chunks: List[ScoredChunk]) -> List[Dict[str, Any]]:
         fetched: Dict[str, Dict] = {}
@@ -230,7 +230,7 @@ class CrossRefEnricher:
             return []
 
 
-# ── LLM Responder ─────────────────────────────────────────────────────────────
+# -- LLM Responder -------------------------------------------------------------
 
 class LLMResponder:
 
@@ -246,7 +246,7 @@ class LLMResponder:
         citation_result: Optional[CitationResult],
         intent: IntentResult,
     ) -> FinalResponse:
-        """Non-streaming generation — returns complete FinalResponse."""
+        """Non-streaming generation  -  returns complete FinalResponse."""
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
         )
@@ -288,7 +288,7 @@ class LLMResponder:
         intent: IntentResult,
     ):
         """
-        Streaming generation — yields text chunks as they arrive from Bedrock.
+        Streaming generation  -  yields text chunks as they arrive from Bedrock.
         Metadata yielded as final JSON event.
         """
         insufficient = bool(
@@ -370,7 +370,7 @@ class LLMResponder:
         return "\n".join(parts)
 
 
-# ── Chunk formatting ──────────────────────────────────────────────────────────
+# -- Chunk formatting ----------------------------------------------------------
 
 def _format_chunk(chunk: Dict, label: str = "") -> str:
     lines = [f"--- {label} ---"] if label else []
@@ -408,7 +408,7 @@ def _format_chunk(chunk: Dict, label: str = "") -> str:
 
     elif chunk_type in ("cgst_rule", "igst_rule", "gstat_rule"):
         lines.append(
-            f"Rule: {ext.get('rule_number_full', '')} — "
+            f"Rule: {ext.get('rule_number_full', '')}  -  "
             f"{ext.get('rule_title', '')}"
         )
         text = str(chunk.get("text") or "").strip()
@@ -417,7 +417,7 @@ def _format_chunk(chunk: Dict, label: str = "") -> str:
 
     elif chunk_type in ("cgst_section", "igst_section"):
         lines.append(
-            f"Section {ext.get('section_number', '')} — "
+            f"Section {ext.get('section_number', '')}  -  "
             f"{ext.get('section_title', '')} "
             f"({ext.get('act', '')})"
         )

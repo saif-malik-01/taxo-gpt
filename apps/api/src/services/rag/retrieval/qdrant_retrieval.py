@@ -1,32 +1,32 @@
 """
 retrieval/qdrant_retrieval.py
-Stage 4 â€” Retrieval, scoring, and final selection.
+Stage 4 - Retrieval, scoring, and final selection.
 
 Three retrieval pools (all parallel):
-    Pool A: vector  â€” dense similarity search, top 30 with cosine scores
-    Pool B: bm25    â€” BM25 sparse search, top 30 with BM25 scores
-    Pool C: payload â€” scroll1 + scroll2 + scroll3 (payload match, no score)
+    Pool A: vector  - dense similarity search, top 30 with cosine scores
+    Pool B: bm25    - BM25 sparse search, top 30 with BM25 scores
+    Pool C: payload - scroll1 + scroll2 + scroll3 (payload match, no score)
 
 Pinned lookups (parallel, separate from scoring):
     citation, name/party search, case number search
 
 Scoring model:
-    Step 1  Pool C chunks already in Pool A â†’ add scroll bonus to cosine score
-    Step 2  Pool C chunks NOT in Pool A â†’ fetch stored vectors â†’ cosine sim
-            + scroll bonus â†’ insert into Pool A
+    Step 1  Pool C chunks already in Pool A -> add scroll bonus to cosine score
+    Step 2  Pool C chunks NOT in Pool A -> fetch stored vectors -> cosine sim
+            + scroll bonus -> insert into Pool A
     Step 3  Pool A is now unified: original vector results + keyword/scroll
             results, all scored on cosine-similarity basis (one ranked list)
-    Step 4  RRF between Pool A (ranked) and Pool B/BM25 (ranked) â†’ base score
+    Step 4  RRF between Pool A (ranked) and Pool B/BM25 (ranked) -> base score
     Step 5  Intent weights additive
-    Step 6  Sort â†’ top 30
+    Step 6  Sort -> top 30
     Step 7  Match depth boost (cross-ref +0.08, keyword +0.08, cap +0.24)
     Step 8  Pinned chunks inserted at top
-    Step 9  Dedup by chunk id â†’ top 25 for LLM
+    Step 9  Dedup by chunk id -> top 25 for LLM
 
 Scroll bonuses (additive to cosine score):
-    scroll1 (direct ext field match)  â†’ +0.18  highest confidence
-    scroll3 (keyword array match)     â†’ +0.12
-    scroll2 (cross-reference match)   â†’ +0.10
+    scroll1 (direct ext field match)  -> +0.18  highest confidence
+    scroll3 (keyword array match)     -> +0.12
+    scroll2 (cross-reference match)   -> +0.10
 """
 
 import math
@@ -37,8 +37,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
-from apps.api.src.services.rag.config import (
-    CONFIG,
+from apps.api.src.core.config import (
+    settings,
     SECTION_CHUNK_TYPES,
     RULE_CHUNK_TYPES,
     FORM_CHUNK_TYPES,
@@ -54,7 +54,7 @@ _TOP_N   = 30   # each individual search call returns this many
 _FINAL_N = 25   # chunks sent to LLM
 _RRF_K   = 60   # RRF constant
 
-# Scroll bonuses â€” additive to cosine similarity score in Pool A
+# Scroll bonuses - additive to cosine similarity score in Pool A
 # Applied when a scroll confirms a chunk (scroll1 = most precise)
 _SCROLL1_BONUS = 0.18   # direct ext field match (exact section/rule/form match)
 _SCROLL3_BONUS = 0.12   # keyword array match
@@ -66,7 +66,7 @@ class QdrantRetrieval:
     def __init__(self, qdrant: QdrantClient, bm25: BM25Vectorizer):
         self._qdrant   = qdrant
         self._bm25     = bm25
-        self._col      = CONFIG.qdrant.collection_name
+        self._col      = settings.QDRANT_COLLECTION
         self._embedder = TitanEmbeddingGenerator()
 
     def retrieve(
@@ -86,23 +86,23 @@ class QdrantRetrieval:
         pinned_citation:        the citation string to exclude from retrieval pool
         """
 
-        # â”€â”€ Embed query â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Embed query -----------------------------------------------
         logger.info("Stage 4: embedding query...")
         query_vector = self._embedder.embed_text(query)
         if query_vector is None:
-            logger.error("Stage 4: query embedding failed â€” BM25 + payload only")
+            logger.error("Stage 4: query embedding failed - BM25 + payload only")
         else:
             logger.info(f"Stage 4: query vector ready ({len(query_vector)} dims)")
 
-        # â”€â”€ BM25 sparse vector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- BM25 sparse vector ----------------------------------------
         sparse_indices, sparse_values = self._bm25.compute_sparse_vector(keyword_document)
         logger.info(
-            f"Stage 4: BM25 sparse vector â€” "
+            f"Stage 4: BM25 sparse vector - "
             f"{len(sparse_indices)} non-zero dims from "
             f"{len(keyword_document.split())} tokens"
         )
 
-        # â”€â”€ Determine which calls to run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Determine which calls to run ------------------------------
         run_scroll1  = _has_identifiers(stage2b) or bool(stage2b.hsn_code or stage2b.sac_code)
         run_scroll2  = _has_identifiers(stage2b)
         run_scroll3  = bool(
@@ -124,7 +124,7 @@ class QdrantRetrieval:
             f"case_num={'YES' if run_case_num else 'NO'}"
         )
 
-        # â”€â”€ Launch all parallel calls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Launch all parallel calls ---------------------------------
         futures_map: Dict[Any, str] = {}
         with ThreadPoolExecutor(max_workers=10) as ex:
             if query_vector:
@@ -154,16 +154,16 @@ class QdrantRetrieval:
                     logger.error(f"  [{source}] failed: {e}")
                     raw_results[source] = []
 
-        # â”€â”€ Unpack results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Unpack results --------------------------------------------
         # Vector and BM25 return (chunk_id, payload, score) triples
-        # Scrolls return (chunk_id, payload) pairs (no score â€” payload match)
-        # Name/case searches return (chunk_id, payload) pairs â€” PINNED
+        # Scrolls return (chunk_id, payload) pairs (no score - payload match)
+        # Name/case searches return (chunk_id, payload) pairs - PINNED
 
         vector_scored: List[Tuple[str, Dict, float]] = raw_results.get("vector", [])
         bm25_scored:   List[Tuple[str, Dict, float]] = raw_results.get("bm25", [])
 
         # Combine scroll1 + scroll2 + scroll3 into payload pool
-        # Dedup ACROSS all three â€” a chunk in scroll1 is not re-added by scroll2/3.
+        # Dedup ACROSS all three - a chunk in scroll1 is not re-added by scroll2/3.
         # scroll_type_map tracks which scroll first claimed each chunk id.
         scroll1_ids: Set[str] = set()
         scroll2_ids: Set[str] = set()
@@ -214,14 +214,14 @@ class QdrantRetrieval:
         if pinned_pairs:
             logger.info(
                 f"Pinned: {len(pinned_pairs)} chunks "
-                f"from name/case search â€” guaranteed top slots"
+                f"from name/case search - guaranteed top slots"
             )
 
-        # â”€â”€ Build id sets and payload maps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Build id sets and payload maps ----------------------------
         vector_ids = {cid for cid, _, _ in vector_scored}
         bm25_ids   = {cid for cid, _, _ in bm25_scored}
 
-        # Pool A: vector scores â€” base pool, everything gets merged into this
+        # Pool A: vector scores - base pool, everything gets merged into this
         pool_a_scores:   Dict[str, float] = {cid: s for cid, _, s in vector_scored}
         pool_a_payloads: Dict[str, Dict]  = {cid: p for cid, p, _ in vector_scored}
         # BM25 payloads for chunks not already in vector
@@ -250,27 +250,27 @@ class QdrantRetrieval:
                 f"Pinned: {len(pinned_pairs)} chunks from name/case search"
             )
 
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # ═══════════════════════════════════════════════════════════════
         # SCORING MODEL
         #
         # Goal: merge Pool C (scrolls, no score) into Pool A (vector, scored)
         # so that Pool A becomes one unified cosine-similarity-based ranked list.
         # Then RRF between Pool A (enriched) and Pool B (BM25).
         #
-        # Step 1  Pool C chunks already in Pool A â†’ add scroll bonus to vector score
-        # Step 2  Pool C chunks NOT in Pool A â†’ fetch vectors â†’ cosine sim + scroll bonus â†’ insert into Pool A
+        # Step 1  Pool C chunks already in Pool A → add scroll bonus to vector score
+        # Step 2  Pool C chunks NOT in Pool A → fetch vectors → cosine sim + scroll bonus → insert into Pool A
         # Step 3  Pool A is now the unified vector+keyword pool (one ranked list)
-        # Step 4  RRF between Pool A and Pool B (BM25) â†’ final base score
+        # Step 4  RRF between Pool A and Pool B (BM25) → final base score
         # Step 5  Intent weights
-        # Step 6  Sort â†’ top 30
+        # Step 6  Sort → top 30
         # Step 7  Match depth boost
         # Step 8  Pinned chunks inserted
-        # Step 9  Dedup â†’ top 25
-        # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Step 9  Dedup → top 25
+        # ═══════════════════════════════════════════════════════════════
 
-        # â”€â”€ Step 1: Pool C chunks already in Pool A â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 1: Pool C chunks already in Pool A ───────────────────
         # Add scroll-type bonus to their existing vector score.
-        # This raises their rank within Pool A â€” confirming they are
+        # This raises their rank within Pool A — confirming they are
         # relevant from a different retrieval signal.
         in_both_count = 0
         for cid in payload_ids:
@@ -280,18 +280,18 @@ class QdrantRetrieval:
                 in_both_count += 1
 
         logger.info(
-            f"Step 1: {in_both_count} scroll chunks already in vector â†’ "
+            f"Step 1: {in_both_count} scroll chunks already in vector -> "
             f"scroll bonus added to cosine score"
         )
 
-        # â”€â”€ Step 2: Pool C chunks NOT in Pool A â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Step 2: Pool C chunks NOT in Pool A ----------------------
         # These were found by keyword/payload matching but not in vector top-30.
         # Fetch their stored vectors from Qdrant, compute cosine similarity,
         # add scroll bonus, insert into Pool A.
         payload_not_in_vector = payload_ids - vector_ids
         if payload_not_in_vector and query_vector:
             logger.info(
-                f"Step 2: {len(payload_not_in_vector)} scroll-only chunks â€” "
+                f"Step 2: {len(payload_not_in_vector)} scroll-only chunks - "
                 f"fetching stored vectors for cosine similarity..."
             )
             try:
@@ -299,13 +299,13 @@ class QdrantRetrieval:
                     collection_name=self._col,
                     ids=list(payload_not_in_vector),
                     with_payload=True,
-                    with_vectors=[CONFIG.qdrant.text_vector_name],
+                    with_vectors=[settings.QDRANT_TEXT_VECTOR],
                 )
                 inserted = 0
                 for point in fetched:
                     cid  = str(point.id)
                     vecs = point.vector or {}
-                    vec  = vecs.get(CONFIG.qdrant.text_vector_name)
+                    vec  = vecs.get(settings.QDRANT_TEXT_VECTOR)
                     if vec is None:
                         continue
                     sim          = _cosine_similarity(query_vector, vec)
@@ -320,7 +320,7 @@ class QdrantRetrieval:
                 )
             except Exception as e:
                 logger.error(f"Step 2: vector fetch failed: {e}")
-                # Fallback â€” scroll1 gets high base (exact field match is high confidence)
+                # Fallback - scroll1 gets high base (exact field match is high confidence)
                 for cid in payload_not_in_vector:
                     scroll_bonus = _scroll_bonus(cid, scroll1_ids, scroll2_ids, scroll3_ids)
                     base = 0.15 if cid in scroll1_ids else 0.05
@@ -328,11 +328,11 @@ class QdrantRetrieval:
                     pool_a_payloads[cid] = payload_pool.get(cid, {})
                 s1_count = sum(1 for cid in payload_not_in_vector if cid in scroll1_ids)
                 logger.info(
-                    f"Step 2 fallback: {s1_count} scroll1 chunks â†’ base=0.15+bonus, "
-                    f"rest â†’ base=0.05+bonus"
+                    f"Step 2 fallback: {s1_count} scroll1 chunks -> base=0.15+bonus, "
+                    f"rest -> base=0.05+bonus"
                 )
         elif payload_not_in_vector and not query_vector:
-            # No query vector available â€” use scroll bonuses only as score
+            # No query vector available - use scroll bonuses only as score
             for cid in payload_not_in_vector:
                 scroll_bonus = _scroll_bonus(cid, scroll1_ids, scroll2_ids, scroll3_ids)
                 pool_a_scores[cid]   = scroll_bonus
@@ -346,10 +346,10 @@ class QdrantRetrieval:
             f"{len(pool_a_ids) - len(vector_ids)} added from scrolls)"
         )
 
-        # â”€â”€ Step 4: RRF between Pool A and Pool B (BM25) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Step 4: RRF between Pool A and Pool B (BM25) --------------
         # Pool A is now a proper ranked list (by cosine sim + scroll bonus).
         # Pool B (BM25) is a proper ranked list (by BM25 score).
-        # RRF combines their rank positions â€” sidesteps scale incompatibility.
+        # RRF combines their rank positions - sidesteps scale incompatibility.
         # k=60 standard.
 
         # Rank Pool A by score descending
@@ -374,7 +374,7 @@ class QdrantRetrieval:
             f"| rrf_max={rrf_max:.4f}"
         )
 
-        # â”€â”€ Exclude pinned citation chunks from pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Exclude pinned citation chunks from pool -------------------
         if pinned_citation:
             before = len(rrf_scores)
             rrf_scores = {
@@ -385,7 +385,7 @@ class QdrantRetrieval:
             if removed:
                 logger.info(f"Excluded {removed} chunks matching pinned citation")
 
-        # â”€â”€ Step 5: Intent weights â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Step 5: Intent weights -------------------------------------
         weight_count = 0
         for cid in list(rrf_scores.keys()):
             ct = all_payloads.get(cid, {}).get("chunk_type", "")
@@ -398,7 +398,7 @@ class QdrantRetrieval:
             f"weights={intent.score_weights}"
         )
 
-        # â”€â”€ Step 6: Sort â†’ top 30 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Step 6: Sort -> top 30 --------------------------------------
         sorted_pool = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:_TOP_N]
         top30 = [
             ScoredChunk(
@@ -416,11 +416,11 @@ class QdrantRetrieval:
         score_hi = top30[0].score if top30 else 0
         score_lo = top30[-1].score if top30 else 0
         logger.info(
-            f"Step 6 top 30: score range {score_hi:.4f}â†’{score_lo:.4f} | "
+            f"Step 6 top 30: score range {score_hi:.4f}->{score_lo:.4f} | "
             f"types={[c.payload.get('chunk_type','?') for c in top30[:8]]}"
         )
 
-        # â”€â”€ Step 7: Match depth boost â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Step 7: Match depth boost ---------------------------------
         query_tokens = _get_query_legal_tokens(stage2b)
         if query_tokens:
             boosted = 0
@@ -435,7 +435,7 @@ class QdrantRetrieval:
             )
             top30.sort(key=lambda c: c.score, reverse=True)
 
-        # â”€â”€ Step 8: Insert pinned chunks (citation + name + case) â”€â”€â”€â”€â”€
+        # -- Step 8: Insert pinned chunks (citation + name + case) -----
         # These come in ORDER: citation first, then case/name
         # Append retrieval reason to payload text field
         all_pinned: List[ScoredChunk] = []
@@ -469,11 +469,11 @@ class QdrantRetrieval:
                 f"name/case={len(pinned_pairs)})"
             )
 
-        # â”€â”€ Step 9: Dedup by chunk id â†’ final top 25 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Step 9: Dedup by chunk id -> final top 25 -----------------
         seen: Set[str] = set()
         final: List[ScoredChunk] = []
 
-        # Pinned first (citation â†’ case/name order)
+        # Pinned first (citation -> case/name order)
         for chunk in all_pinned:
             if chunk.chunk_id not in seen:
                 seen.add(chunk.chunk_id)
@@ -489,7 +489,7 @@ class QdrantRetrieval:
             logger.info(
                 f"Stage 4 complete: {len(final)} chunks for LLM | "
                 f"pinned={sum(1 for c in final if c.pinned)} | "
-                f"score range: {final[0].score:.4f}→{final[-1].score:.4f} | "
+                f"score range: {final[0].score:.4f} -> {final[-1].score:.4f} | "
                 f"types: {[c.payload.get('chunk_type','?') for c in final]}"
             )
         else:
@@ -497,7 +497,7 @@ class QdrantRetrieval:
             
         return final
 
-    # â”€â”€ Vector search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Vector search -------------------------------------------------
 
     def _vector_search(
         self, query_vector: List[float]
@@ -506,7 +506,7 @@ class QdrantRetrieval:
             resp = self._qdrant.query_points(
                 collection_name=self._col,
                 query=query_vector,
-                using=CONFIG.qdrant.text_vector_name,
+                using=settings.QDRANT_SPARSE_VECTOR,
                 limit=_TOP_N,
                 with_payload=True,
             )
@@ -515,19 +515,19 @@ class QdrantRetrieval:
             logger.error(f"Vector search failed: {e}")
             return []
 
-    # ── BM25 search ────────────────────────────────────────────────────────
+    # -- BM25 search --------------------------------------------------------
 
     def _bm25_search(
         self, indices: List[int], values: List[float]
     ) -> List[Tuple[str, Dict, float]]:
         if not indices:
-            logger.warning("BM25: empty sparse vector — skipping")
+            logger.warning("BM25: empty sparse vector  -  skipping")
             return []
         try:
             resp = self._qdrant.query_points(
                 collection_name=self._col,
                 query=qmodels.SparseVector(indices=indices, values=values),
-                using=CONFIG.qdrant.sparse_vector_name,
+                using=settings.QDRANT_SPARSE_VECTOR,
                 limit=_TOP_N,
                 with_payload=True,
             )
@@ -536,7 +536,7 @@ class QdrantRetrieval:
             logger.error(f"BM25 search failed: {e}")
             return []
 
-    # â”€â”€ Scroll 1 â€” direct ext field match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Scroll 1 - direct ext field match ----------------------------
 
     def _scroll1(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
         results: List[Tuple[str, Dict]] = []
@@ -676,7 +676,7 @@ class QdrantRetrieval:
 
         return results
 
-    # â”€â”€ Scroll 2 â€” cross-reference match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Scroll 2 - cross-reference match -----------------------------
 
     def _scroll2(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
         results: List[Tuple[str, Dict]] = []
@@ -765,7 +765,7 @@ class QdrantRetrieval:
 
         return results
 
-    # â”€â”€ Scroll 3 â€” keyword match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Scroll 3 - keyword match --------------------------------------
 
     def _scroll3(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
         results: List[Tuple[str, Dict]] = []
@@ -826,7 +826,7 @@ class QdrantRetrieval:
 
         return results
 
-    # â”€â”€ Name search (pinned) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Name search (pinned) ------------------------------------------
 
     def _name_search(self, names: List[str]) -> List[Tuple[str, Dict]]:
         words = _name_words(names)
@@ -847,7 +847,7 @@ class QdrantRetrieval:
                     logger.debug(f"Name search failed for {word}: {e}")
         return _dedup_by_id_pairs(results)
 
-    # â”€â”€ Case number search (pinned) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Case number search (pinned) -----------------------------------
 
     def _case_number_search(self, case_number: str) -> List[Tuple[str, Dict]]:
         primary = _primary_case_number(case_number)
@@ -867,7 +867,7 @@ class QdrantRetrieval:
             logger.warning(f"Case number search failed: {e}")
             return []
 
-    # â”€â”€ Scroll helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Scroll helper -------------------------------------------------
 
     def _scroll(
         self,
@@ -889,7 +889,7 @@ class QdrantRetrieval:
             return []
 
 
-# â”€â”€ Text index setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Text index setup ---------------------------------------------------------
 
 def ensure_text_indexes(qdrant: QdrantClient):
     fields = [
@@ -899,7 +899,7 @@ def ensure_text_indexes(qdrant: QdrantClient):
     for field in fields:
         try:
             qdrant.create_payload_index(
-                collection_name=CONFIG.qdrant.collection_name,
+                collection_name=settings.QDRANT_COLLECTION,
                 field_name=field,
                 field_schema=qmodels.TextIndexParams(
                     type="text",
@@ -914,12 +914,12 @@ def ensure_text_indexes(qdrant: QdrantClient):
             logger.debug(f"Text index {field} skipped: {e}")
 
 
-# â”€â”€ Match depth boost â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Match depth boost --------------------------------------------------------
 
 def _match_depth_boost(payload: Dict, query_tokens: List[str]) -> float:
     """
     +0.08 per identifier found in cross_references OR keywords (or both).
-    Same identifier in both locations = still +0.08 â€” not cumulative.
+    Same identifier in both locations = still +0.08 - not cumulative.
     It is the same evidence stored in two places.
     Cap: +0.24 total (max 3 distinct identifiers matched).
     """
@@ -943,7 +943,7 @@ def _match_depth_boost(payload: Dict, query_tokens: List[str]) -> float:
     return min(boost, 0.24)
 
 
-# â”€â”€ Cross-reference parsers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Cross-reference parsers ---------------------------------------------------
 
 def _parse_judgment_xrefs(xrefs: Dict) -> List[str]:
     tokens = []
@@ -969,7 +969,7 @@ def _parse_judgment_xrefs(xrefs: Dict) -> List[str]:
     for raw in _xref_list(xrefs, "circulars"):
         parts = re.split(r"circular\s+no\.?\s*", raw, flags=re.IGNORECASE)
         for part in parts:
-            m = re.match(r"(\d+[/\-]\d+(?:[/\-]\d+)?)", part.strip(" ,-â€“"))
+            m = re.match(r"(\d+[/\-]\d+(?:[/\-]\d+)?)", part.strip(" ,-"))
             if m:
                 num = re.sub(r"[/\-]", "_", m.group(1))
                 tokens.append(f"circular_{num}")
@@ -1022,7 +1022,7 @@ def _get_query_legal_tokens(stage2b: Stage2BResult) -> List[str]:
     return tokens
 
 
-# â”€â”€ Retrieval reason annotation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Retrieval reason annotation -----------------------------------------------
 
 def _append_retrieval_reason(payload: Dict, reason: str):
     """
@@ -1030,11 +1030,11 @@ def _append_retrieval_reason(payload: Dict, reason: str):
     understands why this chunk is pinned.
     """
     current = str(payload.get("text") or "").strip()
-    tag = f"\n\n[PINNED â€” retrieved because: {reason}]"
+    tag = f"\n\n[PINNED - retrieved because: {reason}]"
     payload["text"] = current + tag
 
 
-# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Helpers -------------------------------------------------------------------
 
 def _scroll_bonus(
     cid: str,
@@ -1113,7 +1113,7 @@ def _normalise_notif_num(ref: str) -> Optional[str]:
 
 
 def _normalise_circ_num(ref: str) -> Optional[str]:
-    ref = re.sub(r"circular\s*no\.?\s*[-â€“]?\s*", "", ref, flags=re.IGNORECASE).strip()
+    ref = re.sub(r"circular\s*no\.?\s*[-]?\s*", "", ref, flags=re.IGNORECASE).strip()
     m = re.search(r"(\d+[/\-]\d+(?:[/\-]\d+)?)", ref)
     return m.group(1) if m else None
 

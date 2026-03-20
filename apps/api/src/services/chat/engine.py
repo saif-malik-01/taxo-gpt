@@ -9,8 +9,6 @@ from apps.api.src.services.rag.models import SessionMessage
 
 logger = logging.getLogger(__name__)
 
-
-# Singleton pipeline instance
 _pipeline = None
 
 def get_pipeline():
@@ -33,34 +31,6 @@ def _map_history(history: List[Dict]) -> List[SessionMessage]:
         except (IndexError, AttributeError):
             continue
     return pipeline_history
-
-async def chat(
-    query: str, 
-    store: any = None, 
-    all_chunks: list = None, 
-    history: list = [], 
-    profile_summary: Optional[str] = None, 
-    document_context: Optional[str] = None
-) -> Tuple[str, list, dict, dict, dict]:
-    """
-    Call the new RetrievalPipeline in non-streaming mode.
-    """
-    pipeline = await run_in_threadpool(get_pipeline)
-    
-    # Enrich query with profile/doc context if present
-    context_prefix = ""
-    if profile_summary:
-        context_prefix += f"[User Profile: {profile_summary}]\n"
-    if document_context:
-        context_prefix += f"[Project/Document Context: {document_context}]\n"
-    
-    final_query = f"{context_prefix}{query}" if context_prefix else query
-    session_history = _map_history(history)
-
-    result = await run_in_threadpool(pipeline.query, final_query, session_history)
-    
-    usage = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0} 
-    return result.answer, result.retrieved_documents, {}, {}, usage
 
 async def chat_stream(
     query: str, 

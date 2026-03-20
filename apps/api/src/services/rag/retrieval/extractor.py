@@ -1,9 +1,9 @@
 """
 apps/api/src/services/rag/retrieval/extractor.py
-Stage 1 — Query clarification
-Stage 2A — Regex extraction (mirrors indexing L3)
-Stage 2B — LLM field extraction (mirrors indexing L1)
-Stage 2C — Intent + score_weights + response_hierarchy
+Stage 1  -  Query clarification
+Stage 2A  -  Regex extraction (mirrors indexing L3)
+Stage 2B  -  LLM field extraction (mirrors indexing L1)
+Stage 2C  -  Intent + score_weights + response_hierarchy
 2A, 2B, 2C run in parallel.
 """
 
@@ -11,7 +11,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-from apps.api.src.services.rag.retrieval.bedrock_llm import BedrockLLMClient
+from apps.api.src.services.llm.bedrock import BedrockLLMClient
 from apps.api.src.services.rag.models import IntentResult, SessionMessage, Stage2AResult, Stage2BResult
 from apps.api.src.services.rag.retrieval.regex_fallback import extract_fallback
 from apps.api.src.core.normalizer import universal_normalise, whitespace_split_normalise
@@ -19,7 +19,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ── Stage 1 ───────────────────────────────────────────────────────────────────
+# -- Stage 1 -------------------------------------------------------------------
 
 _S1_SYSTEM = """You are a query classifier for an Indian tax law chatbot.
 Given conversation history and the current query, classify:
@@ -58,7 +58,7 @@ class Stage1Clarifier:
         return query
 
 
-# ── Stage 2A ──────────────────────────────────────────────────────────────────
+# -- Stage 2A ------------------------------------------------------------------
 
 def _extract_citation(text: str) -> Optional[str]:
     """Extract and normalise any taxo.online or MANU citation from text."""
@@ -106,27 +106,27 @@ class Stage2ARegex:
             return Stage2AResult([], [], None)
 
 
-# ── Stage 2B ──────────────────────────────────────────────────────────────────
+# -- Stage 2B ------------------------------------------------------------------
 
 _S2B_SYSTEM = """You are a precise field extractor for an Indian tax law chatbot.
 Extract fields from the user query. Return ONLY valid JSON.
 
 RULES:
-1. parties / person_names: extract ANY name — full or partial, one word is fine.
-   Extract EXACTLY as written — do not expand or correct.
+1. parties / person_names: extract ANY name  -  full or partial, one word is fine.
+   Extract EXACTLY as written  -  do not expand or correct.
 2. case_number: extract as-is, preserve all punctuation exactly.
 3. citation: recognise ALL these taxo.online variants:
    "2017 taxo.online 42", "2017 taxo online 42", "taxo online 42",
    "taxo 42", "17 taxo online 42", "taxoonline 42", "Taxo.Online 42",
    "2017 SCC Online 234", "MANU/SC/0872/2021"
    Normalise to: "YYYY Taxo.online N" or "MANU/..." as appropriate.
-4. HSN/SAC — CRITICAL:
-   - HSN (8-digit): GOODS/PRODUCTS only. Exact code only — never guess.
-   - SAC (6-digit): SERVICES only. Exact code only — never guess.
-   - Product described but no code → hsn_code: null
-   - Service described but no code → sac_code: null
-5. acts: extract even if implied ("GST" → "CGST Act" / "IGST Act",
-   "income tax" → "Income Tax Act 1961")
+4. HSN/SAC  -  CRITICAL:
+   - HSN (8-digit): GOODS/PRODUCTS only. Exact code only  -  never guess.
+   - SAC (6-digit): SERVICES only. Exact code only  -  never guess.
+   - Product described but no code  ->  hsn_code: null
+   - Service described but no code  ->  sac_code: null
+5. acts: extract even if implied ("GST"  ->  "CGST Act" / "IGST Act",
+   "income tax"  ->  "Income Tax Act 1961")
 6. Return null for fields not mentioned. Return [] for empty lists.
 
 Return:
@@ -185,13 +185,13 @@ class Stage2BLLM:
             return Stage2BResult()
 
 
-# ── Stage 2C ──────────────────────────────────────────────────────────────────
+# -- Stage 2C ------------------------------------------------------------------
 
 _S2C_SYSTEM = """You are an intent classifier for an Indian tax law chatbot.
 
 Analyse the query and return:
 
-1. INTENT — choose ONE:
+1. INTENT  -  choose ONE:
    JUDGMENT: user asks for court cases, judgements, rulings, orders, held, precedents.
              Signals: "judgement", "case", "ruling", "held", "HC", "SC", "ITAT",
              party names, citation numbers, "writ", "appeal", "order".
@@ -199,7 +199,7 @@ Analyse the query and return:
    RATE: user asks specifically for the GST/tax RATE PERCENTAGE on a product or service.
          Signals: "rate", "GST on", "tax on", "how much GST", "what is the rate",
          "GST rate", "%", HSN/SAC codes, product/service names WITH rate intent.
-         NOT RATE if user asks "what is section X" or "explain" or "define" —
+         NOT RATE if user asks "what is section X" or "explain" or "define"  - 
          those are GENERAL even if the section is about rates.
 
    FORM: user asks about a specific GST form, filing procedure, or how to file.
@@ -209,13 +209,13 @@ Analyse the query and return:
             compliance, "what is", "explain", "define", "section X", "rule X",
             "meaning of", "applicability". DEFAULT to GENERAL when in doubt.
 
-2. CONFIDENCE: 0–100.
-   Be conservative — default to GENERAL if unsure. Set confidence < 70 if unclear.
+2. CONFIDENCE: 0-100.
+   Be conservative  -  default to GENERAL if unsure. Set confidence < 70 if unclear.
 
 3. SCORE_WEIGHTS: additive score boosts per chunk_type.
-   Things user EXPLICITLY asks for → 0.10
-   Things DIRECTLY RELATED to primary ask → 0.05
-   Everything else → 0.00
+   Things user EXPLICITLY asks for  ->  0.10
+   Things DIRECTLY RELATED to primary ask  ->  0.05
+   Everything else  ->  0.00
 
    chunk_type values: judgment, cgst_section, igst_section, cgst_rule,
    igst_rule, gstat_rule, notification, circular, faq, gst_form,
@@ -229,9 +229,9 @@ Analyse the query and return:
     "analytical_review", "summary"]
 
    Reorder ONLY if user explicitly requests:
-   "give me judgement" → judgment to position 1
-   "give me rate"      → notification_circular_faq to position 1
-   "show me form"      → rules to position 1
+   "give me judgement"  ->  judgment to position 1
+   "give me rate"       ->  notification_circular_faq to position 1
+   "show me form"       ->  rules to position 1
 
    analytical_review always second to last. summary always last.
 
@@ -291,7 +291,7 @@ class Stage2CIntent:
             return _default_intent()
 
 
-# ── Combined extractor ────────────────────────────────────────────────────────
+# -- Combined extractor --------------------------------------------------------
 
 class CombinedExtractor:
     def __init__(self, llm: BedrockLLMClient):
@@ -321,7 +321,7 @@ class CombinedExtractor:
         return a, b, c
 
 
-# ── BM25 query expansion dictionary ──────────────────────────────────────────
+# -- BM25 query expansion dictionary ------------------------------------------
 
 _BM25_EXPANSIONS: Dict[str, List[str]] = {
     "itc":   ["input_tax_credit"],
@@ -395,7 +395,7 @@ def build_bm25_keyword_document(a: Stage2AResult, b: Stage2BResult) -> str:
     return doc
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 
 def _lst(val: Any) -> List[str]:
     if not val:

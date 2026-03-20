@@ -22,31 +22,6 @@ class LLMResponder:
     def __init__(self, llm: BedrockLLMClient):
         self._llm = llm
 
-    def generate(
-        self,
-        query: str,
-        history: List[SessionMessage],
-        a2: Stage2AResult,
-        b2: Stage2BResult,
-        intent: IntentResult,
-        top_chunks: List[Dict],
-        citation_res: CitationResult,
-    ) -> FinalResponse:
-        """
-        1. Formulate complex prompt including retrieved chunks and intent.
-        2. Non-streaming LLM call.
-        3. Parse the result.
-        """
-        system, user = self._build_prompts(query, history, a2, b2, intent, top_chunks, citation_res)
-        answer = self._llm.call(system, user, label="stage6")
-        
-        return FinalResponse(
-            answer=answer or "I couldn't generate a response based on the retrieved information.",
-            retrieved_documents=top_chunks,
-            intent=intent.intent,
-            confidence=intent.confidence,
-        )
-
     def generate_stream(
         self,
         query: str,

@@ -7,7 +7,7 @@ at index time and query time.
 import re
 import logging
 from typing import List, Optional
-from apps.api.src.core.config import settings
+from apps.api.src.core.config import PRESERVED_UPPERCASE, AUTHORITY_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +27,12 @@ def universal_normalise(token: str) -> Optional[str]:
 
     token = token.strip()
 
-    if token.upper() in settings.PRESERVED_UPPERCASE:
+    if token.upper() in PRESERVED_UPPERCASE:
         return token.upper()
 
     lower = token.lower()
-    if lower in settings.AUTHORITY_MAP:
-        return settings.AUTHORITY_MAP[lower]
+    if lower in AUTHORITY_MAP:
+        return AUTHORITY_MAP[lower]
 
     token = token.lower()
     token = re.sub(r"[\s\-/\\]", "_", token)
