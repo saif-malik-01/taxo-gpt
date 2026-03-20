@@ -506,7 +506,7 @@ class QdrantRetrieval:
             resp = self._qdrant.query_points(
                 collection_name=self._col,
                 query=query_vector,
-                using=settings.QDRANT_SPARSE_VECTOR,
+                using=settings.QDRANT_TEXT_VECTOR,
                 limit=_TOP_N,
                 with_payload=True,
             )

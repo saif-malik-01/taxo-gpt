@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     QDRANT_PORT: int = 6333
     QDRANT_API_KEY: str = ""
     QDRANT_TIMEOUT: int = 20
-    QDRANT_COLLECTION: str = "gst_chunks"
+    QDRANT_COLLECTION: str = "tax_chunks"
     QDRANT_HTTPS: bool = False
     QDRANT_TEXT_VECTOR: str = "text_vector"    # Dense vector name
     QDRANT_SPARSE_VECTOR: str = "sparse_vector" # Sparse vector name (BM25)
