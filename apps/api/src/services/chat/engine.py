@@ -34,11 +34,8 @@ def _map_history(history: List[Dict]) -> List[SessionMessage]:
 
 async def chat_stream(
     query: str, 
-    store: any = None, 
-    all_chunks: list = None, 
     history: list = [], 
     profile_summary: Optional[str] = None, 
-    document_context: Optional[str] = None
 ) -> AsyncGenerator[dict, None]:
     """
     Call the new RetrievalPipeline in streaming mode and map events back to our JSON protocol.
@@ -48,18 +45,13 @@ async def chat_stream(
     context_prefix = ""
     if profile_summary:
         context_prefix += f"[User Profile: {profile_summary}]\n"
-    if document_context:
-        context_prefix += f"[Project/Document Context: {document_context}]\n"
     
     final_query = f"{context_prefix}{query}" if context_prefix else query
     session_history = _map_history(history)
 
     # 1. Run Stages 1-5 (Initial retrieval/filtering)
     staged = await run_in_threadpool(pipeline.query_stages_1_to_5, final_query, session_history)
-
-    # Unpack: (final_query, session_history, chunks, citation_result, intent)
-    _, _, top_chunks, citation_result, intent_obj = staged
-
+    
     # 2. Run Stage 6 (Streaming response)
     stream_gen = pipeline.query_stage_6_stream(*staged)
 
@@ -71,16 +63,9 @@ async def chat_stream(
                 
                 yield {
                     "type": "retrieval",
-                    "sources": meta.get("retrieved_documents", []),
-                    "full_judgments": {} 
-                }
-                yield {
-                    "type": "citations",
-                    "party_citations": {meta.get("intent", "GENERAL"): []}
-                }
-                yield {
-                    "type": "usage",
-                    "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+                    "intent": meta.get("intent"),
+                    "confidence": meta.get("confidence"),
+                    "sources": meta.get("retrieved_documents", [])
                 }
             except Exception as e:
                 logger.error(f"Error parsing pipeline metadata: {e}")
