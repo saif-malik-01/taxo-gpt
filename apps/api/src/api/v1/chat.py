@@ -60,7 +60,13 @@ async def ask_gst_stream_simple(
                 
             # Make sure we save the bot message so history stays correct
             if full_response:
-                await add_message(session_id, "bot", full_response, user_id)
+                bot_msg = await add_message(session_id, "bot", full_response, user_id)
+                # Yield a final completion event with the message ID
+                yield json.dumps({
+                    "type": "completion", 
+                    "session_id": session_id,
+                    "message_id": bot_msg.id
+                }) + "\n"
 
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
