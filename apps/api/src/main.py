@@ -1,7 +1,7 @@
 import os
 import logging
 import time
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from apps.api.src.core.config import settings
 from apps.api.src.db.session import engine, Base
@@ -9,6 +9,11 @@ from apps.api.src.api.v1.auth import router as auth_router
 from apps.api.src.api.v1.chat import router as chat_router
 from apps.api.src.api.v1.payments import router as payments_router
 from apps.api.src.api.v1.admin import router as admin_router
+from apps.api.src.services.jobs.scheduler import start_scheduler, stop_scheduler
+from sqlalchemy import text
+from apps.api.src.db.session import engine, get_redis
+from apps.api.src.services.chat.engine import get_pipeline
+from starlette.concurrency import run_in_threadpool
 
 # Environment Settings for Transformers Cache (from main.py)
 os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
@@ -57,9 +62,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info(f"Starting {settings.PROJECT_NAME}...")
-    # Background jobs will be migrated in a later step
     try:
-        from apps.api.src.services.jobs.scheduler import start_scheduler
         start_scheduler()
         logger.info("Scheduler started")
     except ImportError as e:
@@ -69,17 +72,49 @@ async def startup_event():
 async def shutdown_event():
     logger.info(f"Shutting down {settings.PROJECT_NAME}...")
     try:
-        from apps.api.src.services.jobs.scheduler import stop_scheduler
         stop_scheduler()
     except ImportError: pass
 
-# Include Versioned Routers
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(payments_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
 
-@app.get("/health")
 @app.get("/api/v1/health")
-def health_check():
-    return {"status": "ok", "version": "v1", "app": settings.PROJECT_NAME}
+async def health_check():
+    health_status = {
+        "status": "ok",
+        "version": "v1.1.0",
+        "database": "unknown",
+        "redis": "unknown",
+        "qdrant": "unknown"
+    }
+    
+    # 1. Check Postgres
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        health_status["database"] = "connected"
+    except Exception as e:
+        health_status["database"] = f"error: {str(e)}"
+        health_status["status"] = "error"
+
+    # 2. Check Redis
+    try:
+        redis_client = await get_redis()
+        redis_client.ping()
+        health_status["redis"] = "connected"
+    except Exception as e:
+        health_status["redis"] = f"error: {str(e)}"
+        health_status["status"] = "error"
+
+    # 3. Check Qdrant (via Pipeline)
+    try:
+        pipeline = await run_in_threadpool(get_pipeline)
+        pipeline._qdrant.get_collections()
+        health_status["qdrant"] = "connected"
+    except Exception as e:
+        health_status["qdrant"] = f"error: {str(e)}"
+        health_status["status"] = "error"
+
+    return health_status
