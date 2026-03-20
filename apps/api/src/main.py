@@ -102,7 +102,7 @@ async def health_check():
     # 2. Check Redis
     try:
         redis_client = await get_redis()
-        redis_client.ping()
+        await redis_client.ping() # type: ignore
         health_status["redis"] = "connected"
     except Exception as e:
         health_status["redis"] = f"error: {str(e)}"

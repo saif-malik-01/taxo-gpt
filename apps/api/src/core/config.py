@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     QDRANT_SPARSE_VECTOR: str = "sparse_vector" # Sparse vector name (BM25)
 
     # --- Path for BM25 Stats ---
-    CORPUS_STATS_FILE: str = "data/processed/corpus_stats.json"
+    CORPUS_STATS_FILE: str = "corpus_stats.json"
     
     # AWS Configuration
     AWS_ACCESS_KEY_ID: str = ""
