@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.api.src.core.config import settings
 from apps.api.src.db.session import get_db
 from apps.api.src.services.memory import check_credits, track_usage, get_session_history, add_message, get_user_profile
 from apps.api.src.services.auth.deps import auth_guard
