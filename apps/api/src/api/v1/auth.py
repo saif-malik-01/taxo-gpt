@@ -1,0 +1,273 @@
+import logging
+import uuid
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends, Header
+from sqlalchemy import func
+from sqlalchemy.future import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+import httpx
+
+from apps.api.src.services.auth.jwt import create_access_token
+from apps.api.src.services.auth.utils import verify_password, get_password_hash
+from apps.api.src.services.auth.deps import auth_guard
+from apps.api.src.db.session import get_db, add_session, remove_session
+from apps.api.src.db.models.base import User, UserProfile, UserUsage
+from apps.api.src.core.config import settings
+
+from apps.api.src.schemas.auth import (
+    LoginRequest, LoginResponse, GoogleLoginRequest, 
+    FacebookLoginRequest, RegisterRequest, RegisterResponse,
+    VerifyEmailRequest, ResendVerificationRequest
+)
+from apps.api.src.schemas.user import ProfileUpdate
+from apps.api.src.services.email import EmailService
+
+router = APIRouter(prefix="/auth", tags=["Auth"])
+logger = logging.getLogger(__name__)
+
+@router.post("/login", response_model=LoginResponse)
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower()
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    user = result.scalars().first()
+
+    if not user or not verify_password(payload.password, user.password_hash):
+        logger.warning(f"Failed login attempt for email: {email}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not user.is_verified:
+        raise HTTPException(status_code=403, detail="Email not verified. Please check your inbox.")
+
+    session_id = str(uuid.uuid4())
+    try:
+        await add_session(user.id, session_id, user.max_sessions)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    token = create_access_token({
+        "sub": user.email,
+        "id": user.id,
+        "role": user.role,
+        "session_id": session_id
+    })
+    return {"access_token": token}
+
+@router.post("/google", response_model=LoginResponse)
+async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        if payload.credential.startswith("ya29."):
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://www.googleapis.com/oauth2/v3/userinfo",
+                    headers={"Authorization": f"Bearer {payload.credential}"}
+                )
+                if resp.status_code != 200:
+                    raise ValueError(f"Invalid access token")
+                idinfo = resp.json()
+        else:
+            idinfo = id_token.verify_oauth2_token(
+                payload.credential, 
+                google_requests.Request(), 
+                settings.GOOGLE_CLIENT_ID
+            )
+
+        google_id = idinfo['sub']
+        email = idinfo['email'].lower()
+        name = idinfo.get('name')
+
+        result = await db.execute(select(User).where(User.google_id == google_id))
+        user = result.scalars().first()
+
+        if not user:
+            result = await db.execute(select(User).where(func.lower(User.email) == email))
+            user = result.scalars().first()
+
+            if user:
+                user.google_id = google_id
+                if not user.full_name and name:
+                    user.full_name = name
+                await db.commit()
+            else:
+                user = User(
+                    email=email,
+                    google_id=google_id,
+                    full_name=name,
+                    password_hash=None,
+                    role="user",
+                    is_verified=True # Social logins are auto-verified
+                )
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
+
+                db.add(UserProfile(user_id=user.id))
+                db.add(UserUsage(user_id=user.id))
+                await db.commit()
+
+        session_id = str(uuid.uuid4())
+        await add_session(user.email, session_id, user.max_sessions)
+
+        token = create_access_token({
+            "sub": user.email, "id": user.id, "role": user.role, "session_id": session_id
+        })
+        return {"access_token": token}
+
+    except Exception as e:
+        logger.error(f"Google login error: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
+
+@router.post("/facebook", response_model=LoginResponse)
+async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        async with httpx.AsyncClient() as client:
+            fb_res = await client.get(
+                "https://graph.facebook.com/me",
+                params={"fields": "id,name,email", "access_token": payload.access_token}
+            )
+            if fb_res.status_code != 200:
+                raise HTTPException(status_code=401, detail="Invalid Facebook token")
+            fb_data = fb_res.json()
+            
+        fb_id = fb_data.get('id')
+        email = fb_data.get('email', f"{fb_id}@facebook.user").lower()
+        name = fb_data.get('name')
+
+        result = await db.execute(select(User).where(User.facebook_id == fb_id))
+        user = result.scalars().first()
+
+        if not user:
+            result = await db.execute(select(User).where(func.lower(User.email) == email))
+            user = result.scalars().first()
+
+            if user:
+                user.facebook_id = fb_id
+                await db.commit()
+            else:
+                user = User(
+                    email=email, facebook_id=fb_id, full_name=name,
+                    password_hash=None, role="user", is_verified=True
+                )
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
+                db.add(UserProfile(user_id=user.id))
+                db.add(UserUsage(user_id=user.id))
+                await db.commit()
+
+        session_id = str(uuid.uuid4())
+        await add_session(user.email, session_id, user.max_sessions)
+        token = create_access_token({
+            "sub": user.email, "id": user.id, "role": user.role, "session_id": session_id
+        })
+        return {"access_token": token}
+    except Exception as e:
+        logger.error(f"Facebook login error: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
+
+@router.post("/register", response_model=RegisterResponse)
+async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower()
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    verification_token = str(uuid.uuid4())
+    new_user = User(
+        email=email, 
+        password_hash=get_password_hash(payload.password),
+        full_name=payload.full_name,
+        mobile_number=payload.mobile_number,
+        country=payload.country,
+        role=payload.role,
+        is_verified=False,
+        verification_token=verification_token
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    db.add(UserProfile(user_id=new_user.id))
+    db.add(UserUsage(user_id=new_user.id))
+    await db.commit()
+
+    EmailService.send_verification_email(email=email, token=verification_token, full_name=payload.full_name)
+
+    return {"message": "Registration successful. Please verify email.", "is_success": True}
+
+@router.post("/verify-email")
+async def verify_email(payload: VerifyEmailRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.verification_token == payload.token))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid token")
+        
+    user.is_verified = True
+    user.verification_token = None
+    await db.commit()
+    return {"message": "Email verified successfully", "is_success": True}
+
+@router.post("/resend-verification")
+async def resend_verification(payload: ResendVerificationRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(func.lower(User.email) == payload.email.lower()))
+    user = result.scalars().first()
+    if not user: return {"message": "Verification email sent if account exists."}
+    if user.is_verified: return {"message": "Email already verified."}
+
+    token = str(uuid.uuid4())
+    user.verification_token = token
+    await db.commit()
+    EmailService.send_verification_email(email=user.email, token=token, full_name=user.full_name)
+    return {"message": "Verification email resent."}
+
+@router.post("/logout")
+async def logout(user=Depends(auth_guard)):
+    user_id = user.get("id")
+    session_id = user.get("session_id")
+    if user_id and session_id:
+        await remove_session(user_id, session_id)
+    return {"status": "logged out"}
+
+@router.get("/me")
+async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    email = user.get("sub")
+    res = await db.execute(
+        select(User).options(selectinload(User.profile)).where(func.lower(User.email) == email.lower())
+    )
+    db_user = res.scalars().first()
+    if not db_user: raise HTTPException(status_code=404, detail="User not found")
+        
+    return {
+        "user": {
+            "id": db_user.id, "email": db_user.email, "full_name": db_user.full_name,
+            "mobile_number": db_user.mobile_number, "country": db_user.country,
+            "role": db_user.role, "profile": {
+                "dynamic_summary": db_user.profile.dynamic_summary if db_user.profile else None,
+                "preferences": db_user.profile.preferences if db_user.profile else {}
+            }
+        }
+    }
+
+@router.patch("/me")
+async def update_profile(payload: ProfileUpdate, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    email = user.get("sub")
+    res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
+    db_user = res.scalars().first()
+    
+    res = await db.execute(select(UserProfile).where(UserProfile.user_id == db_user.id))
+    profile = res.scalars().first()
+    
+    if not profile:
+        profile = UserProfile(user_id=db_user.id); db.add(profile)
+    
+    if payload.dynamic_summary is not None: profile.dynamic_summary = payload.dynamic_summary
+    if payload.preferences is not None: profile.preferences = payload.preferences
+        
+    await db.commit()
+    return {"status": "profile updated", "profile": {
+        "dynamic_summary": profile.dynamic_summary,
+        "preferences": profile.preferences
+    }}
