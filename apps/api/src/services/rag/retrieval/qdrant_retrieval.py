@@ -31,6 +31,7 @@ Scroll bonuses (additive to cosine score):
 
 import math
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -88,14 +89,18 @@ class QdrantRetrieval:
 
         # -- Embed query -----------------------------------------------
         logger.info("Stage 4: embedding query...")
+        t_start_embed = time.time()
         query_vector = self._embedder.embed_text(query)
+        t_embed = (time.time() - t_start_embed) * 1000
         if query_vector is None:
-            logger.error("Stage 4: query embedding failed - BM25 + payload only")
+            logger.error(f"Stage 4: query embedding failed ({t_embed:.1f}ms) - BM25 + payload only")
         else:
-            logger.info(f"Stage 4: query vector ready ({len(query_vector)} dims)")
+            logger.info(f"Stage 4: query vector ready ({len(query_vector)} dims, {t_embed:.1f}ms)")
 
         # -- BM25 sparse vector ----------------------------------------
+        t_start_bm25_v = time.time()
         sparse_indices, sparse_values = self._bm25.compute_sparse_vector(keyword_document)
+        t_bm25_v = (time.time() - t_start_bm25_v) * 1000
         logger.info(
             f"Stage 4: BM25 sparse vector - "
             f"{len(sparse_indices)} non-zero dims from "
@@ -125,6 +130,7 @@ class QdrantRetrieval:
         )
 
         # -- Launch all parallel calls ---------------------------------
+        t_start_parallel = time.time()
         futures_map: Dict[Any, str] = {}
         with ThreadPoolExecutor(max_workers=10) as ex:
             if query_vector:
@@ -148,11 +154,17 @@ class QdrantRetrieval:
             raw_results: Dict[str, Any] = {}
             for fut in as_completed(futures_map):
                 source = futures_map[fut]
+                t_fut_start = time.time()
                 try:
                     raw_results[source] = fut.result()
+                    t_fut = (time.time() - t_fut_start) * 1000
+                    logger.debug(f"  [{source}] completed in {t_fut:.1f}ms")
                 except Exception as e:
                     logger.error(f"  [{source}] failed: {e}")
                     raw_results[source] = []
+        
+        t_parallel = (time.time() - t_start_parallel) * 1000
+        logger.info(f"Parallel retrieval pool calls done in {t_parallel:.1f}ms")
 
         # -- Unpack results --------------------------------------------
         # Vector and BM25 return (chunk_id, payload, score) triples
@@ -294,6 +306,7 @@ class QdrantRetrieval:
                 f"Step 2: {len(payload_not_in_vector)} scroll-only chunks - "
                 f"fetching stored vectors for cosine similarity..."
             )
+            t_start_step2 = time.time()
             try:
                 fetched = self._qdrant.retrieve(
                     collection_name=self._col,
@@ -314,12 +327,14 @@ class QdrantRetrieval:
                     pool_a_payloads[cid] = point.payload or payload_pool.get(cid, {})
                     inserted += 1
 
+                t_step2 = (time.time() - t_start_step2) * 1000
                 logger.info(
                     f"Step 2: {inserted} scroll-only chunks inserted into "
-                    f"Pool A (cosine sim + scroll bonus)"
+                    f"Pool A (cosine sim + scroll bonus) in {t_step2:.1f}ms"
                 )
             except Exception as e:
-                logger.error(f"Step 2: vector fetch failed: {e}")
+                t_step2 = (time.time() - t_start_step2) * 1000
+                logger.error(f"Step 2: vector fetch failed after {t_step2:.1f}ms: {e}")
                 # Fallback - scroll1 gets high base (exact field match is high confidence)
                 for cid in payload_not_in_vector:
                     scroll_bonus = _scroll_bonus(cid, scroll1_ids, scroll2_ids, scroll3_ids)
