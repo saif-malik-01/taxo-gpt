@@ -83,3 +83,5 @@ qdrant_storage/
 # ----------------------
 coverage/
 htmlcov/
+
+/corpus_stats.json

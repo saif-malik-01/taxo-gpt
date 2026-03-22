@@ -634,28 +634,52 @@ async def _process_files(temp_file_paths, question, session_id, doc_context):
     doc_processor = get_document_processor()
 
     try:
-        # Step 1: Extract text from all files
-        file_data = []
-        for tmp_path, ext, filename in temp_file_paths:
+        # Step 1: Extract text from all files IN PARALLEL
+        # asyncio.gather runs all extractions concurrently — each doc's pages
+        # are already extracted in parallel inside extract_text() via
+        # ThreadPoolExecutor, so this gives us both levels of parallelism:
+        #   - Multiple documents extracted simultaneously
+        #   - Each document's pages extracted simultaneously within it
+        async def _extract_one(tmp_path, filename):
             try:
                 text = await run_in_threadpool(doc_processor.extract_text, tmp_path)
-                file_data.append((filename, text or ""))
+                return (filename, text or "", None)
             except Exception as e:
-                yield {"type": "error", "message": f"Could not extract {filename}: {e}"}
+                return (filename, "", str(e))
+
+        import asyncio as _asyncio
+        extraction_results = await _asyncio.gather(
+            *[_extract_one(tmp_path, filename) for tmp_path, ext, filename in temp_file_paths]
+        )
+
+        file_data = []
+        for filename, text, error in extraction_results:
+            if error:
+                yield {"type": "error", "message": f"Could not extract {filename}: {error}"}
                 return
+            file_data.append((filename, text))
 
         active_case = get_active_case(doc_context)
 
-        # Step 2: Classify each file
-        classified = []
-        ambiguous  = []
-
-        for filename, text in file_data:
+        # Step 2: Classify all files IN PARALLEL
+        # Each classification is a Bedrock LLM call (~1-2s).
+        # Sequential: N files × 1.5s = N×1.5s total.
+        # Parallel:   all fire at once = ~1.5s total regardless of N.
+        async def _classify_one(filename, text):
             classification = await run_in_threadpool(
                 classify_document, text, filename, question, active_case
             )
             routing = determine_routing(classification, has_existing_case=bool(active_case))
+            return (filename, text, classification, routing)
 
+        classification_results = await _asyncio.gather(
+            *[_classify_one(filename, text) for filename, text in file_data]
+        )
+
+        classified = []
+        ambiguous  = []
+
+        for filename, text, classification, routing in classification_results:
             if routing == "ask_user":
                 ambiguous.append((filename, text, classification))
             else:

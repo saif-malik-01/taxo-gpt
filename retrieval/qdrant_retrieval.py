@@ -421,35 +421,87 @@ class QdrantRetrieval:
             top30.sort(key=lambda c: c.score, reverse=True)
 
         # ── Step 8: Insert pinned chunks (citation + name + case) ─────
+        # All sources are merged and deduplicated by citation before inserting.
+        # One judgment split into 10 chunks has the same citation in every chunk.
+        # Keeping all 10 wastes 9 pinned slots with identical case_note content.
+        # After dedup, one chunk per unique citation is kept — the one with the
+        # longest case_note. Multiple citations (e.g. 2019 HC + 2024 SC for the
+        # same case) are kept as separate entries since they are different orders.
         all_pinned: List[ScoredChunk] = []
+
+        # Collect all candidate chunks from every pinned source
+        all_pinned_candidates: List[Tuple[str, Dict, float, Set[str]]] = []
+        # (chunk_id, payload, score, source_sets)
 
         if pinned_citation_chunks:
             for chunk in pinned_citation_chunks:
                 cid = str(chunk.get("id", chunk.get("_chunk_id", "")))
-                _append_retrieval_reason(chunk, f"citation '{pinned_citation}'")
-                all_pinned.append(ScoredChunk(
-                    chunk_id=cid,
-                    payload=chunk,
-                    score=1.0,
-                    source_sets={"citation"},
-                    pinned=True,
-                ))
+                all_pinned_candidates.append((cid, chunk, 1.0, {"citation"}))
 
         for cid, payload, reason in pinned_pairs:
-            _append_retrieval_reason(payload, reason)
-            all_pinned.append(ScoredChunk(
+            all_pinned_candidates.append((cid, payload, 0.99, {"name_case_search"}))
+
+        # Dedup all candidates by citation — one chunk per unique citation
+        seen_citations: Dict[str, int] = {}   # citation → index in all_pinned
+        seen_chunk_ids: Set[str] = set()
+
+        for cid, payload, score, source_sets in all_pinned_candidates:
+            if cid in seen_chunk_ids:
+                continue
+            ext      = payload.get("ext") or {}
+            citation = str(ext.get("citation") or "").strip()
+
+            if citation and citation in seen_citations:
+                # Same citation already added — keep the one with better case_note
+                existing_idx  = seen_citations[citation]
+                existing_note = str(
+                    (all_pinned[existing_idx].payload.get("ext") or {}).get("case_note") or ""
+                )
+                new_note = str(ext.get("case_note") or "")
+                if len(new_note) > len(existing_note):
+                    # Replace with the richer chunk
+                    old_cid = all_pinned[existing_idx].chunk_id
+                    seen_chunk_ids.discard(old_cid)
+                    reason_label = (
+                        f"citation '{pinned_citation}'" if "citation" in source_sets
+                        else "party/name or case number match"
+                    )
+                    _append_retrieval_reason(payload, reason_label)
+                    all_pinned[existing_idx] = ScoredChunk(
+                        chunk_id=cid,
+                        payload=payload,
+                        score=score,
+                        source_sets=source_sets,
+                        pinned=True,
+                    )
+                    seen_chunk_ids.add(cid)
+                # Either way skip adding a new entry for this citation
+                continue
+
+            # New citation (or chunk without citation) — add it
+            reason_label = (
+                f"citation '{pinned_citation}'" if "citation" in source_sets
+                else "party/name or case number match"
+            )
+            _append_retrieval_reason(payload, reason_label)
+            sc = ScoredChunk(
                 chunk_id=cid,
                 payload=payload,
-                score=0.99,
-                source_sets={"name_case_search"},
+                score=score,
+                source_sets=source_sets,
                 pinned=True,
-            ))
+            )
+            if citation:
+                seen_citations[citation] = len(all_pinned)
+            seen_chunk_ids.add(cid)
+            all_pinned.append(sc)
 
         if all_pinned:
+            unique_citations = list(seen_citations.keys())
             logger.info(
-                f"Pinned: {len(all_pinned)} chunks inserted at top "
-                f"(citation={len(pinned_citation_chunks or [])} "
-                f"name/case={len(pinned_pairs)})"
+                f"Pinned: {len(all_pinned)} unique chunks after citation dedup "
+                f"(from {len(all_pinned_candidates)} raw candidates) | "
+                f"citations: {unique_citations[:6]}"
             )
 
         # ── Step 9: Dedup by chunk id → final top 25 ─────────────────
@@ -843,27 +895,56 @@ class QdrantRetrieval:
     # ── Name search (pinned) ──────────────────────────────────────────
 
     def _name_search(self, names: List[str]) -> List[Tuple[str, Dict]]:
+        """
+        Search for judgments by party name / company name.
+        All scroll calls (3 fields × N words) run in parallel.
+        Results are deduplicated by citation — keeping the best chunk
+        (longest case_note) per unique citation, capped at 5 citations.
+        This prevents a single judgment split into 10 chunks from consuming
+        20 pinned slots and overloading the LLM prompt.
+        """
         words = _name_words(names)
         if not words:
             return []
-        results: List[Tuple[str, Dict]] = []
-        for word in words[:8]:
+
+        # Build all scroll call specs
+        calls = []
+        for word in words[:6]:
             for key in ("ext.case_name", "ext.petitioner", "ext.respondent"):
+                calls.append((word, key))
+
+        if not calls:
+            return []
+
+        # Run all in parallel
+        raw: List[Tuple[str, Dict]] = []
+        with ThreadPoolExecutor(max_workers=min(12, len(calls))) as ex:
+            future_map = {
+                ex.submit(
+                    self._scroll,
+                    [qmodels.FieldCondition(key="chunk_type",
+                                            match=qmodels.MatchValue(value="judgment")),
+                     qmodels.FieldCondition(key=key,
+                                            match=qmodels.MatchText(text=word))],
+                    10, f"name_{word[:12]}_{key.split('.')[-1]}"
+                ): (word, key)
+                for word, key in calls
+            }
+            for future in as_completed(future_map):
                 try:
-                    results += self._scroll(
-                        [qmodels.FieldCondition(key="chunk_type",
-                                                match=qmodels.MatchValue(value="judgment")),
-                         qmodels.FieldCondition(key=key,
-                                                match=qmodels.MatchText(text=word))],
-                        limit=10, label=f"name_{word[:15]}"
-                    )
+                    raw += future.result()
                 except Exception as e:
-                    logger.debug(f"Name search failed for {word}: {e}")
-        return _dedup_by_id_pairs(results)
+                    logger.debug(f"Name search failed: {e}")
+
+        return _dedup_by_citation(raw, max_citations=5)
 
     # ── Case number search (pinned) ───────────────────────────────────
 
     def _case_number_search(self, case_number: str) -> List[Tuple[str, Dict]]:
+        """
+        Search by case number. Deduplicates by citation keeping one chunk
+        per unique citation (the one with the best case_note).
+        """
         primary = _primary_case_number(case_number)
         if not primary:
             return []
@@ -875,8 +956,12 @@ class QdrantRetrieval:
                                         match=qmodels.MatchText(text=primary))],
                 limit=20, label=f"case_{primary}"
             )
-            logger.info(f"  case_search: {len(results)} results for primary='{primary}'")
-            return results
+            deduped = _dedup_by_citation(results, max_citations=5)
+            logger.info(
+                f"  case_search: {len(results)} raw → "
+                f"{len(deduped)} after citation dedup for primary='{primary}'"
+            )
+            return deduped
         except Exception as e:
             logger.warning(f"Case number search failed: {e}")
             return []
@@ -1103,6 +1188,55 @@ def _dedup_by_id_pairs(items: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:
             seen.add(chunk_id)
             out.append((chunk_id, payload))
     return out
+
+
+def _dedup_by_citation(
+    items: List[Tuple[str, Dict]],
+    max_citations: int = 5,
+) -> List[Tuple[str, Dict]]:
+    """
+    Deduplicate judgment chunks by citation, keeping one chunk per unique
+    citation — the chunk with the longest case_note (most informative).
+
+    Why one per citation:
+      A single judgment is split into multiple chunks (chunk_index 1, 2, 3...).
+      The case_note in ext is a complete summary of the whole judgment.
+      Sending 10 chunks from the same citation wastes 9 prompt slots with
+      duplicate context. One chunk with the case_note is sufficient for the LLM
+      to understand and cite the judgment correctly.
+
+    Why prefer longest case_note:
+      All chunks of the same citation share the same case_note in ext.
+      But some chunks may have a richer text field. Pick the one with the
+      most content (case_note length as proxy).
+
+    max_citations: cap on unique citations returned — prevents a broad name
+      search from flooding the pinned slots.
+    """
+    # Group by citation
+    by_citation: Dict[str, Tuple[str, Dict]] = {}
+    no_citation: List[Tuple[str, Dict]] = []
+
+    for chunk_id, payload in items:
+        ext = payload.get("ext") or {}
+        citation = str(ext.get("citation") or "").strip()
+        if not citation:
+            no_citation.append((chunk_id, payload))
+            continue
+        existing = by_citation.get(citation)
+        if existing is None:
+            by_citation[citation] = (chunk_id, payload)
+        else:
+            # Keep the chunk with the longer case_note
+            existing_note = str((existing[1].get("ext") or {}).get("case_note") or "")
+            new_note      = str(ext.get("case_note") or "")
+            if len(new_note) > len(existing_note):
+                by_citation[citation] = (chunk_id, payload)
+
+    # Combine: citation-deduped first, then no-citation (no cap on those)
+    result = list(by_citation.values())[:max_citations]
+    result += no_citation
+    return result
 
 
 def _bare_number(ref: str) -> Optional[str]:
