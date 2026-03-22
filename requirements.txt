@@ -21,3 +21,4 @@ razorpay
 fpdf2
 bcrypt
 greenlet
+qdrant-client==1.11.3

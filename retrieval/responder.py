@@ -735,7 +735,12 @@ class CrossRefEnricher:
                 with_payload=True,
                 with_vectors=False,
             )
-            return [r.payload for r in results if r.payload]
+            res = []
+            for r in results:
+                if r.payload:
+                    r.payload["id"] = r.id
+                    res.append(r.payload)
+            return res
         except Exception as e:
             logger.debug(f"Cross-ref scroll {key}={value} failed: {e}")
             return []
@@ -994,17 +999,18 @@ def _build_docs_list(
     docs = []
     if citation_result and citation_result.found:
         for chunk in citation_result.chunks:
-            docs.append(_doc_summary(chunk, "pinned", 1.0))
+            docs.append(_doc_summary(chunk, "pinned", 1.0, chunk.get("id")))
     for sc in top_chunks:
-        docs.append(_doc_summary(sc.payload, "retrieved", sc.score))
+        docs.append(_doc_summary(sc.payload, "retrieved", sc.score, sc.chunk_id))
     for chunk in cross_refs:
-        docs.append(_doc_summary(chunk, "cross_reference", 0.0))
+        docs.append(_doc_summary(chunk, "cross_reference", 0.0, chunk.get("id")))
     return docs
 
 
-def _doc_summary(payload: Dict, label: str, score: float) -> Dict:
+def _doc_summary(payload: Dict, label: str, score: float, doc_id: Optional[Any] = None) -> Dict:
     ext = payload.get("ext") or {}
     return {
+        "id":         str(doc_id) if doc_id is not None else "",
         "label":      label,
         "score":      round(score, 4),
         "chunk_type": payload.get("chunk_type", ""),
