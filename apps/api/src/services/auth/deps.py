@@ -7,12 +7,8 @@ from apps.api.src.core.config import settings
 security = HTTPBearer(auto_error=False)
 
 async def auth_guard(
-    authorization: HTTPAuthorizationCredentials = Depends(security),
-    x_api_key: str = Header(default=None)
+    authorization: HTTPAuthorizationCredentials = Depends(security)
 ):
-    if x_api_key == settings.API_KEY_SECRET:
-        return {"sub": "admin@taxo.online", "role": "admin"}
-
     if authorization:
         token = authorization.credentials
         payload = verify_token(token)

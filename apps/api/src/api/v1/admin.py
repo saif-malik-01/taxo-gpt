@@ -78,3 +78,64 @@ async def get_analytics(admin_user=Depends(admin_guard), db: AsyncSession = Depe
         "total_users": user_count,
         "total_transactions": trans_count
     }
+
+@router.get("/analytics/users")
+async def top_users_stats(admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    # Returns users sorted by usage or total tokens
+    from apps.api.src.db.models.base import UserUsage
+    res = await db.execute(
+        select(User, UserUsage)
+        .join(UserUsage, User.id == UserUsage.user_id)
+        .order_by(UserUsage.total_tokens_used.desc())
+        .limit(20)
+    )
+    data = []
+    for user, usage in res.all():
+        data.append({
+            "id": user.id, "email": user.email, "full_name": user.full_name,
+            "tokens_used": usage.total_tokens_used, "queries_made": usage.simple_query_used
+        })
+    return data
+
+@router.patch("/payments/packages/{package_id}")
+async def update_package(package_id: int, payload: PackageUpdate, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(CreditPackage).where(CreditPackage.id == package_id))
+    pkg = res.scalars().first()
+    if not pkg: raise HTTPException(status_code=404, detail="Package not found")
+    
+    for k, v in payload.dict(exclude_unset=True).items():
+        setattr(pkg, k, v)
+    await db.commit(); await db.refresh(pkg)
+    return pkg
+
+@router.delete("/payments/packages/{package_id}")
+async def delete_package(package_id: int, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(CreditPackage).where(CreditPackage.id == package_id))
+    pkg = res.scalars().first()
+    if not pkg: raise HTTPException(status_code=404, detail="Package not found")
+    await db.delete(pkg); await db.commit()
+    return {"status": "deleted"}
+
+@router.get("/payments/coupons")
+async def list_coupons(admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Coupon))
+    return res.scalars().all()
+
+@router.patch("/payments/coupons/{coupon_id}")
+async def update_coupon(coupon_id: int, payload: CouponUpdate, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Coupon).where(Coupon.id == coupon_id))
+    coupon = res.scalars().first()
+    if not coupon: raise HTTPException(status_code=404, detail="Coupon not found")
+    
+    for k, v in payload.dict(exclude_unset=True).items():
+        setattr(coupon, k, v)
+    await db.commit(); await db.refresh(coupon)
+    return coupon
+
+@router.delete("/payments/coupons/{coupon_id}")
+async def delete_coupon(coupon_id: int, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Coupon).where(Coupon.id == coupon_id))
+    coupon = res.scalars().first()
+    if not coupon: raise HTTPException(status_code=404, detail="Coupon not found")
+    await db.delete(coupon); await db.commit()
+    return {"status": "deleted"}

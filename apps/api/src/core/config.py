@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     # JWT
     JWT_SECRET_KEY: str = "supersecretkey"
     JWT_ALGORITHM: str = "HS256"
-    API_KEY_SECRET: str = "taxogpt-internal-api-key"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # Email Configuration for Feedback Reports

@@ -50,12 +50,13 @@ async def log_requests(request: Request, call_next):
     return response
 
 # CORS Configuration
+origins = [settings.FRONTEND_URL] if settings.FRONTEND_URL else ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
     allow_headers=["*"],
+    allow_methods=["*"],
 )
 
 # Startup Events (Scheduler/Database Initializers)

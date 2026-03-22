@@ -5,25 +5,61 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
 from apps.api.src.db.session import get_db
-from apps.api.src.services.memory import check_credits, track_usage, get_session_history, add_message, get_user_profile
+from apps.api.src.db.models.base import ChatSession, ChatMessage, Feedback, SharedSession
+from sqlalchemy import select, delete, desc
+from apps.api.src.services.memory import (
+    check_credits, track_usage, get_session_history, 
+    add_message, get_user_profile
+)
 from apps.api.src.services.auth.deps import auth_guard
 from apps.api.src.services.chat.engine import chat_stream
 from apps.api.src.services.chat.memory_updater import auto_update_profile
+from apps.api.src.schemas.chat import ChatRequest
 
-router = APIRouter(prefix="/chat", tags=["Chat"])
+router = APIRouter(tags=["Chat"])
 logger = logging.getLogger(__name__)
 
-@router.post("/ask/stream/simple")
+@router.get("/sessions")
+async def list_sessions(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    user_id = user.get("id")
+    res = await db.execute(
+        select(ChatSession).where(ChatSession.user_id == user_id).order_by(desc(ChatSession.created_at))
+    )
+    sessions = res.scalars().all()
+    return [{
+        "id": s.id, 
+        "title": s.title, 
+        "session_type": s.session_type, 
+        "created_at": s.created_at
+    } for s in sessions]
+
+@router.get("/sessions/{session_id}/history")
+async def get_history(session_id: str, user=Depends(auth_guard)):
+    # Basic auth check - ensure session belongs to user (optional but recommended)
+    history = await get_session_history(session_id)
+    return history
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    user_id = user.get("id")
+    await db.execute(
+        delete(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user_id)
+    )
+    await db.commit()
+    return {"status": "deleted"}
+
+@router.post("/chat/ask/stream/simple")
 async def ask_gst_stream_simple(
+    payload: ChatRequest,
     background_tasks: BackgroundTasks,
-    question: str = Form(...),
-    session_id: Optional[str] = Form(None),
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db)
 ):
-    session_id = session_id or str(uuid.uuid4())
+    question = payload.question
+    session_id = payload.session_id or str(uuid.uuid4())
     user_id = user.get("id")
 
     allowed, error_msg = await check_credits(user_id, session_id, False, db, chat_mode="simple")
@@ -73,3 +109,95 @@ async def ask_gst_stream_simple(
             yield json.dumps({"type": "error", "message": str(e)}) + "\n"
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+
+@router.post("/chat/ask/stream/draft")
+async def ask_gst_stream_draft(
+    payload: ChatRequest,
+    background_tasks: BackgroundTasks,
+    user=Depends(auth_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    question = payload.question
+    session_id = payload.session_id or str(uuid.uuid4())
+    user_id = user.get("id")
+
+    allowed, error_msg = await check_credits(user_id, session_id, True, db, chat_mode="draft")
+    if not allowed:
+        raise HTTPException(status_code=402, detail=error_msg)
+
+    async def stream_generator():
+        try:
+            await add_message(session_id, "user", question, user_id, chat_mode="draft")
+            history = await get_session_history(session_id)
+            is_new_session = len(history) <= 1
+            await track_usage(user_id, session_id, db, force_deduct=True) # Draft always deducts
+
+            profile = await get_user_profile(user_id)
+            profile_summary = profile.dynamic_summary if profile else None
+
+            full_response = ""
+            async for event in chat_stream(
+                query=question, 
+                history=history, 
+                profile_summary=profile_summary
+            ):
+                if event.get("type") == "content":
+                    full_response += event.get("delta", "")
+                yield json.dumps(event) + "\n"
+
+            if full_response:
+                bot_msg = await add_message(session_id, "bot", full_response, user_id, chat_mode="draft")
+                yield json.dumps({"type": "completion", "session_id": session_id, "message_id": bot_msg.id}) + "\n"
+
+        except Exception as e:
+            logger.error(f"Draft stream error: {e}", exc_info=True)
+            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+
+class FeedbackRequest(BaseModel):
+    message_id: int
+    rating: int
+    comment: Optional[str] = None
+
+@router.post("/sessions/feedback")
+async def give_feedback(payload: FeedbackRequest, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    # Verify message exists
+    res = await db.execute(select(ChatMessage).where(ChatMessage.id == payload.message_id))
+    msg = res.scalars().first()
+    if not msg: raise HTTPException(status_code=404, detail="Message not found")
+    
+    # Update or create feedback
+    res = await db.execute(select(Feedback).where(Feedback.message_id == payload.message_id))
+    existing = res.scalars().first()
+    if existing:
+        existing.rating = payload.rating
+        existing.comment = payload.comment
+    else:
+        db.add(Feedback(message_id=payload.message_id, rating=payload.rating, comment=payload.comment))
+    
+    await db.commit()
+    return {"status": "success"}
+
+@router.post("/chat/share/session/{session_id}")
+async def share_session(session_id: str, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    # Verify session belongs to user
+    user_id = user.get("id")
+    res = await db.execute(select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user_id))
+    session = res.scalars().first()
+    if not session: raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Create shared link entry
+    shared_id = str(uuid.uuid4())[:8] # Short ID
+    db.add(SharedSession(id=shared_id, session_id=session_id))
+    await db.commit()
+    return {"shared_id": shared_id, "url": f"/chat/share/{shared_id}"}
+
+@router.get("/chat/share/{shared_id}")
+async def get_shared_session(shared_id: str, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(SharedSession).where(SharedSession.id == shared_id))
+    shared = res.scalars().first()
+    if not shared: raise HTTPException(status_code=404, detail="Shared session not found")
+    
+    history = await get_session_history(shared.session_id)
+    return {"history": history}

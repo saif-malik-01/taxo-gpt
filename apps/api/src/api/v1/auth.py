@@ -235,7 +235,10 @@ async def logout(user=Depends(auth_guard)):
 async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
     email = user.get("sub")
     res = await db.execute(
-        select(User).options(selectinload(User.profile)).where(func.lower(User.email) == email.lower())
+        select(User).options(
+            selectinload(User.profile),
+            selectinload(User.usage)
+        ).where(func.lower(User.email) == email.lower())
     )
     db_user = res.scalars().first()
     if not db_user: raise HTTPException(status_code=404, detail="User not found")
@@ -244,11 +247,35 @@ async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
         "user": {
             "id": db_user.id, "email": db_user.email, "full_name": db_user.full_name,
             "mobile_number": db_user.mobile_number, "country": db_user.country,
-            "role": db_user.role, "profile": {
+            "role": db_user.role, 
+            "profile": {
                 "dynamic_summary": db_user.profile.dynamic_summary if db_user.profile else None,
                 "preferences": db_user.profile.preferences if db_user.profile else {}
+            },
+            "credits": {
+                "simple_query_balance": db_user.usage.simple_query_balance if db_user.usage else 0,
+                "draft_reply_balance": db_user.usage.draft_reply_balance if db_user.usage else 0,
+                "total_tokens_used": db_user.usage.total_tokens_used if db_user.usage else 0
             }
         }
+    }
+
+@router.get("/credits")
+async def get_credits(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    user_id = user.get("id")
+    res = await db.execute(
+        select(UserUsage).where(UserUsage.user_id == user_id)
+    )
+    usage = res.scalars().first()
+    if not usage:
+        usage = UserUsage(user_id=user_id)
+        db.add(usage)
+        await db.commit()
+    
+    return {
+        "simple_query_balance": usage.simple_query_balance,
+        "draft_reply_balance": usage.draft_reply_balance,
+        "total_tokens_used": usage.total_tokens_used
     }
 
 @router.patch("/me")
