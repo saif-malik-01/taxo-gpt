@@ -46,6 +46,7 @@ class RetrievalPipeline:
         self._qdrant = QdrantClient(
             host    = CONFIG.qdrant.host,
             port    = CONFIG.qdrant.port,
+            https   = CONFIG.qdrant.https,
             api_key = CONFIG.qdrant.api_key,
             timeout = CONFIG.qdrant.timeout,
         )

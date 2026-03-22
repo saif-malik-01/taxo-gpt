@@ -22,7 +22,8 @@ class BedrockConfig:
 @dataclass
 class QdrantConfig:
     host:                str           = os.getenv("QDRANT_HOST", "localhost")
-    port:                int           = int(os.getenv("QDRANT_PORT", "6333"))
+    port:                int           = int(os.getenv("QDRANT_PORT", "6333") or "6333")
+    https:               bool          = os.getenv("QDRANT_HTTPS", "false").lower() == "true"
     api_key:             Optional[str] = os.getenv("QDRANT_API_KEY") or None
     collection_name:     str           = "tax_chunks"
     text_vector_name:    str           = "text_vector"

@@ -41,8 +41,9 @@ def _make_client() -> QdrantClient:
     return QdrantClient(
         host    = cfg.host,
         port    = cfg.port,
+        https   = cfg.https,
         api_key = cfg.api_key,
-        timeout = cfg.timeout,
+        timeout = cfg.timeout
     )
 
 

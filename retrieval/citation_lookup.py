@@ -70,6 +70,7 @@ class CitationLookup:
 
             if len(case_note.split()) >= 20:
                 logger.info(f"Citation: using case_note ({len(case_note.split())} words)")
+                sample["id"] = scroll_result[0].id
                 chunks = [sample]
             else:
                 # Fetch up to 8 chunks sorted by chunk_index
@@ -89,7 +90,11 @@ class CitationLookup:
                     with_payload=True,
                     with_vectors=False,
                 )
-                chunks = [r.payload for r in all_results if r.payload]
+                chunks = []
+                for r in all_results:
+                    if r.payload:
+                        r.payload["id"] = r.id
+                        chunks.append(r.payload)
                 chunks.sort(key=lambda c: c.get("chunk_index", 0))
                 logger.info(f"Citation: fetched {len(chunks)} chunks for {citation}")
 

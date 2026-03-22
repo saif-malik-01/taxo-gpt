@@ -47,7 +47,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Dict, List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -299,8 +299,9 @@ def health():
 
 @app.post("/chat/ask", response_model=ChatResponse)
 async def chat_ask(
-    payload:          ChatRequest,
     background_tasks: BackgroundTasks,
+    question:         str           = Form(...),
+    session_id:       Optional[str] = Form(None),
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db),
 ):
@@ -308,7 +309,7 @@ async def chat_ask(
         raise HTTPException(status_code=503, detail="Pipeline not ready")
 
     db_user    = await _get_db_user(user.get("sub"), db)
-    session_id = payload.session_id or str(uuid.uuid4())
+    session_id = session_id or str(uuid.uuid4())
 
     allowed, error_msg = await check_credits(db_user.id, session_id, False, db)
     if not allowed:
@@ -320,7 +321,7 @@ async def chat_ask(
     try:
         response: FinalResponse = await run_in_threadpool(
             _pipeline.query,
-            payload.question,
+            question,
             pipeline_history,
         )
     except Exception as e:
@@ -328,12 +329,12 @@ async def chat_ask(
         raise HTTPException(status_code=500, detail="Pipeline error — see server logs")
 
     ts = datetime.now(timezone.utc).isoformat()
-    await add_message(session_id, "user",      payload.question, db_user.id)
+    await add_message(session_id, "user",      question, db_user.id)
     await add_message(session_id, "assistant", response.answer,  db_user.id)
     await track_usage(db_user.id, session_id, db, force_deduct=(len(history) == 0))
 
     background_tasks.add_task(
-        auto_update_profile, db_user.id, payload.question, response.answer
+        auto_update_profile, db_user.id, question, response.answer
     )
     logger.info(
         f"chat_ask done: user={db_user.id} session={session_id[:8]} "
@@ -445,8 +446,9 @@ async def _stream_core(
 @app.post("/chat/ask/stream/simple")
 @app.post("/chat/ask/stream")
 async def chat_stream_endpoint(
-    payload:          ChatRequest,
     background_tasks: BackgroundTasks,
+    question:         str           = Form(...),
+    session_id:       Optional[str] = Form(None),
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db),
 ):
@@ -463,14 +465,14 @@ async def chat_stream_endpoint(
         raise HTTPException(status_code=503, detail="Pipeline not ready")
 
     db_user    = await _get_db_user(user.get("sub"), db)
-    session_id = payload.session_id or str(uuid.uuid4())
+    session_id = session_id or str(uuid.uuid4())
 
     allowed, error_msg = await check_credits(db_user.id, session_id, False, db)
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
     return StreamingResponse(
-        _stream_core(payload.question, session_id, db_user.id, db, background_tasks),
+        _stream_core(question, session_id, db_user.id, db, background_tasks),
         media_type="application/x-ndjson",
         headers={"X-Session-Id": session_id},
     )
@@ -482,14 +484,16 @@ async def chat_stream_endpoint(
 
 @app.post("/chat/feedback")
 async def save_feedback(
-    payload: FeedbackRequest,
+    message_id: int           = Form(...),
+    rating:     int           = Form(...),
+    comment:    Optional[str] = Form(None),
     user=Depends(auth_guard),
     db: AsyncSession = Depends(get_db),
 ):
     db.add(Feedback(
-        message_id=payload.message_id,
-        rating=payload.rating,
-        comment=payload.comment,
+        message_id=message_id,
+        rating=rating,
+        comment=comment,
     ))
     await db.commit()
     return {"status": "recorded"}
