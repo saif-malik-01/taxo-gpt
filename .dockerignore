@@ -1,0 +1,35 @@
+# Environment
+.env
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Git
+.git
+.gitignore
+
+# Data & Storage
+data/
+logs/
+.hf_cache/
+chunks/
+ingestion_tracker.json
+debug_tokens/
+
+# Local Dev
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Architecture
+architecture/
+
+# Docker
+Dockerfile
+.dockerignore

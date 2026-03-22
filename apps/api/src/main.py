@@ -82,6 +82,12 @@ app.include_router(admin_router, prefix="/api/v1")
 
 @app.get("/api/v1/health")
 async def health_check():
+    """Shallow health check for load balancers."""
+    return {"status": "ok"}
+
+@app.get("/api/v1/health/deep")
+async def deep_health_check():
+    """Deep health check that verifies all database connections."""
     health_status = {
         "status": "ok",
         "version": "v1.1.0",
