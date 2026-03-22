@@ -195,6 +195,32 @@ class QdrantRetrieval:
             f"  [bm25]: {len(bm25_scored)} scored results "
             f"types={list({p.get('chunk_type','?') for _,p,_ in bm25_scored[:5]})}"
         )
+
+        # ── DIAGNOSTIC: top 10 vector search results ────────────────
+        # Comment out this block once you have inspected the chunks.
+        logger.info("  [DIAG] ── TOP 10 VECTOR SEARCH RESULTS ──────────────────")
+        for _rank, (_cid, _p, _score) in enumerate(vector_scored[:10], 1):
+            _ext      = _p.get("ext") or {}
+            _ctype    = _p.get("chunk_type", "?")
+            _parent   = _p.get("parent_doc", "?")
+            _text_pre = str(_p.get("text") or "").strip()[:120].replace("", " ")
+            _id_hint  = (
+                _ext.get("_chunk_id") or
+                _ext.get("citation") or
+                _ext.get("section_number") or
+                _ext.get("rule_number_full") or
+                _ext.get("notification_number") or
+                _ext.get("circular_number") or
+                _p.get("_chunk_id") or
+                _cid[:12]
+            )
+            logger.info(
+                f"  [DIAG] #{_rank:02d}  score={_score:.4f}  "
+                f"type={_ctype:<20}  id={_id_hint}  "
+                f"parent={_parent}"
+            )
+            logger.info(f"         text_preview: {_text_pre}")
+        logger.info("  [DIAG] ─────────────────────────────────────────────────")
         logger.info(
             f"Payload pool: {len(payload_ids)} unique chunks "
             f"(s1={len(scroll1_ids)} s2={len(scroll2_ids)} s3={len(scroll3_ids)})"
