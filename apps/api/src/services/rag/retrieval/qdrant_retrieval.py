@@ -451,37 +451,73 @@ class QdrantRetrieval:
             top30.sort(key=lambda c: c.score, reverse=True)
 
         # -- Step 8: Insert pinned chunks (citation + name + case) -----
-        # These come in ORDER: citation first, then case/name
-        # Append retrieval reason to payload text field
+        # All sources are merged and deduplicated by citation before inserting.
+        # One judgment split into chunks has the same citation in every chunk.
+        # Keeping all wastes pinned slots with identical case_note content.
+        # After dedup, one chunk per unique citation is kept (the one with the longest case_note).
         all_pinned: List[ScoredChunk] = []
+
+        all_pinned_candidates: List[Tuple[str, Dict, float, Set[str]]] = []
 
         if pinned_citation_chunks:
             for chunk in pinned_citation_chunks:
                 cid = str(chunk.get("id", chunk.get("_chunk_id", "")))
-                _append_retrieval_reason(chunk, f"citation '{pinned_citation}'")
-                all_pinned.append(ScoredChunk(
-                    chunk_id=cid,
-                    payload=chunk,
-                    score=1.0,
-                    source_sets={"citation"},
-                    pinned=True,
-                ))
+                all_pinned_candidates.append((cid, chunk, 1.0, {"citation"}))
 
         for cid, payload, reason in pinned_pairs:
-            _append_retrieval_reason(payload, reason)
-            all_pinned.append(ScoredChunk(
+            all_pinned_candidates.append((cid, payload, 0.99, {"name_case_search"}))
+
+        seen_citations: Dict[str, int] = {}
+        seen_chunk_ids: Set[str] = set()
+
+        for cid, payload, score, source_sets in all_pinned_candidates:
+            if cid in seen_chunk_ids:
+                continue
+            ext = payload.get("ext") or {}
+            citation = str(ext.get("citation") or "").strip()
+
+            reason_label = (
+                f"citation '{pinned_citation}'" if "citation" in source_sets
+                else "party/name or case number match"
+            )
+
+            if citation and citation in seen_citations:
+                existing_idx  = seen_citations[citation]
+                existing_note = str(
+                    (all_pinned[existing_idx].payload.get("ext") or {}).get("case_note") or ""
+                )
+                new_note = str(ext.get("case_note") or "")
+                if len(new_note) > len(existing_note):
+                    old_cid = all_pinned[existing_idx].chunk_id
+                    seen_chunk_ids.discard(old_cid)
+                    _append_retrieval_reason(payload, reason_label)
+                    all_pinned[existing_idx] = ScoredChunk(
+                        chunk_id=cid,
+                        payload=payload,
+                        score=score,
+                        source_sets=source_sets,
+                        pinned=True,
+                    )
+                    seen_chunk_ids.add(cid)
+                continue
+
+            _append_retrieval_reason(payload, reason_label)
+            sc = ScoredChunk(
                 chunk_id=cid,
                 payload=payload,
-                score=0.99,
-                source_sets={"name_case_search"},
+                score=score,
+                source_sets=source_sets,
                 pinned=True,
-            ))
+            )
+            if citation:
+                seen_citations[citation] = len(all_pinned)
+            seen_chunk_ids.add(cid)
+            all_pinned.append(sc)
 
         if all_pinned:
             logger.info(
-                f"Pinned: {len(all_pinned)} chunks inserted at top "
-                f"(citation={len(pinned_citation_chunks or [])} "
-                f"name/case={len(pinned_pairs)})"
+                f"Pinned: {len(all_pinned)} unique chunks after citation dedup "
+                f"(from {len(all_pinned_candidates)} raw candidates)"
             )
 
         # -- Step 9: Dedup by chunk id -> final top 25 -----------------
@@ -508,7 +544,11 @@ class QdrantRetrieval:
                 f"types: {[c.payload.get('chunk_type','?') for c in final]}"
             )
         else:
-            logger.info("Stage 4 complete: 0 chunks found.")
+            logger.warning(
+                "Stage 4 complete: 0 chunks retrieved - "
+                "Qdrant may be unreachable or the collection is empty. "
+                "LLM will respond from context alone."
+            )
             
         return final
 
@@ -694,7 +734,7 @@ class QdrantRetrieval:
     # -- Scroll 2 - cross-reference match -----------------------------
 
     def _scroll2(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
-        results: List[Tuple[str, Dict]] = []
+        calls: List[Tuple[List, int, str]] = []
 
         for sec in stage2b.sections:
             num = _bare_number(sec)
@@ -707,28 +747,25 @@ class QdrantRetrieval:
                 f"Section {num_only}" if num_only != num else None,
             ])))
             for v in variants:
-                results += self._scroll(
+                calls.append((
                     [qmodels.FieldCondition(key="cross_references.sections",
                                             match=qmodels.MatchValue(value=v))],
-                    limit=15, label=f"s2_sec_{num}"
-                )
-                results += self._scroll(
+                    15, f"s2_sec_{num}"
+                ))
+                calls.append((
                     [qmodels.FieldCondition(key="ext.sections_referred",
                                             match=qmodels.MatchValue(value=v))],
-                    limit=10, label=f"s2_sec_ext_{num}"
-                )
+                    10, f"s2_sec_ext_{num}"
+                ))
             # Judgment ext.sections_in_dispute text search
             for n in list(dict.fromkeys(filter(None, [num, num_only if num_only != num else None]))):
-                try:
-                    results += self._scroll(
-                        [qmodels.FieldCondition(key="chunk_type",
-                                                match=qmodels.MatchValue(value="judgment")),
-                         qmodels.FieldCondition(key="ext.sections_in_dispute",
-                                                match=qmodels.MatchText(text=n))],
-                        limit=15, label=f"s2_jud_sec_{n}"
-                    )
-                except Exception:
-                    pass
+                calls.append((
+                    [qmodels.FieldCondition(key="chunk_type",
+                                            match=qmodels.MatchValue(value="judgment")),
+                     qmodels.FieldCondition(key="ext.sections_in_dispute",
+                                            match=qmodels.MatchText(text=n))],
+                    15, f"s2_jud_sec_{n}"
+                ))
 
         for rule in stage2b.rules:
             num = _bare_number(rule)
@@ -736,47 +773,62 @@ class QdrantRetrieval:
                 continue
             variants = [num, f"Rule {num}", f"rule {num}", f"{num}(1)", f"Rule {num}(1)"]
             for v in variants:
-                results += self._scroll(
+                calls.append((
                     [qmodels.FieldCondition(key="cross_references.rules",
                                             match=qmodels.MatchValue(value=v))],
-                    limit=15, label=f"s2_rule_{num}"
-                )
-                results += self._scroll(
+                    15, f"s2_rule_{num}"
+                ))
+                calls.append((
                     [qmodels.FieldCondition(key="ext.rules_referred",
                                             match=qmodels.MatchValue(value=v))],
-                    limit=10, label=f"s2_rule_ext_{num}"
-                )
+                    10, f"s2_rule_ext_{num}"
+                ))
 
         for notif in stage2b.notifications:
             num = _normalise_notif_num(notif)
             if num:
-                results += self._scroll(
+                calls.append((
                     [qmodels.FieldCondition(key="cross_references.notifications",
                                             match=qmodels.MatchValue(value=num))],
-                    limit=15, label=f"s2_notif_{num}"
-                )
+                    15, f"s2_notif_{num}"
+                ))
 
         for circ in stage2b.circulars:
             num = _normalise_circ_num(circ)
             if num:
-                results += self._scroll(
+                calls.append((
                     [qmodels.FieldCondition(key="cross_references.circulars",
                                             match=qmodels.MatchValue(value=num))],
-                    limit=15, label=f"s2_circ_{num}"
-                )
+                    15, f"s2_circ_{num}"
+                ))
 
         for form in ([stage2b.form_name] if stage2b.form_name else []) + \
                     ([stage2b.form_number] if stage2b.form_number else []):
-            results += self._scroll(
+            calls.append((
                 [qmodels.FieldCondition(key="cross_references.forms",
                                         match=qmodels.MatchValue(value=form))],
-                limit=10, label=f"s2_form_{form}"
-            )
-            results += self._scroll(
+                10, f"s2_form_{form}"
+            ))
+            calls.append((
                 [qmodels.FieldCondition(key="ext.forms_prescribed",
                                         match=qmodels.MatchValue(value=form))],
-                limit=10, label=f"s2_form_ext_{form}"
-            )
+                10, f"s2_form_ext_{form}"
+            ))
+
+        if not calls:
+            return []
+
+        results: List[Tuple[str, Dict]] = []
+        with ThreadPoolExecutor(max_workers=min(12, len(calls))) as ex:
+            future_map = {
+                ex.submit(self._scroll, conditions, limit, label): label
+                for conditions, limit, label in calls
+            }
+            for future in as_completed(future_map):
+                try:
+                    results += future.result()
+                except Exception as e:
+                    logger.debug(f"scroll2 parallel call failed: {e}")
 
         return results
 
@@ -847,20 +899,35 @@ class QdrantRetrieval:
         words = _name_words(names)
         if not words:
             return []
-        results: List[Tuple[str, Dict]] = []
-        for word in words[:8]:
+            
+        calls = []
+        for word in words[:6]:
             for key in ("ext.case_name", "ext.petitioner", "ext.respondent"):
+                calls.append((word, key))
+
+        if not calls:
+            return []
+
+        raw: List[Tuple[str, Dict]] = []
+        with ThreadPoolExecutor(max_workers=min(12, len(calls))) as ex:
+            future_map = {
+                ex.submit(
+                    self._scroll,
+                    [qmodels.FieldCondition(key="chunk_type",
+                                            match=qmodels.MatchValue(value="judgment")),
+                     qmodels.FieldCondition(key=key,
+                                            match=qmodels.MatchText(text=word))],
+                    10, f"name_{word[:12]}_{key.split('.')[-1]}"
+                ): (word, key)
+                for word, key in calls
+            }
+            for future in as_completed(future_map):
                 try:
-                    results += self._scroll(
-                        [qmodels.FieldCondition(key="chunk_type",
-                                                match=qmodels.MatchValue(value="judgment")),
-                         qmodels.FieldCondition(key=key,
-                                                match=qmodels.MatchText(text=word))],
-                        limit=10, label=f"name_{word[:15]}"
-                    )
+                    raw += future.result()
                 except Exception as e:
-                    logger.debug(f"Name search failed for {word}: {e}")
-        return _dedup_by_id_pairs(results)
+                    logger.debug(f"Name search failed: {e}")
+
+        return _dedup_by_citation(raw, max_citations=5)
 
     # -- Case number search (pinned) -----------------------------------
 
@@ -876,8 +943,12 @@ class QdrantRetrieval:
                                         match=qmodels.MatchText(text=primary))],
                 limit=20, label=f"case_{primary}"
             )
-            logger.info(f"  case_search: {len(results)} results for primary='{primary}'")
-            return results
+            deduped = _dedup_by_citation(results, max_citations=5)
+            logger.info(
+                f"  case_search: {len(results)} raw -> "
+                f"{len(deduped)} after citation dedup for primary='{primary}'"
+            )
+            return deduped
         except Exception as e:
             logger.warning(f"Case number search failed: {e}")
             return []
@@ -1105,6 +1176,33 @@ def _has_identifiers(stage2b: Stage2BResult) -> bool:
         stage2b.sections or stage2b.rules or stage2b.notifications
         or stage2b.circulars or stage2b.form_name or stage2b.form_number
     )
+
+
+def _dedup_by_citation(
+    items: List[Tuple[str, Dict]],
+    max_citations: int = 5,
+) -> List[Tuple[str, Dict]]:
+    by_citation: Dict[str, Tuple[str, Dict]] = {}
+    no_citation: List[Tuple[str, Dict]] = []
+
+    for chunk_id, payload in items:
+        ext = payload.get("ext") or {}
+        citation = str(ext.get("citation") or "").strip()
+        if not citation:
+            no_citation.append((chunk_id, payload))
+            continue
+        existing = by_citation.get(citation)
+        if existing is None:
+            by_citation[citation] = (chunk_id, payload)
+        else:
+            existing_note = str((existing[1].get("ext") or {}).get("case_note") or "")
+            new_note      = str(ext.get("case_note") or "")
+            if len(new_note) > len(existing_note):
+                by_citation[citation] = (chunk_id, payload)
+
+    result = list(by_citation.values())[:max_citations]
+    result += no_citation
+    return result
 
 
 def _dedup_by_id_pairs(items: List[Tuple[str, Dict]]) -> List[Tuple[str, Dict]]:

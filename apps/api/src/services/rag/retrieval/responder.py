@@ -1,10 +1,11 @@
 """
 apps/api/src/services/rag/retrieval/responder.py
-Stage 6  -  Cross-reference enrichment + LLM response generation.
+Stage 6 — Cross-reference enrichment + LLM response generation.
 """
 
 import re
 import json as _json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -20,196 +21,149 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_MAX_CROSS_REFS  = 3
+_MAX_CROSS_REFS  = 2          # reduced from 3 — fewer blocking Qdrant calls
 _MAX_TOKENS_RESP = 4096
+_ENRICH_WORKERS  = 6          # parallel scroll calls inside enrich()
+_TOP_CHUNKS_FOR_ENRICH = 5    # only inspect top-5 chunks for cross-refs
 
-# -- Hierarchy label map -------------------------------------------------------
 
-_HIERARCHY_LABELS = {
-    "act": (
-        "STATUTORY PROVISION\n"
-        "State precisely what the Act provides on this matter. "
-        "Quote the exact language of the provision where relevant. "
-        "Cite the section number and Act name for every statement."
-    ),
-    "rules": (
-        "RULES\n"
-        "State what the applicable rules prescribe. "
-        "Quote rule text or sub-rules directly where they are material. "
-        "Cite the rule number for every statement."
-    ),
-    "notification_circular_faq": (
-        "NOTIFICATIONS / CIRCULARS / FAQs\n"
-        "State what CBIC or CBDT has clarified, prescribed, or amended. "
-        "Quote the operative portion of the notification or circular where relevant. "
-        "Cite the notification/circular number and date for every statement."
-    ),
-    "case_scenario_illustration": (
-        "CASE SCENARIOS / ILLUSTRATIONS\n"
-        "Present practical examples or illustrations from the context. "
-        "Describe each scenario clearly and state the applicable treatment."
-    ),
-    "judgment": (
-        "JUDICIAL PRECEDENTS\n"
-        "For each relevant judgment present:\n"
-        "  Case name | Court | Citation\n"
-        "  Facts: the material facts relevant to the issue\n"
-        "  Issue: the precise legal question the court decided\n"
-        "  Held: the court's decision  -  quote the ratio decidendi directly if available\n"
-        "  Relevance: how this ruling applies to the query"
-    ),
-    "analytical_review": (
-        "ANALYTICAL PERSPECTIVE\n"
-        "Present the broader legal position, unresolved areas, conflicting views, "
-        "or practical implications. Where the law is settled, state it clearly. "
-        "Where it is contested, present both sides without personal opinion."
-    ),
-    "summary": (
-        "SUMMARY\n"
-        "Provide a concise, plain-language conclusion of the legal position. "
-        "This must synthesise all the above into a clear, actionable answer. "
-        "It must be more useful and clearer than any analytical review above."
-    ),
-    "rate": (
-        "GST RATE\n"
-        "State the applicable rate, the HSN/SAC code, the notification prescribing "
-        "the rate, any conditions or exemptions, and amendments in reverse "
-        "chronological order (most recent first)."
-    ),
-}
-
-_BASE_RULES = """
-RULES  -  follow these strictly:
-
-1. STRUCTURE: Present sections in the order given above.
-   If no relevant context exists for a section, skip it silently  -  do not mention its absence.
-   Every section that IS presented must be substantive and directly answer the query.
-
-2. CITATIONS: Every legal statement must cite its source.
-   Acts: cite section number and Act name.
-   Rules: cite rule number.
-   Notifications/Circulars: cite number and date.
-   Judgments: cite case name, court, and citation.
-
-3. LANGUAGE: Use precise legal and professional language throughout.
-   Quote the exact text of provisions, notifications, or judicial holdings
-   where the precise wording is legally material.
-   Do not paraphrase where quoting adds clarity.
-
-4. QUALITY BENCHMARK: Your answer must be more detailed, accurate, and useful
-   than any analytical review present in the context.
-   The analytical review is the floor  -  not the ceiling.
-
-5. COMPLETENESS: Prepare a detailed and complete response.
-   Do not truncate or summarise prematurely.
-   The user expects a thorough professional answer.
-
-6. BOUNDARIES: Never fabricate, infer, or speculate beyond the provided context.
-   If the context does not address a specific aspect of the query, state clearly:
-   "The available material does not address [specific aspect]."
-
-7. TONE: Professional, direct, and clear.
-   Do not hedge unnecessarily. State the law as it is.
-"""
-
+# ── System prompt ────────────────────────────────────────────────────────────
 
 def _build_system_prompt(hierarchy: List[str], insufficient: bool = False) -> str:
-    numbered = []
-    for i, key in enumerate(hierarchy, 1):
-        label = _HIERARCHY_LABELS.get(key)
-        if label:
-            numbered.append(f"{i}. {label}")
+    """
+    Builds a free-form system prompt.
+    The hierarchy is used only to hint which types of material are in the
+    context — the LLM is NOT forced into a fixed section structure.
+    It answers the user query directly using whatever is in the retrieved context.
+    """
+    # Map hierarchy keys to plain-language hints about what context is available
+    _CONTENT_HINTS = {
+        "act":                       "statutory provisions",
+        "rules":                     "rules and sub-rules",
+        "notification_circular_faq": "CBIC notifications, circulars, and FAQs",
+        "case_scenario_illustration": "case scenarios and illustrations",
+        "judgment":                  "court judgments and tribunal orders",
+        "analytical_review":         "analytical commentary",
+        "rate":                      "GST rate information, HSN/SAC codes",
+        "summary":                   "summaries",
+    }
+    available = [_CONTENT_HINTS[k] for k in hierarchy if k in _CONTENT_HINTS]
+    context_hint = (
+        f"The retrieved context includes: {', '.join(available)}."
+        if available else ""
+    )
 
-    structure = "\n\n".join(numbered)
     base = (
         "You are a senior Indian tax law professional providing expert legal guidance.\n\n"
-        "Structure your response in the following order. "
-        "Include a section only if the provided context contains relevant material for it. "
-        "SUMMARY is always the final section.\n\n"
-        + structure
-        + "\n\n"
-        + _BASE_RULES
+        + context_hint
+        + ("\n\n" if context_hint else "")
+        + """Answer the user's query in detail using the retrieved context provided below.
+
+RULES:
+1. Answer directly and completely. Do not impose section headings or a fixed structure unless the query itself asks for a breakdown.
+2. Use the retrieved context as your source. Quote exact statutory text or judicial language where the wording is legally material.
+3. Cite every legal statement — section number, rule number, notification number and date, or case name and citation as applicable.
+4. Do NOT say things like "the context does not address this" or "no notification was found" or "this is not in the provided material". Simply use what is available and answer as fully as possible.
+5. If multiple judgments are provided, discuss each one that is relevant to the query. Do not skip judgments.
+6. Be thorough. Do not truncate or summarise prematurely. The user expects a detailed professional answer.
+7. Maintain a professional, respectful tone throughout. Never be dismissive."""
     )
+
     if insufficient:
         base += (
             "\n\nNOTE: The retrieved context may not fully address this query. "
-            "Answer as completely as possible from the available material. "
-            "State clearly which aspects are not covered and suggest the user "
-            "provide more detail or rephrase."
+            "Answer as completely as possible from what is available. "
+            "Clearly state which specific aspects are not covered."
         )
     return base
 
 
-# -- Cross-reference enrichment ------------------------------------------------
+# ── Cross-reference enrichment ────────────────────────────────────────────────
 
 class CrossRefEnricher:
+    """
+    Fetches up to _MAX_CROSS_REFS supporting chunks from cross-references
+    embedded in the top retrieved chunks.
+
+    All Qdrant scroll calls are executed in parallel (ThreadPoolExecutor)
+    so the total wait time equals the slowest single call, not the sum.
+    Capped at _TOP_CHUNKS_FOR_ENRICH source chunks and _ENRICH_WORKERS
+    parallel workers to keep latency bounded.
+    """
 
     def __init__(self, qdrant: QdrantClient):
         self._qdrant = qdrant
         self._col    = settings.QDRANT_COLLECTION
 
     def enrich(self, top_chunks: List[ScoredChunk]) -> List[Dict[str, Any]]:
-        fetched: Dict[str, Dict] = {}
+        lookups: List[tuple] = []
+        seen_cache_keys = set()
 
-        for chunk in top_chunks:
-            if len(fetched) >= _MAX_CROSS_REFS:
-                break
+        for chunk in top_chunks[:_TOP_CHUNKS_FOR_ENRICH]:
             xrefs = chunk.payload.get("cross_references") or {}
-            self._fetch_sections(xrefs.get("sections") or [], fetched)
-            self._fetch_rules(xrefs.get("rules") or [], fetched)
-            self._fetch_notifications(xrefs.get("notifications") or [], fetched)
-            self._fetch_circulars(xrefs.get("circulars") or [], fetched)
 
-        result = list(fetched.values())[:_MAX_CROSS_REFS]
-        logger.info(f"Cross-ref enrichment: {len(result)} extra chunks")
-        return result
+            for sec in (xrefs.get("sections") or []):
+                num = _bare_number(sec)
+                if num:
+                    ck = f"sec_{num}"
+                    if ck not in seen_cache_keys:
+                        lookups.append(("ext.section_number", num, ck))
+                        seen_cache_keys.add(ck)
 
-    def _fetch_sections(self, sections: List[str], out: Dict):
-        for sec in sections:
-            if len(out) >= _MAX_CROSS_REFS:
-                return
-            num = _bare_number(sec)
-            if not num:
-                continue
-            chunks = self._scroll("ext.section_number", num)
-            if chunks and f"sec_{num}" not in out:
-                out[f"sec_{num}"] = chunks[0]
+            for rule in (xrefs.get("rules") or []):
+                num = _bare_number(rule)
+                if num:
+                    ck = f"rule_{num}"
+                    if ck not in seen_cache_keys:
+                        lookups.append(("ext.rule_number_full", f"Rule {num}", ck))
+                        seen_cache_keys.add(ck)
 
-    def _fetch_rules(self, rules: List[str], out: Dict):
-        for rule in rules:
-            if len(out) >= _MAX_CROSS_REFS:
-                return
-            num = _bare_number(rule)
-            if not num:
-                continue
-            full = f"Rule {num}"
-            chunks = self._scroll("ext.rule_number_full", full)
-            if chunks and f"rule_{num}" not in out:
-                out[f"rule_{num}"] = chunks[0]
+            for notif in (xrefs.get("notifications") or []):
+                m = re.search(r"(\d+\s*/\s*\d+)", notif)
+                if m:
+                    num = re.sub(r"\s*", "", m.group(1))
+                    ck  = f"notif_{num}"
+                    if ck not in seen_cache_keys:
+                        lookups.append(("ext.notification_number", num, ck))
+                        seen_cache_keys.add(ck)
 
-    def _fetch_notifications(self, notifs: List[str], out: Dict):
-        for notif in notifs:
-            if len(out) >= _MAX_CROSS_REFS:
-                return
-            m = re.search(r"(\d+\s*/\s*\d+)", notif)
-            if not m:
-                continue
-            num = re.sub(r"\s*", "", m.group(1))
-            chunks = self._scroll("ext.notification_number", num)
-            if chunks and f"notif_{num}" not in out:
-                out[f"notif_{num}"] = chunks[0]
+            for circ in (xrefs.get("circulars") or []):
+                m = re.search(r"(\d+[/\-]\d+(?:[/\-]\d+)?)", circ)
+                if m:
+                    num = m.group(1)
+                    ck  = f"circ_{num}"
+                    if ck not in seen_cache_keys:
+                        lookups.append(("ext.circular_number", num, ck))
+                        seen_cache_keys.add(ck)
 
-    def _fetch_circulars(self, circs: List[str], out: Dict):
-        for circ in circs:
-            if len(out) >= _MAX_CROSS_REFS:
-                return
-            m = re.search(r"(\d+[/\-]\d+(?:[/\-]\d+)?)", circ)
-            if not m:
-                continue
-            num = m.group(1)
-            chunks = self._scroll("ext.circular_number", num)
-            if chunks and f"circ_{num}" not in out:
-                out[f"circ_{num}"] = chunks[0]
+        if not lookups:
+            return []
+
+        results: Dict[str, Dict] = {}
+        with ThreadPoolExecutor(max_workers=min(_ENRICH_WORKERS, len(lookups))) as ex:
+            future_map = {
+                ex.submit(self._scroll, key, value): cache_key
+                for key, value, cache_key in lookups
+            }
+            for future in as_completed(future_map):
+                cache_key = future_map[future]
+                try:
+                    chunks_found = future.result()
+                except Exception as e:
+                    logger.debug(f"Cross-ref fetch failed [{cache_key}]: {e}")
+                    continue
+
+                if chunks_found and cache_key not in results:
+                    results[cache_key] = chunks_found[0]
+                    if len(results) >= _MAX_CROSS_REFS:
+                        for f in future_map:
+                            f.cancel()
+                        break
+
+        result_list = list(results.values())[:_MAX_CROSS_REFS]
+        logger.info(f"Cross-ref enrichment: {len(result_list)} extra chunks "
+                    f"(from {len(lookups)} parallel lookups)")
+        return result_list
 
     def _scroll(self, key: str, value: str) -> List[Dict]:
         try:
@@ -230,7 +184,7 @@ class CrossRefEnricher:
             return []
 
 
-# -- LLM Responder -------------------------------------------------------------
+# ── LLM Responder ─────────────────────────────────────────────────────────────
 
 class LLMResponder:
 
@@ -246,7 +200,7 @@ class LLMResponder:
         citation_result: Optional[CitationResult],
         intent: IntentResult,
     ) -> FinalResponse:
-        """Non-streaming generation  -  returns complete FinalResponse."""
+        """Non-streaming generation — returns complete FinalResponse."""
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
         )
@@ -288,8 +242,9 @@ class LLMResponder:
         intent: IntentResult,
     ):
         """
-        Streaming generation  -  yields text chunks as they arrive from Bedrock.
-        Metadata yielded as final JSON event.
+        Streaming generation — yields text chunks as they arrive from Bedrock.
+        cross_ref_chunks are passed in pre-computed (done during stages 1-5 threadpool)
+        so this function can start streaming immediately without any Qdrant calls.
         """
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
@@ -334,7 +289,7 @@ class LLMResponder:
         parts = []
 
         if history:
-            parts.append("=== CONVERSATION HISTORY (last 3 turns) ===")
+            parts.append("=== CONVERSATION HISTORY (for context only — use ONLY if the current query explicitly references a prior exchange; do not let history bias or anchor the current answer) ===")
             for msg in history[-3:]:
                 parts.append(f"User: {msg.user_query}")
                 parts.append(
@@ -348,67 +303,141 @@ class LLMResponder:
                 f"=== PINNED JUDGMENT [{citation_result.citation}] ==="
             )
             for chunk in citation_result.chunks:
-                parts.append(_format_chunk(chunk, "[PINNED]"))
+                parts.append(_format_chunk(chunk, "[PINNED]", pinned=True))
             parts.append("")
 
         if top_chunks:
             parts.append("=== PRIMARY RETRIEVED CONTEXT ===")
             for i, sc in enumerate(top_chunks, 1):
                 label = f"[{i}] {sc.payload.get('chunk_type', '?').upper()}"
-                parts.append(_format_chunk(sc.payload, label))
+                parts.append(_format_chunk(sc.payload, label, pinned=sc.pinned))
             parts.append("")
 
-        if cross_refs:
-            parts.append("=== SUPPORTING REFERENCES ===")
-            for i, chunk in enumerate(cross_refs, 1):
-                label = f"[REF-{i}] {chunk.get('chunk_type', '?').upper()}"
-                parts.append(_format_chunk(chunk, label))
-            parts.append("")
-
+        # Cross-refs not sent to LLM — they appear in sources list only (frontend)
         parts.append("=== USER QUERY ===")
         parts.append(final_query)
         return "\n".join(parts)
 
 
-# -- Chunk formatting ----------------------------------------------------------
+# ── Chunk formatting ──────────────────────────────────────────────────────────
 
-def _format_chunk(chunk: Dict, label: str = "") -> str:
+def _format_chunk(chunk: Dict, label: str = "", pinned: bool = False) -> str:
+    """
+    Format a single chunk payload for the LLM prompt.
+
+    pinned=True  : chunk was retrieved by citation / party name / case number.
+                   For judgments the full case_note is sent — this is the exact
+                   case the user asked for and completeness matters.
+    pinned=False : chunk was retrieved by vector/BM25/scroll.
+                   For judgments case_note is capped at 800 chars to keep the
+                   total prompt manageable across 25 chunks (~5k tokens vs ~18k).
+
+    Rules:
+    - summary is NEVER sent to the LLM for any chunk type.
+    - sac_code chunks include ext.services when present.
+    - No truncation on any chunk type other than non-pinned judgments.
+    """
     lines = [f"--- {label} ---"] if label else []
     ext        = chunk.get("ext") or {}
     chunk_type = chunk.get("chunk_type", "")
 
-    if chunk.get("parent_doc"):
+    # Source sent for all chunk types except judgment
+    # (judgment identity comes from Case/Citation/Petitioner/Respondent fields)
+    if chunk.get("parent_doc") and chunk_type not in ("judgment", "circular", "gst_form", "gstat_form"):
         lines.append(f"Source: {chunk['parent_doc']}")
 
     if chunk_type == "judgment":
+        # Always send identifying metadata
         for f, k in [("Case", "case_name"), ("Citation", "citation"),
                      ("Court", "court"), ("Decision", "decision")]:
             v = ext.get(k)
             if v:
                 lines.append(f"{f}: {v.replace('_', ' ') if k == 'decision' else v}")
-        case_note = str(ext.get("case_note") or "").strip()
-        if case_note:
-            lines.append(f"Case Note:\n{case_note}")
+
+        if pinned:
+            case_note = str(ext.get("case_note") or "").strip()
+            if case_note:
+                lines.append(f"Case Note:\n{case_note}")
+            text = str(chunk.get("text") or "").strip()
+            if text:
+                lines.append(f"Text:\n{text}")
+            for lbl, key in [
+                ("Sections in Dispute", "sections_in_dispute"),
+                ("Act",                 "act"),
+                ("Petitioner",          "petitioner"),
+                ("Respondent",          "respondent"),
+                ("Bench",               "bench"),
+                ("Judgment Date",       "judgment_date"),
+            ]:
+                v = ext.get(key)
+                if v:
+                    lines.append(f"{lbl}: {v}")
         else:
+            for f2, k2 in [("Citation",   "citation"),
+                           ("Decision",   "decision"),
+                           ("Petitioner", "petitioner"),
+                           ("Respondent", "respondent"),
+                           ("Year",       "year")]:
+                v2 = ext.get(k2)
+                if v2:
+                    lines.append(f"{f2}: {v2.replace('_', ' ') if k2 == 'decision' else v2}")
             text = str(chunk.get("text") or "").strip()
             if text:
                 lines.append(f"Text:\n{text}")
 
-    elif chunk_type in ("notification", "circular"):
-        num  = ext.get("notification_number") or ext.get("circular_number", "")
-        date = ext.get("circular_date") or ext.get("year", "")
-        subj = ext.get("subject", "")
-        if num:
-            lines.append(f"Number: {num} ({date})")
-        if subj:
-            lines.append(f"Subject: {subj}")
+    elif chunk_type == "notification":
+        # Source: already carries full identity from parent_doc
+        # e.g. "Notification No.26/2017 – Central Tax"
+        for label2, key2 in [
+            ("Issued By", "issued_by"),
+            ("Period",    "applicable_period"),
+        ]:
+            v2 = ext.get(key2)
+            if v2:
+                lines.append(f"{label2}: {v2}")
+        headers = ext.get("table_headers")
+        if headers:
+            if isinstance(headers, list):
+                lines.append("Table Headers: " + " | ".join(str(h) for h in headers if h))
+            else:
+                lines.append(f"Table Headers: {headers}")
+        row_data = ext.get("row_data")
+        if row_data:
+            if isinstance(row_data, dict):
+                # dict: {column_name: cell_value} — format as key: value pairs
+                lines.append("Row Data: " + " | ".join(
+                    f"{k}: {v}" for k, v in row_data.items() if v is not None and str(v).strip()
+                ))
+            elif isinstance(row_data, list):
+                lines.append("Table Data:\n" + "\n".join(str(r) for r in row_data if r))
         text = str(chunk.get("text") or "").strip()
         if text:
-            lines.append(f"Text:\n{text[:1500]}")
+            lines.append(f"Text:\n{text}")
+
+    elif chunk_type == "circular":
+        # Circular: no number field — only subject, table_headers, row_data, text
+        subj = ext.get("subject", "")
+        if subj:
+            lines.append(f"Subject: {subj}")
+        headers = ext.get("table_headers")
+        if headers:
+            if isinstance(headers, list):
+                lines.append("Table Headers: " + " | ".join(str(h) for h in headers if h))
+            else:
+                lines.append(f"Table Headers: {headers}")
+        row_data = ext.get("row_data")
+        if row_data:
+            if isinstance(row_data, list):
+                lines.append("Table Data:\n" + "\n".join(str(r) for r in row_data if r))
+            else:
+                lines.append(f"Table Data:\n{row_data}")
+        text = str(chunk.get("text") or "").strip()
+        if text:
+            lines.append(f"Text:\n{text}")
 
     elif chunk_type in ("cgst_rule", "igst_rule", "gstat_rule"):
         lines.append(
-            f"Rule: {ext.get('rule_number_full', '')}  -  "
+            f"Rule: {ext.get('rule_number_full', '')} — "
             f"{ext.get('rule_title', '')}"
         )
         text = str(chunk.get("text") or "").strip()
@@ -417,7 +446,7 @@ def _format_chunk(chunk: Dict, label: str = "") -> str:
 
     elif chunk_type in ("cgst_section", "igst_section"):
         lines.append(
-            f"Section {ext.get('section_number', '')}  -  "
+            f"Section {ext.get('section_number', '')} — "
             f"{ext.get('section_title', '')} "
             f"({ext.get('act', '')})"
         )
@@ -425,21 +454,47 @@ def _format_chunk(chunk: Dict, label: str = "") -> str:
         if text:
             lines.append(f"Text:\n{text}")
 
-    elif chunk_type in ("hsn_code", "sac_code"):
-        code = ext.get("hsn_code") or ext.get("sac_code", "")
-        lines.append(f"Code: {code}")
+    elif chunk_type == "hsn_code":
+        lines.append(f"HSN Code: {ext.get('hsn_code', '')}")
+        chapter = ext.get("chapter_title", "")
+        sub     = ext.get("sub_chapter_title", "")
+        if chapter:
+            lines.append(f"Chapter: {chapter}")
+        if sub:
+            lines.append(f"Sub-Chapter: {sub}")
+        text = str(chunk.get("text") or "").strip()
+        if text:
+            lines.append(f"Text:\n{text}")
+
+    elif chunk_type == "sac_code":
+        lines.append(f"SAC Code: {ext.get('sac_code', '')}")
+        # Include service descriptions — the LLM needs these to determine
+        # the correct GST rate and classification for the service.
+        services = ext.get("services")
+        if services:
+            if isinstance(services, list):
+                lines.append("Services:" + "".join(f"  - {s}" for s in services if s))
+            else:
+                lines.append(f"Services:{services}")
+        text = str(chunk.get("text") or "").strip()
+        if text:
+            lines.append(f"Text:\n{text}")
+
+    elif chunk_type in ("gst_form", "gstat_form"):
+        form_name = ext.get("form_name", "")
+        if form_name:
+            lines.append(f"Form: {form_name}")
         text = str(chunk.get("text") or "").strip()
         if text:
             lines.append(f"Text:\n{text}")
 
     else:
-        text = str(chunk.get("text") or chunk.get("summary") or "").strip()
+        text = str(chunk.get("text") or "").strip()
         if text:
-            lines.append(f"Content:\n{text[:1500]}")
+            lines.append(f"Text:\n{text}")
 
-    summary = str(chunk.get("summary") or "").strip()
-    if summary and chunk_type not in ("judgment",):
-        lines.append(f"Summary: {summary[:300]}")
+    # summary is intentionally NOT sent to the LLM — it duplicates the text /
+    # case_note and adds tokens without adding information the LLM needs.
 
     return "\n".join(lines)
 
@@ -449,14 +504,39 @@ def _build_docs_list(
     cross_refs: List[Dict],
     citation_result: Optional[CitationResult],
 ) -> List[Dict]:
+    """
+    Build sources list for frontend. Deduplicated by identifier (citation).
+    One entry per unique citation — prevents the same judgment from appearing
+    10-18 times when multiple chunks of the same case were pinned.
+    """
     docs = []
+    seen_identifiers: set = set()
+
+    def _add(payload: Dict, label: str, score: float) -> None:
+        ext = payload.get("ext") or {}
+        identifier = (
+            ext.get("citation") or
+            ext.get("section_number") or
+            ext.get("rule_number_full") or
+            ext.get("notification_number") or
+            ext.get("circular_number") or
+            ext.get("form_name") or
+            ext.get("hsn_code") or
+            ext.get("sac_code") or ""
+        )
+        if identifier and identifier in seen_identifiers:
+            return
+        if identifier:
+            seen_identifiers.add(identifier)
+        docs.append(_doc_summary(payload, label, score))
+
     if citation_result and citation_result.found:
         for chunk in citation_result.chunks:
-            docs.append(_doc_summary(chunk, "pinned", 1.0))
+            _add(chunk, "pinned", 1.0)
     for sc in top_chunks:
-        docs.append(_doc_summary(sc.payload, "retrieved", sc.score))
+        _add(sc.payload, "retrieved", sc.score)
     for chunk in cross_refs:
-        docs.append(_doc_summary(chunk, "cross_reference", 0.0))
+        _add(chunk, "cross_reference", 0.0)
     return docs
 
 
