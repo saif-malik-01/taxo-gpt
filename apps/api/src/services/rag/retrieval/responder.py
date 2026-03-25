@@ -188,8 +188,9 @@ class CrossRefEnricher:
 
 class LLMResponder:
 
-    def __init__(self, llm: BedrockLLMClient):
+    def __init__(self, llm: BedrockLLMClient, qdrant: Optional[QdrantClient] = None):
         self._llm = llm
+        self._qdrant = qdrant
 
     def generate(
         self,
@@ -224,7 +225,7 @@ class LLMResponder:
         )
         if not answer:
             answer = "Unable to generate a response at this time. Please try again."
-        retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result)
+        retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
         return FinalResponse(
             answer=answer,
             retrieved_documents=retrieved_docs,
@@ -259,7 +260,7 @@ class LLMResponder:
             f"(intent={intent.intent} conf={intent.confidence} "
             f"chunks={len(top_chunks)} cross_refs={len(cross_ref_chunks)})"
         )
-        retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result)
+        retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
 
         for chunk in self._llm.call_stream(
             system_prompt=system_prompt,
@@ -503,6 +504,7 @@ def _build_docs_list(
     top_chunks: List[ScoredChunk],
     cross_refs: List[Dict],
     citation_result: Optional[CitationResult],
+    qdrant: Optional[QdrantClient] = None
 ) -> List[Dict]:
     """
     Build sources list for frontend. Deduplicated by identifier (citation).
@@ -511,6 +513,7 @@ def _build_docs_list(
     """
     docs = []
     seen_identifiers: set = set()
+    judgments_to_fetch = {}
 
     def _add(payload: Dict, label: str, score: float) -> None:
         ext = payload.get("ext") or {}
@@ -528,7 +531,13 @@ def _build_docs_list(
             return
         if identifier:
             seen_identifiers.add(identifier)
-        docs.append(_doc_summary(payload, label, score))
+            
+        summary_dict = _doc_summary(payload, label, score)
+        
+        if payload.get("chunk_type") == "judgment":
+            judgments_to_fetch[identifier] = payload
+            
+        docs.append(summary_dict)
 
     if citation_result and citation_result.found:
         for chunk in citation_result.chunks:
@@ -537,8 +546,67 @@ def _build_docs_list(
         _add(sc.payload, "retrieved", sc.score)
     for chunk in cross_refs:
         _add(chunk, "cross_reference", 0.0)
+        
+    if qdrant and judgments_to_fetch:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            future_to_id = {
+                ex.submit(_fetch_full_judgment, qdrant, payload): ident
+                for ident, payload in judgments_to_fetch.items()
+            }
+            for future in as_completed(future_to_id):
+                ident = future_to_id[future]
+                try:
+                    full_data = future.result()
+                    if full_data:
+                        for d in docs:
+                            if d.get("identifier") == ident:
+                                d["full_judgment"] = full_data
+                                break
+                except Exception as e:
+                    logger.error(f"Error fetching full judgment for {ident}: {e}")
+
     return docs
 
+def _fetch_full_judgment(qdrant: QdrantClient, payload: Dict) -> Dict:
+    file_hash = payload.get("_file_hash")
+    citation = payload.get("ext", {}).get("citation")
+    
+    if not file_hash and not citation:
+        return {}
+
+    must_cond = []
+    if file_hash:
+        must_cond.append(qmodels.FieldCondition(
+            key="_file_hash", match=qmodels.MatchValue(value=file_hash)
+        ))
+    elif citation:
+        must_cond.append(qmodels.FieldCondition(
+            key="ext.citation", match=qmodels.MatchValue(value=citation)
+        ))
+        
+    try:
+        results, _ = qdrant.scroll(
+            collection_name=settings.QDRANT_COLLECTION,
+            scroll_filter=qmodels.Filter(must=must_cond),
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+        )
+        
+        chunks = [r.payload for r in results if r.payload]
+        chunks.sort(key=lambda x: x.get("chunk_index", 0))
+        full_text = "\n\n".join([str(c.get("text") or "") for c in chunks])
+        
+        base_meta = chunks[0].get("ext", {}) if chunks else payload.get("ext", {})
+        
+        return {
+            "text": full_text.strip(),
+            "metadata": base_meta,
+            "total_chunks": len(chunks)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching full judgment: {e}")
+        return {}
 
 def _doc_summary(payload: Dict, label: str, score: float) -> Dict:
     ext = payload.get("ext") or {}

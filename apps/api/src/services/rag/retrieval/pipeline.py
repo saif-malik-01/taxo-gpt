@@ -55,7 +55,7 @@ class RetrievalPipeline:
         self._retrieval  = QdrantRetrieval(self._qdrant, self._bm25)
         self._scorer     = MetadataScorer()
         self._enricher   = CrossRefEnricher(self._qdrant)
-        self._responder  = LLMResponder(self._llm)
+        self._responder  = LLMResponder(self._llm, self._qdrant)
 
     def setup(self):
         logger.info("Pipeline setup starting...")
