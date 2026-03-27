@@ -5,6 +5,7 @@ import string
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from starlette.concurrency import run_in_threadpool
 
 from apps.api.src.db.session import get_redis, AsyncSessionLocal
 from apps.api.src.db.models.base import ChatSession, ChatMessage, UserProfile, User, SharedSession, UserUsage, CreditLog
@@ -21,25 +22,65 @@ logger = logging.getLogger(__name__)
 SESSION_KEY = "session:{}:history"
 
 async def get_session_history(session_id: str, limit: int = 50):
+    """
+    Returns history. If source_ids are present, hydrates them from Qdrant.
+    """
+    from apps.api.src.services.rag.retrieval.hydrator import hydrate_sources
+    from apps.api.src.services.chat.engine import get_pipeline
+    
     redis = await get_redis()
     key = SESSION_KEY.format(session_id)
     try:
         cached_history = await redis.lrange(key, 0, -1)
-        if cached_history: return [json.loads(msg) for msg in cached_history]
-    except Exception as e: logger.warning(f"Redis error: {e}")
-    
+        if cached_history: 
+            return [json.loads(msg) for msg in cached_history]
+    except Exception as e: 
+        logger.warning(f"Redis error: {e}")
+
     async with AsyncSessionLocal() as db:
-        res = await db.execute(select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.timestamp.desc()).limit(limit))
+        res = await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.timestamp.desc())
+            .limit(limit)
+        )
         messages = sorted(res.scalars().all(), key=lambda x: x.timestamp)
-        history = [{"id": m.id, "role": m.role, "content": m.content} for m in messages]
+        
+        history = []
+        for m in messages:
+            msg_dict = {
+                "id": m.id, 
+                "role": m.role, 
+                "content": m.content
+            }
+            if m.source_ids:
+                # Hydrate sources for this message
+                pipeline = await run_in_threadpool(get_pipeline)
+                sources = await hydrate_sources(m.source_ids, pipeline._qdrant)
+                msg_dict["sources"] = sources
+            
+            history.append(msg_dict)
+        logger.warning(f"Redis error {history}")
+    
+
         if history:
             try:
                 await redis.rpush(key, *[json.dumps(m) for m in history])
                 await redis.expire(key, 3600)
-            except Exception as e: logger.warning(f"Redis pop error: {e}")
+            except Exception as e: 
+                logger.warning(f"Redis cache push error: {e}")
         return history
 
-async def add_message(session_id: str, role: str, content: str, user_id: int = None, chat_mode: str = None, prompt_tokens: int = 0, response_tokens: int = 0):
+async def add_message(
+    session_id: str, 
+    role: str, 
+    content: str, 
+    user_id: int = None, 
+    chat_mode: str = None, 
+    prompt_tokens: int = 0, 
+    response_tokens: int = 0,
+    source_ids: list = None # New field
+):
     async with AsyncSessionLocal() as db:
         if user_id:
             exists = await db.execute(select(ChatSession.id).where(ChatSession.id == session_id))
@@ -48,16 +89,26 @@ async def add_message(session_id: str, role: str, content: str, user_id: int = N
                 db.add(ChatSession(id=session_id, user_id=user_id, title=content[:30], session_type=stype))
                 await db.commit()
         
-        new_msg = ChatMessage(session_id=session_id, role=role, content=content, prompt_tokens=prompt_tokens, response_tokens=response_tokens)
+        new_msg = ChatMessage(
+            session_id=session_id, 
+            role=role, 
+            content=content, 
+            prompt_tokens=prompt_tokens, 
+            response_tokens=response_tokens,
+            source_ids=source_ids # Save IDs
+        )
         db.add(new_msg)
         await db.commit()
         await db.refresh(new_msg)
         
+        # We don't cache individual messages in the list key here to avoid complexity
+        # The list key in Redis is purged when get_session_history is called or when it expires.
+        # However, for performance we often purge the Redis key on new messages.
         try:
             redis = await get_redis()
-            await redis.rpush(SESSION_KEY.format(session_id), json.dumps({"id": new_msg.id, "role": role, "content": content}))
-            await redis.expire(SESSION_KEY.format(session_id), 3600)
+            await redis.delete(SESSION_KEY.format(session_id))
         except Exception: pass
+        
         return new_msg
 
 async def get_user_profile(user_id: int):

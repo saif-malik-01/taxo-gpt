@@ -517,6 +517,7 @@ async def _handle_query_fallback(
             pending_q = None
 
     answer_parts = []
+    source_ids = []
     try:
         staged = await run_in_threadpool(
             pipeline.query_stages_1_to_5,
@@ -530,8 +531,14 @@ async def _handle_query_fallback(
                     meta = json.loads(raw_meta)
                 except Exception:
                     meta = {}
+                
+                # Capture IDs
+                for s in meta.get("retrieved_documents", []):
+                    if s.get("chunk_id"):
+                        source_ids.append(s["chunk_id"])
+
                 full_answer = "".join(answer_parts)
-                await add_message(session_id, "assistant", full_answer, user_id)
+                await add_message(session_id, "assistant", full_answer, user_id, source_ids=source_ids)
                 if _should_update_profile(question):
                     background_tasks.add_task(auto_update_profile, user_id, question, full_answer)
                 yield _emit({
@@ -894,7 +901,9 @@ async def _handle_draft_issues(
     full_reply_text += closing
 
     active_case["state"] = "complete"
-    asst = await add_message(session_id, "assistant", full_reply_text, user_id)
+    # Extract IDs from all collected sources
+    source_ids = [s.get("chunk_id") for s in all_sources if s.get("chunk_id")]
+    asst = await add_message(session_id, "assistant", full_reply_text, user_id, source_ids=source_ids)
     yield _retrieval_event(
         session_id,
         message_id=getattr(asst, "id", None),
@@ -1012,12 +1021,8 @@ async def _handle_update_reply(
             iss["status"] = "user_edited"
             break
 
-    asst = await add_message(session_id, "assistant", reply, user_id)
-    yield _retrieval_event(
-        session_id,
-        message_id=getattr(asst, "id", None),
-        sources=sources,
-    )
+    source_ids = [s.get("chunk_id") for s in sources if s.get("chunk_id")]
+    asst = await add_message(session_id, "assistant", reply, user_id, source_ids=source_ids)
     if _should_update_profile(target["text"]):
         background_tasks.add_task(auto_update_profile, user_id, target["text"], reply)
 
@@ -1057,6 +1062,7 @@ async def _handle_query_with_doc(
         augmented = f"[DOCUMENT CONTEXT]\n{doc_ctx[:4000]}\n\n[USER QUESTION]\n{question}"
 
     answer_parts = []
+    source_ids = []
     try:
         staged = await run_in_threadpool(
             pipeline.query_stages_1_to_5,
@@ -1070,8 +1076,14 @@ async def _handle_query_with_doc(
                     meta = json.loads(raw_meta)
                 except Exception:
                     meta = {}
+                
+                # Capture IDs
+                for s in meta.get("retrieved_documents", []):
+                    if s.get("chunk_id"):
+                        source_ids.append(s["chunk_id"])
+
                 full_answer = "".join(answer_parts)
-                await add_message(session_id, "assistant", full_answer, user_id)
+                await add_message(session_id, "assistant", full_answer, user_id, source_ids=source_ids)
                 await track_usage(user_id, session_id, db)
                 if _should_update_profile(question):
                     background_tasks.add_task(auto_update_profile, user_id, question, full_answer)

@@ -508,14 +508,13 @@ def _build_docs_list(
 ) -> List[Dict]:
     """
     Build sources list for frontend. Deduplicated by identifier (citation).
-    One entry per unique citation — prevents the same judgment from appearing
-    10-18 times when multiple chunks of the same case were pinned.
+    One entry per unique citation.
     """
     docs = []
     seen_identifiers: set = set()
     judgments_to_fetch = {}
 
-    def _add(payload: Dict, label: str, score: float) -> None:
+    def _add(payload: Dict, label: str, score: float, chunk_id: str = None) -> None:
         ext = payload.get("ext") or {}
         identifier = (
             ext.get("citation") or
@@ -527,12 +526,15 @@ def _build_docs_list(
             ext.get("hsn_code") or
             ext.get("sac_code") or ""
         )
-        if identifier and identifier in seen_identifiers:
+        if not identifier or identifier in seen_identifiers:
             return
-        if identifier:
-            seen_identifiers.add(identifier)
             
+        seen_identifiers.add(identifier)
         summary_dict = _doc_summary(payload, label, score)
+        # Store the original Qdrant point ID
+        resolved_id = chunk_id or payload.get("chunk_id") or payload.get("id")
+        if resolved_id:
+            summary_dict["chunk_id"] = str(resolved_id)
         
         if payload.get("chunk_type") == "judgment":
             judgments_to_fetch[identifier] = payload
@@ -541,9 +543,10 @@ def _build_docs_list(
 
     if citation_result and citation_result.found:
         for chunk in citation_result.chunks:
+            # For pinned chunks, try to find ID in payload
             _add(chunk, "pinned", 1.0)
     for sc in top_chunks:
-        _add(sc.payload, "retrieved", sc.score)
+        _add(sc.payload, "retrieved", sc.score, chunk_id=sc.chunk_id)
     for chunk in cross_refs:
         _add(chunk, "cross_reference", 0.0)
         
@@ -599,31 +602,53 @@ def _fetch_full_judgment(qdrant: QdrantClient, payload: Dict) -> Dict:
         
         base_meta = chunks[0].get("ext", {}) if chunks else payload.get("ext", {})
         
-        return {
-            "text": full_text.strip(),
-            "metadata": base_meta,
-            "total_chunks": len(chunks)
-        }
+        return _map_judgment_metadata(base_meta, full_text.strip())
     except Exception as e:
         logger.error(f"Error fetching full judgment: {e}")
         return {}
 
+def _map_judgment_metadata(ext: Dict, full_text: str) -> Dict:
+    """
+    Maps raw judgment metadata to the client-requested structure.
+    """
+    # Prefer case_name as title, fallback to Petitioner vs Respondent
+    title = ext.get("case_name") or f"{ext.get('petitioner', '')} vs {ext.get('respondent', '')}"
+    
+    return {
+        "citation": ext.get("citation", ""),
+        "title": title,
+        "case_number": ext.get("case_number", ""),
+        "court": ext.get("court", ""),
+        "state": ext.get("state", ""),
+        "year": str(ext.get("year", "")),
+        "judge": ext.get("bench", ""),
+        "petitioner": ext.get("petitioner", ""),
+        "respondent": ext.get("respondent", ""),
+        "decision": ext.get("decision", ""),
+        "current_status": ext.get("legal_status", "Closed"),
+        "law": ext.get("law", "GST"),
+        "act_name": ext.get("act", ""),
+        "section_number": ext.get("section_number") or ext.get("sections_in_dispute", ""),
+        "rule_name": ext.get("rule_name", ""),
+        "rule_number": ext.get("rule_number", ""),
+        "notification_number": ext.get("notification_number", ""),
+        "case_note": ext.get("case_note", ""),
+        "full_text": full_text
+    }
+
 def _doc_summary(payload: Dict, label: str, score: float) -> Dict:
     ext = payload.get("ext") or {}
     return {
-        "label":      label,
-        "score":      round(score, 4),
+        "chunk_id":   payload.get("chunk_id") or payload.get("id"), # Try to get ID
         "chunk_type": payload.get("chunk_type", ""),
-        "parent_doc": payload.get("parent_doc", ""),
-        "chunk_index": payload.get("chunk_index"),
-        "source":     (payload.get("provenance") or {}).get("source_file", ""),
+        "text":       payload.get("text", ""),
         "identifier": (
             ext.get("citation") or ext.get("section_number") or
             ext.get("rule_number_full") or ext.get("notification_number") or
             ext.get("circular_number") or ext.get("form_name") or
             ext.get("hsn_code") or ext.get("sac_code") or ""
         ),
-        "summary": str(payload.get("summary") or "")[:200],
+        "summary":    str(payload.get("summary") or "")[:200],
     }
 
 

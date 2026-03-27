@@ -136,13 +136,15 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id = Column(BigInteger, primary_key=True, index=True) # Changed to BigInteger
-    session_id = Column(String, ForeignKey("chat_sessions.id"), nullable=False)
+    session_id = Column(String, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
     role = Column(String, nullable=False) # 'user' or 'assistant'
     content = Column(Text, nullable=False)
     
     # Token Tracking (Session FUP)
     prompt_tokens = Column(Integer, default=0)
     response_tokens = Column(Integer, default=0)
+    
+    source_ids = Column(JSON, nullable=True)
     
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -154,7 +156,7 @@ class Feedback(Base):
     __tablename__ = "feedback"
 
     id = Column(Integer, primary_key=True, index=True)
-    message_id = Column(BigInteger, ForeignKey("chat_messages.id"), unique=True, nullable=False) # Changed to BigInteger
+    message_id = Column(BigInteger, ForeignKey("chat_messages.id", ondelete="CASCADE"), unique=True, nullable=False) # Changed to BigInteger
     rating = Column(Integer, nullable=False) # 1-5 or -1/1
     comment = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -166,7 +168,7 @@ class SharedSession(Base):
     __tablename__ = "shared_sessions"
 
     id = Column(String, primary_key=True, index=True) # Obfuscated ID (e.g., short UUID or random string)
-    session_id = Column(String, ForeignKey("chat_sessions.id"), nullable=False)
+    session_id = Column(String, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=True)
 

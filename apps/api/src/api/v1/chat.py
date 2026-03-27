@@ -45,6 +45,32 @@ async def get_history(session_id: str, user=Depends(auth_guard)):
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
     user_id = user.get("id")
+    
+    # Manually delete related records first to avoid foreign key violations
+    # if database-level cascade is missing.
+    await db.execute(
+        delete(SharedSession).where(SharedSession.session_id == session_id)
+    )
+    
+    # Feedback is linked to messages, so we delete messages (which should cascade through ORM
+    # but for direct DELETE we need to be careful. However, ChatMessage has cascade="all, delete-orphan"
+    # only for objects. For direct SQL DELETE, we must check if Feedback needs manual deletion)
+    # Let's just do it sequentially for safety.
+    
+    # Subquery to find all message IDs for this session
+    message_ids_query = select(ChatMessage.id).where(ChatMessage.session_id == session_id)
+    message_ids_res = await db.execute(message_ids_query)
+    msg_ids = message_ids_res.scalars().all()
+    
+    if msg_ids:
+        await db.execute(
+            delete(Feedback).where(Feedback.message_id.in_(msg_ids))
+        )
+        await db.execute(
+            delete(ChatMessage).where(ChatMessage.id.in_(msg_ids))
+        )
+
+    # Finally delete the session
     await db.execute(
         delete(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user_id)
     )
@@ -80,6 +106,7 @@ async def ask_gst_stream_simple(
 
             # ── Stream Response ────────────────────────────────────────────────
             full_response = ""
+            source_ids = []
             async for event in chat_stream(
                 query=question, 
                 history=history, 
@@ -87,6 +114,11 @@ async def ask_gst_stream_simple(
             ):
                 if event.get("type") == "content":
                     full_response += event.get("delta", "")
+                elif event.get("type") == "retrieval":
+                    # Capture IDs for hydration
+                    for s in event.get("sources", []):
+                        if s.get("chunk_id"):
+                            source_ids.append(s["chunk_id"])
                 
                 yield json.dumps(event) + "\n"
 
@@ -96,7 +128,7 @@ async def ask_gst_stream_simple(
                 
             # Make sure we save the bot message so history stays correct
             if full_response:
-                bot_msg = await add_message(session_id, "bot", full_response, user_id)
+                bot_msg = await add_message(session_id, "bot", full_response, user_id, source_ids=source_ids)
                 # Yield a final completion event with the message ID
                 yield json.dumps({
                     "type": "completion", 
@@ -136,6 +168,7 @@ async def ask_gst_stream_draft(
             profile_summary = profile.dynamic_summary if profile else None
 
             full_response = ""
+            source_ids = []
             async for event in chat_stream(
                 query=question, 
                 history=history, 
@@ -143,10 +176,14 @@ async def ask_gst_stream_draft(
             ):
                 if event.get("type") == "content":
                     full_response += event.get("delta", "")
+                elif event.get("type") == "retrieval":
+                    for s in event.get("sources", []):
+                        if s.get("chunk_id"):
+                            source_ids.append(s["chunk_id"])
                 yield json.dumps(event) + "\n"
 
             if full_response:
-                bot_msg = await add_message(session_id, "bot", full_response, user_id, chat_mode="draft")
+                bot_msg = await add_message(session_id, "bot", full_response, user_id, chat_mode="draft", source_ids=source_ids)
                 yield json.dumps({"type": "completion", "session_id": session_id, "message_id": bot_msg.id}) + "\n"
 
         except Exception as e:
