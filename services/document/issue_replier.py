@@ -1,11 +1,28 @@
 """
 services/document/issue_replier.py
-Generates draft replies for each extracted issue.
-Uses BedrockLLMClient + RetrievalPipeline.
 
-Retrieval priority for draft replies:
-    judgment, cgst_rule, igst_rule, notification, circular,
-    cgst_section, igst_section, gstat_rule, gst_form
+Generates draft replies for each extracted issue using:
+  1. Retrieval pipeline (stages 1-5) — finds relevant legal material
+  2. Mode-based reranking — boosts/demotes judgment chunks by decision type
+  3. LLM generation — drafts a precise, legally grounded reply
+
+Retrieval strategy per issue:
+  - The issue text (verbatim, with section/rule/notification references) is sent
+    to query_stages_1_to_5. Stage 2A regex extraction picks up section numbers,
+    rule numbers, notification/circular numbers from the issue text automatically.
+    Stage 4 then does direct field-match scrolls (scroll1/scroll2) for those.
+  - No keyword-based filtering — pipeline handles everything.
+  - After retrieval, apply mode-based reranking on judgment chunks.
+
+Mode-based reranking:
+  defensive: in_favour_of_assessee judgments → score × 1.4
+             in_favour_of_revenue judgments  → score × 0.5 (kept, ratio useful)
+  in_favour: in_favour_of_revenue judgments  → score × 1.4
+             in_favour_of_assessee judgments → score × 0.5
+
+Reference documents (from session_doc_store) are included in the reply prompt.
+Previous reply documents (replied_issues from doc_classifier) are ALSO included
+so the LLM maintains consistency with positions already taken.
 """
 
 import asyncio
@@ -20,25 +37,9 @@ logger = logging.getLogger(__name__)
 MODE_DEFENSIVE = "defensive"
 MODE_IN_FAVOUR = "in_favour"
 
-_IN_FAVOUR_KEYWORDS = [
-    "in favour of revenue", "in favor of revenue", "in favour of department",
-    "in favor of department", "against the taxpayer", "against the assessee",
-    "support the notice", "justify the notice", "authority is correct",
-    "department is correct", "uphold the allegation", "support the allegation",
-    "revenue's position", "department's position", "liability of taxpayer",
-]
-
-
-def detect_mode(question: str) -> str:
-    q = question.lower()
-    if any(kw in q for kw in _IN_FAVOUR_KEYWORDS):
-        return MODE_IN_FAVOUR
-    return MODE_DEFENSIVE
-
-
 # ── LLM client (lazy, thread-safe) ───────────────────────────────────────────
 
-_llm = None
+_llm      = None
 _llm_lock = threading.Lock()
 
 
@@ -54,7 +55,7 @@ def _get_llm():
 
 # ── Pipeline reference (injected at startup) ──────────────────────────────────
 
-_pipeline_ref = None
+_pipeline_ref  = None
 _pipeline_lock = threading.Lock()
 
 
@@ -63,18 +64,83 @@ def _get_pipeline():
 
 
 def set_pipeline(pipeline):
-    """Called once from main.py startup — injects the shared pipeline."""
     global _pipeline_ref
     with _pipeline_lock:
         _pipeline_ref = pipeline
 
 
-# ── Retrieval for draft replies ───────────────────────────────────────────────
+# ── Mode-based reranking ──────────────────────────────────────────────────────
 
-def _retrieve_for_issue(issue: str, mode: str, doc_summary: str = None) -> List[dict]:
+def _rerank_chunks_for_mode(chunks: list, mode: str) -> list:
     """
-    Use the RetrievalPipeline (stages 1-5 only) to find relevant legal material
-    for this issue. Returns a list of chunk payloads (plain dicts).
+    Rerank retrieved chunks based on the reply mode.
+
+    For DEFENSIVE mode:
+      Boost judgments decided in favour of assessee/taxpayer.
+      Demote (but keep) judgments in favour of revenue — ratio decidendi
+      of adverse judgments can still help distinguish the current facts.
+
+    For IN_FAVOUR mode:
+      Boost judgments decided in favour of revenue/department.
+      Demote judgments in favour of assessee.
+
+    Non-judgment chunks (sections, rules, notifications, circulars) are
+    NOT reranked — they are equally relevant regardless of mode.
+    """
+    if not chunks or mode not in (MODE_DEFENSIVE, MODE_IN_FAVOUR):
+        return chunks
+
+    reranked = []
+    for chunk in chunks:
+        score = getattr(chunk, "score", chunk.get("score", 0) if isinstance(chunk, dict) else 0)
+        payload = chunk.payload if hasattr(chunk, "payload") else chunk
+        chunk_type = payload.get("chunk_type", "")
+
+        if chunk_type == "judgment":
+            decision = (payload.get("ext") or {}).get("decision", "")
+
+            if mode == MODE_DEFENSIVE:
+                if "in_favour_of_assessee" in decision:
+                    score = score * 1.4
+                elif "in_favour_of_revenue" in decision:
+                    score = score * 0.5
+
+            elif mode == MODE_IN_FAVOUR:
+                if "in_favour_of_revenue" in decision:
+                    score = score * 1.4
+                elif "in_favour_of_assessee" in decision:
+                    score = score * 0.5
+
+        # Store adjusted score back
+        if hasattr(chunk, "score"):
+            chunk.score = score
+        else:
+            chunk["score"] = score
+        reranked.append(chunk)
+
+    return sorted(reranked, key=lambda c: (
+        c.score if hasattr(c, "score") else c.get("score", 0)
+    ), reverse=True)
+
+
+# ── Retrieval for a single issue ──────────────────────────────────────────────
+
+def _retrieve_for_issue(
+    issue: str,
+    mode: str,
+    doc_summary: str = None,
+) -> List[dict]:
+    """
+    Use the RetrievalPipeline (stages 1-5) to find legal material for this issue.
+
+    Query construction:
+      - Issue text is passed verbatim so regex extraction (Stage 2A) picks up
+        any section/rule/notification numbers embedded in the issue text.
+      - Stage 4 scroll1 then does direct field-match searches for those refs.
+      - Mode-based framing steers the vector search toward relevant case law.
+
+    After retrieval, apply mode-based reranking on judgment chunks.
+    Returns list of chunk payloads (plain dicts), top 15 after reranking.
     """
     pipeline = _get_pipeline()
     if pipeline is None:
@@ -83,29 +149,36 @@ def _retrieve_for_issue(issue: str, mode: str, doc_summary: str = None) -> List[
 
     if mode == MODE_DEFENSIVE:
         query = (
-            f"legal exceptions and relief available to assessee regarding {issue}. "
-            f"Judgments in favour of assessee. Sections, rules, notifications."
+            f"Legal exceptions, defences, and relief available to the assessee "
+            f"regarding: {issue}. "
+            f"Judgments in favour of assessee. Provisos and exceptions in sections. "
+            f"Circulars and notifications granting relief or clarification."
         )
     else:
         query = (
-            f"legal basis establishing taxpayer liability for {issue}. "
-            f"Judgments in favour of revenue. Sections, rules, notifications."
+            f"Legal basis and provisions establishing taxpayer liability regarding: {issue}. "
+            f"Judgments in favour of revenue/department. "
+            f"Sections, rules, and notifications confirming taxability or compliance obligation."
         )
 
     if doc_summary:
-        query += f" Context: {doc_summary[:200]}"
+        query += f" Context: {doc_summary[:300]}"
 
     try:
         staged = pipeline.query_stages_1_to_5(query, [])
         # staged = (final_query, history, chunks, citation_result, intent, cross_refs)
         chunks = staged[2]  # ScoredChunk list
-        return [c.payload for c in chunks[:15]]
+
+        # Apply mode-based reranking
+        reranked = _rerank_chunks_for_mode(chunks, mode)
+
+        return [c.payload for c in reranked[:15]]
     except Exception as e:
         logger.error(f"Issue retrieval failed: {e}")
         return []
 
 
-# ── Prompt builder ────────────────────────────────────────────────────────────
+# ── Chunk renderer for LLM prompt ────────────────────────────────────────────
 
 def _render_chunks(chunks: list) -> str:
     parts = []
@@ -113,15 +186,22 @@ def _render_chunks(chunks: list) -> str:
         chunk_type = c.get("chunk_type", "source").upper()
         ext        = c.get("ext") or {}
         source     = (
-            ext.get("citation") or
+            ext.get("citation")            or
             ext.get("notification_number") or
-            ext.get("circular_number") or
-            ext.get("rule_number_full") or
+            ext.get("circular_number")     or
+            ext.get("rule_number_full")    or
+            ext.get("section_number")      or
             c.get("parent_doc", "source")
         )
-        parts.append(f"[{chunk_type} | {source}]\n{c.get('text', '')}")
+        decision = ext.get("decision", "")
+        decision_tag = f" [{decision.replace('_', ' ')}]" if decision else ""
+        parts.append(
+            f"[{chunk_type} | {source}{decision_tag}]\n{c.get('text', '')}"
+        )
     return "\n\n".join(parts)
 
+
+# ── Prompt builder ────────────────────────────────────────────────────────────
 
 def _build_issue_prompt(
     issue: str,
@@ -134,6 +214,7 @@ def _build_issue_prompt(
     sender: str = None,
     doc_summary: str = None,
     reference_docs_text: str = None,
+    previous_replies_text: str = None,
 ) -> str:
 
     if mode == MODE_DEFENSIVE:
@@ -143,6 +224,7 @@ def _build_issue_prompt(
             "- Prioritise judgments decided in favour of the assessee.\n"
             "- Quote statutory wording, notifications, and judgment extracts precisely.\n"
             "- Ground every argument in a specific section, sub-section, proviso, or clause.\n"
+            "- Address any adverse judgments by distinguishing the facts.\n"
             "- Conclude by establishing that the allegation is not legally sustainable."
         )
     else:
@@ -169,13 +251,24 @@ def _build_issue_prompt(
             + reference_docs_text.strip() + "\n"
         )
 
+    prev_reply_block = ""
+    if previous_replies_text and previous_replies_text.strip():
+        prev_reply_block = (
+            "\n============================================================\n"
+            "PREVIOUS REPLIES (for related/older notices in this case)\n"
+            "IMPORTANT: Maintain consistency with positions already taken.\n"
+            "Do NOT contradict established facts. You may extend arguments.\n"
+            "============================================================\n"
+            + previous_replies_text.strip() + "\n"
+        )
+
     other_issues = [iss for idx, iss in enumerate(all_issues) if idx != issue_number - 1]
     other_block  = (
         "\n".join(f"{i+1}. {iss}" for i, iss in enumerate(other_issues))
         if other_issues else "This is the only issue."
     )
 
-    return f"""You are preparing the reply for Issue {issue_number} of {total_issues} from a legal notice.
+    return f"""You are preparing the reply for Issue {issue_number} of {total_issues}.
 
 ============================================================
 DOCUMENT DETAILS
@@ -186,7 +279,7 @@ DOCUMENT DETAILS
 DOCUMENT SUMMARY
 ============================================================
 {doc_summary.strip() if doc_summary else "Not available"}
-{ref_block}
+{ref_block}{prev_reply_block}
 ============================================================
 OTHER ISSUES IN THIS NOTICE (for consistency)
 ============================================================
@@ -207,21 +300,45 @@ Your reply must:
 2. Provide counter-arguments grounded in the specific facts of this notice.
 3. Cite specific sections, provisos, notifications, circulars, or judgments.
 4. For judgments — state the decision and apply the ratio to this issue.
-5. Conclude with a clear statement on why this issue should be decided in the client's favour.
+5. Address any conditions mentioned in rules/notifications that affect applicability.
+6. Conclude clearly on why this issue should be decided in the client's favour.
 
 LEGAL MATERIAL (judgments, sections, rules, notifications, circulars):
-{_render_chunks(chunks)}
+{_render_chunks(chunks) or "No specific legal material retrieved."}
 
 Write the reply for Issue {issue_number} only. Professional, precise, legally grounded.
-Do NOT add closing statement, signature block, or date.
+Do NOT add closing statement, signature block, or date — those are added separately.
 """
 
 
 _DOC_SYSTEM = (
     "You are a senior Indian tax law professional preparing formal legal draft replies "
     "to GST notices, show cause notices, and orders. "
-    "Your replies must be legally precise, cite exact provisions, and be professionally worded."
+    "Your replies must be legally precise, cite exact provisions, and be professionally worded. "
+    "Conditions in rules, notifications, and circulars that determine applicability "
+    "must be identified and used to strengthen the reply."
 )
+
+
+# ── Previous replies text builder ─────────────────────────────────────────────
+
+def _build_previous_replies_text(case: dict) -> str:
+    """
+    Build a text block of previous replies from uploaded reply documents.
+    These are the replied_issues pairs stored in doc entries.
+    """
+    parts = []
+    for doc in (case.get("documents") or []):
+        replied_issues = doc.get("replied_issues") or []
+        if not replied_issues:
+            continue
+        doc_type = doc.get("legal_doc_type", "previous reply")
+        parts.append(f"[{doc_type.upper()} — Previously submitted reply]")
+        for pair in replied_issues:
+            parts.append(f"Issue: {pair.get('issue_text', '')}")
+            parts.append(f"Reply given: {pair.get('reply_text', '')[:1000]}")
+            parts.append("")
+    return "\n".join(parts)
 
 
 # ── Core single-issue processor ───────────────────────────────────────────────
@@ -236,6 +353,7 @@ def _process_single_issue(
     sender: str = None,
     doc_summary: str = None,
     reference_docs_text: str = None,
+    previous_replies_text: str = None,
 ) -> Tuple[int, str, list, dict]:
     """
     Retrieve legal material + generate LLM reply for one issue.
@@ -249,7 +367,8 @@ def _process_single_issue(
 
         prompt = _build_issue_prompt(
             issue, issue_number, total_issues, all_issues,
-            chunks, mode, recipient, sender, doc_summary, reference_docs_text,
+            chunks, mode, recipient, sender, doc_summary,
+            reference_docs_text, previous_replies_text,
         )
 
         reply = _get_llm().call(
@@ -262,13 +381,9 @@ def _process_single_issue(
         if not reply:
             reply = f"[Could not generate reply for Issue {issue_number}]"
 
-        # Build sources list for frontend.
-        # Qdrant payloads store the original chunk id as "_chunk_id" (set in
-        # qdrant_manager.build_point). The Qdrant point id is a UUID5 and lives
-        # on the point, not in the payload — so c.get("id") would always be empty.
         sources = [
             {
-                "id":         c.get("_chunk_id", ""),   # ← fixed: was c.get("id", "")
+                "id":         c.get("_chunk_id", ""),
                 "chunk_type": c.get("chunk_type", ""),
                 "text":       (c.get("text") or "")[:300],
                 "metadata":   c.get("ext") or {},
@@ -299,19 +414,17 @@ async def process_issues_streaming(
     sender: str = None,
     doc_summary: str = None,
     reference_docs_text: str = None,
+    previous_replies_text: str = None,
     max_parallel: int = 3,
 ) -> AsyncGenerator[Tuple[int, str, list, dict], None]:
     """
     Async generator — yields (issue_number, reply, sources, usage)
-    in strict order (1, 2, 3…) regardless of which finishes first.
-    All issues up to max_parallel run concurrently in the threadpool.
+    in strict sequential order (1, 2, 3…) regardless of completion order.
+    Up to max_parallel issues run concurrently in threadpool.
     """
     total     = len(issues)
     semaphore = asyncio.Semaphore(max_parallel)
-
-    # Use get_running_loop() — get_event_loop() is deprecated since Python 3.10
-    loop = asyncio.get_running_loop()
-
+    loop      = asyncio.get_running_loop()
     futures: Dict[int, asyncio.Future] = {
         i + 1: loop.create_future() for i in range(total)
     }
@@ -322,7 +435,8 @@ async def process_issues_streaming(
                 result = await run_in_threadpool(
                     _process_single_issue,
                     issue, issue_number, total, issues,
-                    mode, recipient, sender, doc_summary, reference_docs_text,
+                    mode, recipient, sender, doc_summary,
+                    reference_docs_text, previous_replies_text,
                 )
                 futures[issue_number].set_result(result)
             except Exception as e:
@@ -340,7 +454,6 @@ async def process_issues_streaming(
         for i, issue in enumerate(issues)
     ]
 
-    # Yield results in strict sequential order
     for issue_num in range(1, total + 1):
         yield await futures[issue_num]
 

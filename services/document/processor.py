@@ -16,28 +16,51 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Shared boto3 session — one session, one connection pool per endpoint ──────
+# All Bedrock clients (Nova Lite pages + Qwen analysis) in this process share
+# this session so they draw from one pool instead of each maintaining their own
+# pool of 10. Without this, 30 concurrent Nova Lite calls + Qwen calls exhaust
+# the default pool of 10, causing "Connection pool is full" warnings and
+# serialisation delays.
+#
+# max_pool_connections=50: covers 30 concurrent page extractions + Qwen calls
+# with headroom. Set via BEDROCK_CONNECTION_POOL env var for tuning.
+_BEDROCK_POOL_SIZE = int(os.getenv("BEDROCK_CONNECTION_POOL", "50"))
+_SHARED_SESSION = boto3.Session()
+
+def _make_bedrock_client(config):
+    """Create a Bedrock runtime client from the shared session."""
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    return _SHARED_SESSION.client(
+        "bedrock-runtime",
+        region_name=region,
+        config=config,
+    )
+
 # ── Boto3 config for vision calls (AmazonNovaClient) ──────────────────────────
 # Nova Lite processes full-page images and returns verbatim page text.
 # With max_new_tokens=8192 a dense page can take 30-90s.
 # read_timeout=150s gives enough headroom.
-# max_attempts=1: disables botocore internal retries — we handle errors via
-# the ThreadPoolExecutor result (failed pages return an error string, not crash).
+# max_attempts=1: disables botocore internal retries.
+# max_pool_connections=50: allows 30 concurrent page extractions without
+#   pool saturation. Previously defaulted to 10, causing ~40s of connection
+#   contention warnings when 30 pages fired simultaneously.
 _NOVA_CONFIG = Config(
     read_timeout=150,
     retries={"max_attempts": 1, "mode": "standard"},
+    max_pool_connections=_BEDROCK_POOL_SIZE,
 )
 
 # ── Boto3 config for document analysis (DocumentAnalyzer / Qwen) ──────────────
 # _run_analysis requests up to 8192 output tokens for a large notice.
 # Qwen typically takes 30-120s for a full 8192-token response.
 # read_timeout=180s covers the slowest responses.
-# max_attempts=1: disables botocore retries — errors surface immediately to
-# _run_analysis's try/except which raises cleanly to analyze().
-# Previously: botocore default was 3 retries x 60s timeout = 180s per attempt,
-# causing the 5-minute hang seen in production logs.
+# max_attempts=1: disables botocore retries.
+# max_pool_connections=50: shared budget with Nova Lite calls above.
 _ANALYZER_CONFIG = Config(
     read_timeout=180,
     retries={"max_attempts": 1, "mode": "standard"},
+    max_pool_connections=_BEDROCK_POOL_SIZE,
 )
 
 
@@ -48,13 +71,9 @@ _ANALYZER_CONFIG = Config(
 class AmazonNovaClient:
     def __init__(self, model_id: str = "amazon.nova-lite-v1:0", region: str = None):
         self.model_id = model_id
-        if region is None:
-            region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
-        self.client = boto3.client(
-            'bedrock-runtime',
-            region_name=region,
-            config=_NOVA_CONFIG,
-        )
+        # Use the shared session so this client draws from the shared pool
+        # instead of creating its own pool of 10.
+        self.client = _make_bedrock_client(_NOVA_CONFIG)
 
     def describe_image(self, pil_image: Image.Image, prompt: str = None) -> str:
         max_size = 2048
@@ -261,7 +280,7 @@ class DocumentProcessor:
         bedrock_model: str = "amazon.nova-lite-v1:0",
         bedrock_region: str = None,
         dpi: int = 300,
-        max_workers: int = 10
+        max_workers: int = 25  # was 10; matches global semaphore default of 25
     ):
         if bedrock_region is None:
             bedrock_region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
@@ -300,6 +319,17 @@ class DocumentProcessor:
             return page_index, cleaned
         except Exception as e:
             return page_index, f"[Page {page_index + 1} extraction error: {str(e)}]"
+
+    def get_page_images(self, file_path: str) -> list:
+        """
+        Convert a document to a list of PIL page images WITHOUT extracting text.
+        Fast — no LLM calls. Used by the global semaphore extraction flow in
+        api/document.py which manages concurrency across all documents.
+
+        Returns: list of PIL.Image.Image (one per page)
+        Raises: ValueError for unsupported formats, ImportError for missing deps.
+        """
+        return _convert_to_images(file_path, dpi=self.dpi)
 
     def extract_text(self, file_path: str) -> str:
         page_images  = _convert_to_images(file_path, dpi=self.dpi)
@@ -388,13 +418,8 @@ class DocumentAnalyzer:
 
     def __init__(self, model_id: str = "qwen.qwen3-next-80b-a3b", region: str = None):
         self.model_id = model_id
-        if region is None:
-            region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
-        self.client = boto3.client(
-            'bedrock-runtime',
-            region_name=region,
-            config=_ANALYZER_CONFIG,
-        )
+        # Use the shared session — same pool as Nova Lite, no separate pool of 10.
+        self.client = _make_bedrock_client(_ANALYZER_CONFIG)
 
     def _run_analysis(self, extracted_text: str, user_question: Optional[str] = None) -> dict:
         prompt = f"""You are analyzing a legal document. Extract information ONLY from the document text provided.
@@ -500,26 +525,25 @@ OUTPUT FORMAT (JSON only):
             raise Exception(f"Re-extraction failed: {str(e)}")
 
     def _deduplicate_issues(self, issues: list) -> list:
-        if not issues:
-            return issues
-        seen   = []
-        unique = []
+        """Jaccard word-token deduplication (threshold 0.60)."""
+        def _tokens(s: str) -> set:
+            return set(re.findall(r'\b\w+\b', re.sub(r'\s+', ' ', s.lower().strip())))
+
+        seen: list[str] = []
+        unique: list[str] = []
         for issue in issues:
-            normalised = re.sub(r'\s+', ' ', issue.lower().strip())
+            n = re.sub(r'\s+', ' ', issue.lower().strip())
             is_dup = False
             for s in seen:
-                shorter = min(len(normalised), len(s))
-                if shorter == 0:
-                    continue
-                if normalised in s or s in normalised:
+                if n in s or s in n:
                     is_dup = True
                     break
-                common = sum(1 for a, b in zip(normalised, s) if a == b)
-                if common / shorter > 0.85:
+                ta, tb = _tokens(issue), _tokens(s)
+                if ta and tb and len(ta & tb) / len(ta | tb) >= 0.60:
                     is_dup = True
                     break
             if not is_dup:
-                seen.append(normalised)
+                seen.append(n)
                 unique.append(issue)
         return unique
 
