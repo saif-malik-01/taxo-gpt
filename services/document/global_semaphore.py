@@ -28,7 +28,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-MAX_CONCURRENT_PAGES = int(os.getenv("MAX_CONCURRENT_PAGES", "20"))
+MAX_CONCURRENT_PAGES = int(os.getenv("MAX_CONCURRENT_PAGES", "25"))
+# 25: doubles throughput vs 12 while staying within default Bedrock Nova Lite
+# quota (~50–100 RPM). Set MAX_CONCURRENT_PAGES env var to tune.
+# For production with quota increase to 500 RPM: safely push to 50.
 SEMAPHORE_BACKEND    = os.getenv("PAGE_SEMAPHORE_BACKEND", "asyncio")  # "asyncio" | "redis"
 
 # ── asyncio backend (default, single-worker) ─────────────────────────────────

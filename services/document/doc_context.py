@@ -81,6 +81,7 @@ def create_empty_context() -> dict:
         "active_case_id":         None,
         "cases":                  [],
         "_pending_confirmations": [],
+        "legal_entities_cache":   {},  # filename → raw entities dict from Track 2B
     }
 
 

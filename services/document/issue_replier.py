@@ -128,16 +128,19 @@ def _rerank_chunks_for_mode(chunks: list, mode: str) -> list:
 def _retrieve_for_issue(
     issue: str,
     mode: str,
-    doc_summary: str = None,
+    stage2b_result=None,    # pre-built Stage2BResult from Step 2B cache
 ) -> List[dict]:
     """
     Use the RetrievalPipeline (stages 1-5) to find legal material for this issue.
 
-    Query construction:
-      - Issue text is passed verbatim so regex extraction (Stage 2A) picks up
-        any section/rule/notification numbers embedded in the issue text.
-      - Stage 4 scroll1 then does direct field-match searches for those refs.
-      - Mode-based framing steers the vector search toward relevant case law.
+    Changes from previous version:
+      - stage2b_result: cached Stage2BResult from Step 2B passed in directly.
+        If provided, passes it to query_stages_1_to_5 to skip Stage 2B LLM
+        re-extraction per issue. Saves ~20s per issue.
+      - doc_summary removed from query: issue text already has all legal
+        entities verbatim. Summary adds noise to vector search.
+      - Conditions instruction added to query framing so retrieval biases
+        toward chunks containing applicability conditions.
 
     After retrieval, apply mode-based reranking on judgment chunks.
     Returns list of chunk payloads (plain dicts), top 15 after reranking.
@@ -152,27 +155,35 @@ def _retrieve_for_issue(
             f"Legal exceptions, defences, and relief available to the assessee "
             f"regarding: {issue}. "
             f"Judgments in favour of assessee. Provisos and exceptions in sections. "
+            f"Conditions in rules and notifications that exempt or exclude this situation. "
             f"Circulars and notifications granting relief or clarification."
         )
     else:
         query = (
             f"Legal basis and provisions establishing taxpayer liability regarding: {issue}. "
             f"Judgments in favour of revenue/department. "
-            f"Sections, rules, and notifications confirming taxability or compliance obligation."
+            f"Sections, rules, and notifications confirming taxability or compliance obligation. "
+            f"Conditions that trigger the obligation or liability."
         )
 
-    if doc_summary:
-        query += f" Context: {doc_summary[:300]}"
-
     try:
-        staged = pipeline.query_stages_1_to_5(query, [])
-        # staged = (final_query, history, chunks, citation_result, intent, cross_refs)
-        chunks = staged[2]  # ScoredChunk list
+        # Pass cached Stage2BResult if available — skips Stage 2B LLM call
+        if stage2b_result is not None:
+            try:
+                staged = pipeline.query_stages_1_to_5(
+                    query, [],
+                    prebuilt_stage2b=stage2b_result,
+                )
+            except TypeError:
+                # pipeline.query_stages_1_to_5 doesn't support prebuilt_stage2b yet
+                staged = pipeline.query_stages_1_to_5(query, [])
+        else:
+            staged = pipeline.query_stages_1_to_5(query, [])
 
-        # Apply mode-based reranking
+        chunks   = staged[2]  # ScoredChunk list
         reranked = _rerank_chunks_for_mode(chunks, mode)
-
         return [c.payload for c in reranked[:15]]
+
     except Exception as e:
         logger.error(f"Issue retrieval failed: {e}")
         return []
@@ -211,16 +222,16 @@ def _build_issue_prompt(
     chunks: list,
     mode: str,
     recipient: str = None,
-    sender: str = None,
     doc_summary: str = None,
     reference_docs_text: str = None,
     previous_replies_text: str = None,
 ) -> str:
-
+    # sender removed — legal arguments don't change based on which officer issued notice
     if mode == MODE_DEFENSIVE:
         mode_instruction = (
             "Prepare a strong defensive reply protecting the notice recipient.\n"
             "- Find every applicable legal exception, proviso, and precedent in the recipient's favour.\n"
+            "- Identify conditions in rules and notifications that EXCLUDE or EXEMPT this situation.\n"
             "- Prioritise judgments decided in favour of the assessee.\n"
             "- Quote statutory wording, notifications, and judgment extracts precisely.\n"
             "- Ground every argument in a specific section, sub-section, proviso, or clause.\n"
@@ -231,16 +242,14 @@ def _build_issue_prompt(
         mode_instruction = (
             "Prepare a reply establishing the legal basis for the allegation.\n"
             "- Find every provision and precedent supporting the revenue's position.\n"
+            "- Identify conditions in rules and notifications that TRIGGER the obligation.\n"
             "- Prioritise judgments decided in favour of revenue.\n"
             "- Quote statutory wording, notifications, and judgment extracts precisely.\n"
             "- Ground every argument in a specific section, sub-section, proviso, or clause.\n"
             "- Conclude by establishing that the obligation applies and the allegation is sustainable."
         )
 
-    doc_details = "\n".join(filter(None, [
-        f"Issuing Authority / Sender: {sender}"   if sender    else "",
-        f"Notice Recipient: {recipient}"           if recipient else "",
-    ])) or "Not specified"
+    doc_details = f"Notice Recipient: {recipient}" if recipient else "Recipient: Not specified"
 
     ref_block = ""
     if reference_docs_text and reference_docs_text.strip():
@@ -300,14 +309,16 @@ Your reply must:
 2. Provide counter-arguments grounded in the specific facts of this notice.
 3. Cite specific sections, provisos, notifications, circulars, or judgments.
 4. For judgments — state the decision and apply the ratio to this issue.
-5. Address any conditions mentioned in rules/notifications that affect applicability.
-6. Conclude clearly on why this issue should be decided in the client's favour.
+5. Identify and use conditions in rules/notifications: conditions that EXCLUDE
+   this situation (for defensive) or conditions that TRIGGER liability (for in_favour).
+6. Conclude with a clear statement on why this issue should be decided in the
+   client's favour (defensive) or why liability is established (in_favour).
 
 LEGAL MATERIAL (judgments, sections, rules, notifications, circulars):
 {_render_chunks(chunks) or "No specific legal material retrieved."}
 
 Write the reply for Issue {issue_number} only. Professional, precise, legally grounded.
-Do NOT add closing statement, signature block, or date — those are added separately.
+Do NOT add closing statement, signature block, or date.
 """
 
 
@@ -350,10 +361,10 @@ def _process_single_issue(
     all_issues: list,
     mode: str,
     recipient: str = None,
-    sender: str = None,
     doc_summary: str = None,
     reference_docs_text: str = None,
     previous_replies_text: str = None,
+    stage2b_result=None,    # cached from Step 2B, passed in for fast retrieval
 ) -> Tuple[int, str, list, dict]:
     """
     Retrieve legal material + generate LLM reply for one issue.
@@ -363,11 +374,12 @@ def _process_single_issue(
     try:
         logger.info(f"Processing Issue {issue_number}/{total_issues}: {issue[:80]}...")
 
-        chunks = _retrieve_for_issue(issue, mode, doc_summary)
+        # Use cached Stage2BResult — no re-extraction of legal entities
+        chunks = _retrieve_for_issue(issue, mode, stage2b_result=stage2b_result)
 
         prompt = _build_issue_prompt(
             issue, issue_number, total_issues, all_issues,
-            chunks, mode, recipient, sender, doc_summary,
+            chunks, mode, recipient, doc_summary,
             reference_docs_text, previous_replies_text,
         )
 
@@ -408,19 +420,23 @@ def _process_single_issue(
 # ── Async streaming generator ─────────────────────────────────────────────────
 
 async def process_issues_streaming(
-    issues: list,
+    issues: list,               # list of issue dicts: {id, text, source_doc, ...}
     mode: str,
-    recipient: str = None,
-    sender: str = None,
+    recipient: str = None,      # sender removed — doesn't affect legal arguments
     doc_summary: str = None,
     reference_docs_text: str = None,
     previous_replies_text: str = None,
+    stage2b_results: dict = None,  # {source_doc_filename: Stage2BResult} from cache
     max_parallel: int = 3,
 ) -> AsyncGenerator[Tuple[int, str, list, dict], None]:
     """
-    Async generator — yields (issue_number, reply, sources, usage)
-    in strict sequential order (1, 2, 3…) regardless of completion order.
+    Async generator — yields (issue_number, reply, sources, usage) in strict
+    sequential order (1, 2, 3…) regardless of completion order.
     Up to max_parallel issues run concurrently in threadpool.
+
+    stage2b_results: maps each issue's source_doc to its cached Stage2BResult
+    from Step 2B. Each issue uses its own document's pre-extracted legal entities
+    for retrieval — no re-extraction per issue.
     """
     total     = len(issues)
     semaphore = asyncio.Semaphore(max_parallel)
@@ -429,14 +445,27 @@ async def process_issues_streaming(
         i + 1: loop.create_future() for i in range(total)
     }
 
-    async def bounded_process(issue, issue_number):
+    # Build flat list of issue texts for the "other issues" block in prompts
+    all_issue_texts = [
+        (i["text"] if isinstance(i, dict) else i)
+        for i in issues
+    ]
+
+    async def bounded_process(issue_obj, issue_number):
         async with semaphore:
             try:
+                issue_text = issue_obj["text"] if isinstance(issue_obj, dict) else issue_obj
+                source_doc = issue_obj.get("source_doc") if isinstance(issue_obj, dict) else None
+
+                # Look up cached Stage2BResult for this issue's source document
+                stage2b = (stage2b_results or {}).get(source_doc) if source_doc else None
+
                 result = await run_in_threadpool(
                     _process_single_issue,
-                    issue, issue_number, total, issues,
-                    mode, recipient, sender, doc_summary,
+                    issue_text, issue_number, total, all_issue_texts,
+                    mode, recipient, doc_summary,
                     reference_docs_text, previous_replies_text,
+                    stage2b,
                 )
                 futures[issue_number].set_result(result)
             except Exception as e:

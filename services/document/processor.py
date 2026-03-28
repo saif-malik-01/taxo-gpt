@@ -279,8 +279,10 @@ class DocumentProcessor:
         self,
         bedrock_model: str = "amazon.nova-lite-v1:0",
         bedrock_region: str = None,
-        dpi: int = 300,
-        max_workers: int = 25  # was 10; matches global semaphore default of 25
+        dpi: int = 150,   # 300→150: Nova Lite downsamples to 2048px anyway.
+                           # 150 DPI gives ~1240×1754px — same effective quality,
+                           # 50% smaller image, 20–30% faster Bedrock upload per page.
+        max_workers: int = 10
     ):
         if bedrock_region is None:
             bedrock_region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
@@ -525,25 +527,26 @@ OUTPUT FORMAT (JSON only):
             raise Exception(f"Re-extraction failed: {str(e)}")
 
     def _deduplicate_issues(self, issues: list) -> list:
-        """Jaccard word-token deduplication (threshold 0.60)."""
-        def _tokens(s: str) -> set:
-            return set(re.findall(r'\b\w+\b', re.sub(r'\s+', ' ', s.lower().strip())))
-
-        seen: list[str] = []
-        unique: list[str] = []
+        if not issues:
+            return issues
+        seen   = []
+        unique = []
         for issue in issues:
-            n = re.sub(r'\s+', ' ', issue.lower().strip())
+            normalised = re.sub(r'\s+', ' ', issue.lower().strip())
             is_dup = False
             for s in seen:
-                if n in s or s in n:
+                shorter = min(len(normalised), len(s))
+                if shorter == 0:
+                    continue
+                if normalised in s or s in normalised:
                     is_dup = True
                     break
-                ta, tb = _tokens(issue), _tokens(s)
-                if ta and tb and len(ta & tb) / len(ta | tb) >= 0.60:
+                common = sum(1 for a, b in zip(normalised, s) if a == b)
+                if common / shorter > 0.85:
                     is_dup = True
                     break
             if not is_dup:
-                seen.append(n)
+                seen.append(normalised)
                 unique.append(issue)
         return unique
 

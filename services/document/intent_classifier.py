@@ -1,21 +1,22 @@
 """
 services/document/intent_classifier.py
 
-Two classification paths:
+Intent classification paths:
 
   classify_intent_no_docs(question, snapshot)
-    → Used when NO files are uploaded in this request.
-    → Full intent classification based on question + snapshot state.
+    → Used when NO files are uploaded. Full intent classification using
+      snapshot state + user message.
 
-  classify_intent_with_docs(question, doc_analyses, snapshot)
-    → Used AFTER per-doc metadata is extracted (files were uploaded).
-    → Determines what to do given the newly uploaded docs + user message.
-    → Doc metadata summaries are included so LLM knows what was uploaded.
+  classify_intent_with_docs() is REMOVED — intent is now extracted inside
+  the combined 2A+2C call in doc_classifier.analyze_document(). The intent
+  fields (intent, mode, issue_numbers, case_id) come back in the same JSON
+  as the document metadata — one Qwen call does both.
+
+  rewrite_query_if_needed(question, history, snapshot)
+    → Resolves referential language in text-only requests.
 
   parse_issue_update(message, current_issues)
-    → Parses corrections/merges/additions to the issues list (unchanged logic).
-
-No keyword/regex based classification — all LLM.
+    → Parses Case 5 issue list corrections.
 """
 
 import json

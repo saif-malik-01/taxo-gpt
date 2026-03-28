@@ -131,3 +131,51 @@ async def delete_session_documents(session_id: str):
             await db.delete(row)
         await db.commit()
         logger.info(f"Deleted {len(rows)} document text records for session={session_id}")
+
+
+async def get_text_by_filename(session_id: str, case_id: int, filename: str) -> str:
+    """
+    Return extracted text for one specific file in a session/case.
+    Used by Step 6 issue extraction to get per-doc text when multiple
+    primary docs exist in the same case.
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(SessionDocumentText)
+            .where(
+                SessionDocumentText.session_id == session_id,
+                SessionDocumentText.case_id    == case_id,
+                SessionDocumentText.filename   == filename,
+            )
+        )
+        row = result.scalars().first()
+    return (row.extracted_text or "").strip() if row else ""
+
+
+async def get_reply_reference_texts(session_id: str, case_id: int) -> str:
+    """
+    Return consolidated text of previous_reply and user_draft_reply documents.
+    Used in issue draft prompt to maintain consistency with prior positions.
+    """
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(SessionDocumentText)
+            .where(
+                SessionDocumentText.session_id == session_id,
+                SessionDocumentText.case_id    == case_id,
+                SessionDocumentText.doc_type   == "reply_reference",
+            )
+            .order_by(SessionDocumentText.created_at)
+        )
+        rows = result.scalars().all()
+
+    if not rows:
+        return ""
+
+    parts = []
+    for row in rows:
+        text = (row.extracted_text or "").strip()
+        if text:
+            parts.append(f"[REPLY REFERENCE: {row.filename}]\n{text}")
+
+    return "\n\n".join(parts)

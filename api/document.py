@@ -1,37 +1,31 @@
 """
 api/document.py
-Document feature router — complete redesign.
+Document feature router — v3 final architecture.
 
-Flow per request:
-  0. Setup: load history, snapshot; detect request type
-  1. Page extraction (if files): global asyncio semaphore, all pages all docs in parallel
-  2. Analysis:
-       With files → per-doc comprehensive LLM call (metadata+issues) in parallel,
-                    then intent classification using doc metadata + user message
-       No files   → intent classification only (using snapshot + user message)
-  3. Routing: pure logic, per document
-  4. Confirmation: emit prompt if ambiguous routing, save pending in snapshot
-  5. Snapshot update: save doc texts to DB (parallel) + update snapshot structure
-  6. Issue extraction merge: issues from analyses merged into snapshot
-  7. Intent routing: dispatch to case handler
-  8. Case handler execution: stream reply
+Request flow:
+  0. Setup: load history + snapshot; detect request type; query rewrite if needed
+  1. Page extraction (files only): global Semaphore(25), DPI=150, all pages parallel
+  2. Parallel tracks:
+       Track 2A+2C: combined Qwen call per doc (metadata + intent) — all docs parallel
+       Track 2B:    Qwen legal entity extraction + regex per doc — all docs parallel
+                    Both tracks fire simultaneously via asyncio.gather
+  3. Routing: pure logic per document (no LLM)
+  4. Confirmation: emit prompt for ambiguous docs, save pending in snapshot
+  5. Snapshot update + DB save (parallel with Step 6)
+  6. Issue extraction: dedicated Qwen calls for docs with has_issues=True (parallel)
+                       Replied-issues extraction for has_replied_issues=True (parallel)
+                       Both run parallel with DB save from Step 5
+  7. Intent routing: dispatch to case handler using intent from Track 2A+2C
+  8. Case handler: stream reply with pre-cached Stage2BResult for fast retrieval
   9. Persist snapshot (always in finally)
 
-Cases handled:
-  1  Upload + no question / summary request
-  2  Upload + direct draft reply intent
-  3  Upload + specific question about document
-  4  User confirms draft reply after summary shown
-  5  User corrects issues list
-  6  User updates a specific issue reply
-  7  Upload another doc, same case
-  8  Upload new doc, same parties different matter
-  9  Upload new doc, different parties
-  10 User switches back to previous case
-  11 User uploads reference document
-  +  Question only (no docs ever) → query chatbot fallback
-  +  Pending confirmation response
-  +  New draft reply in same session (user switches to different matter)
+Key changes vs previous version:
+  - Intent comes from combined 2A+2C result — no separate classify_intent_with_docs call
+  - Track 2B result cached in snapshot.legal_entities_cache[filename]
+  - Step 6 issue extraction is separate and parallel (not inside Step 2)
+  - process_issues_streaming receives stage2b_results dict — no re-extraction per issue
+  - sender removed from draft prompt, doc summary removed from retrieval query
+  - Binary classification: primary | reference (granular type stored for display only)
 """
 
 import asyncio
@@ -40,8 +34,9 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import uuid
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -53,7 +48,13 @@ from services.auth.deps import auth_guard
 from services.chat.memory_updater import auto_update_profile
 from services.database import get_db
 from services.document.doc_classifier import (
-    analyze_document, determine_route, reextract_missed_issues,
+    analyze_document,
+    determine_route,
+    entities_to_stage2b_result,
+    extract_issues,
+    extract_legal_entities,
+    extract_replied_issues,
+    reextract_missed_issues,
 )
 from services.document.doc_context import (
     add_case_to_context, add_document_to_case, append_user_context,
@@ -66,8 +67,9 @@ from services.document.doc_context import (
 )
 from services.document.global_semaphore import get_page_semaphore
 from services.document.intent_classifier import (
-    classify_intent_no_docs, classify_intent_with_docs,
-    parse_issue_update, rewrite_query_if_needed,
+    classify_intent_no_docs,
+    parse_issue_update,
+    rewrite_query_if_needed,
 )
 from services.document.issue_replier import (
     MODE_DEFENSIVE, MODE_IN_FAVOUR, _build_previous_replies_text,
@@ -76,7 +78,7 @@ from services.document.issue_replier import (
 from services.document.processor import get_document_processor
 from services.document.session_doc_store import (
     delete_session_documents, get_primary_texts, get_reference_texts,
-    save_document_text,
+    get_text_by_filename, save_document_text,
 )
 from services.memory import (
     add_message, check_credits, get_session_history, track_usage,
@@ -268,16 +270,32 @@ async def _extract_all_documents(
 
 # ─── Parallel document analysis ───────────────────────────────────────────────
 
-async def _analyze_all_documents(
+async def _run_tracks_2ac_and_2b(
     extracted_docs: list,
     resolved_question: str,
     snapshot: dict,
-) -> list:
+) -> tuple:
     """
-    Run comprehensive document analysis for each doc in parallel.
-    One LLM call per document: metadata + role + issues + replied_issues.
+    Step 2: Two parallel tracks for all uploaded documents.
+
+    Track 2A+2C (combined per doc, all docs parallel):
+      Single Qwen call → document metadata + intent classification together.
+      Intent fields (intent, mode, issue_numbers) come from this call.
+      No separate classify_intent_with_docs needed.
+
+    Track 2B (per doc, all docs parallel, independent of 2A+2C):
+      Qwen legal entity extraction + Stage2A regex simultaneously per doc.
+      Results cached in snapshot.legal_entities_cache[filename].
+      Used in Step 8A retrieval — no re-extraction per issue.
+
+    Both tracks fire simultaneously via asyncio.gather.
+    Total wait = max(slowest 2A+2C doc, slowest 2B doc).
+    2A+2C always dominates, so 2B adds zero time to critical path.
+
+    Returns: (analyses_list, entities_cache_dict)
+      analyses_list:      [{...metadata + intent fields, filename}] one per doc
+      entities_cache_dict: {filename: raw_entities_dict} for snapshot caching
     """
-    import time
     active_case      = get_active_case(snapshot)
     user_ctx_text    = get_user_context_text(active_case, limit=3) if active_case else ""
     active_snap_info = None
@@ -288,11 +306,12 @@ async def _analyze_all_documents(
             "legal_doc_type":   active_case.get("legal_doc_type"),
         }
 
+    # ── Track 2A+2C ───────────────────────────────────────────────────────────
     async def _analyze_one(doc: dict) -> dict:
         t0 = time.monotonic()
         logger.info(
-            f"Analysing '{doc['filename']}': {len(doc['full_text'])} chars "
-            f"via Qwen (issues + metadata)"
+            f"Track 2A+2C: analysing '{doc['filename']}' "
+            f"({len(doc['full_text'])} chars)"
         )
         result = await run_in_threadpool(
             analyze_document,
@@ -301,24 +320,75 @@ async def _analyze_all_documents(
             user_ctx_text,
             active_snap_info,
         )
+        result["filename"] = doc["filename"]
         logger.info(
-            f"Analysis done: '{doc['filename']}' — "
-            f"type={result.get('legal_doc_type')} "
-            f"is_primary={result.get('is_primary')} "
-            f"issues={len(result.get('issues') or [])} "
+            f"Track 2A+2C done: '{doc['filename']}' — "
+            f"classification={result.get('classification')} "
+            f"has_issues={result.get('has_issues')} "
+            f"intent={result.get('intent')} "
             f"({time.monotonic()-t0:.1f}s)"
         )
-        result["filename"] = doc["filename"]
         return result
 
+    # ── Track 2B ──────────────────────────────────────────────────────────────
+    async def _extract_entities_one(doc: dict) -> tuple:
+        t0 = time.monotonic()
+        logger.info(f"Track 2B: extracting entities from '{doc['filename']}'")
+        entities = await run_in_threadpool(
+            extract_legal_entities,
+            doc["full_text"],
+        )
+        logger.info(
+            f"Track 2B done: '{doc['filename']}' — "
+            f"sections={len(entities.get('sections',[]))} "
+            f"notifications={len(entities.get('notifications',[]))} "
+            f"({time.monotonic()-t0:.1f}s)"
+        )
+        return doc["filename"], entities
+
     t_all = time.monotonic()
-    logger.info(f"Starting parallel analysis: {len(extracted_docs)} document(s)")
-    analyses = await asyncio.gather(*[_analyze_one(doc) for doc in extracted_docs])
     logger.info(
-        f"All analysis done: {len(extracted_docs)} doc(s) in "
+        f"Step 2: starting {len(extracted_docs)} doc(s) — "
+        f"Track 2A+2C + Track 2B in parallel"
+    )
+
+    # Fire both tracks simultaneously
+    analyses_coros  = [_analyze_one(doc) for doc in extracted_docs]
+    entities_coros  = [_extract_entities_one(doc) for doc in extracted_docs]
+
+    all_results = await asyncio.gather(
+        *analyses_coros,
+        *entities_coros,
+        return_exceptions=True,
+    )
+
+    n = len(extracted_docs)
+    raw_analyses = all_results[:n]
+    raw_entities = all_results[n:]
+
+    # Process 2A+2C results
+    analyses_list = []
+    for r in raw_analyses:
+        if isinstance(r, Exception):
+            logger.error(f"Track 2A+2C failed for a doc: {r}")
+            analyses_list.append(None)
+        else:
+            analyses_list.append(r)
+
+    # Process 2B results
+    entities_cache = {}
+    for r in raw_entities:
+        if isinstance(r, Exception):
+            logger.error(f"Track 2B failed for a doc: {r}")
+        else:
+            filename, entities = r
+            entities_cache[filename] = entities
+
+    logger.info(
+        f"Step 2 complete: {len(extracted_docs)} doc(s) in "
         f"{time.monotonic()-t_all:.1f}s"
     )
-    return list(analyses)
+    return analyses_list, entities_cache
 
 
 # ─── Routing decision (pure logic) ────────────────────────────────────────────
@@ -571,17 +641,18 @@ async def _apply_routing_and_save(
 
 # ─── Issue merge from analyses ────────────────────────────────────────────────
 
-async def _merge_issues_from_analyses(
+async def _extract_all_issues(
     routing_plan: list,
     snapshot: dict,
     session_id: str,
 ) -> None:
     """
-    Merge issues extracted during document analysis into the active case's
-    issues list. Only runs for newly added primary documents.
+    Step 6: Extract issues from primary documents with has_issues=True.
+    Extract replied-issue pairs from docs with has_replied_issues=True.
+    Both run in parallel per document and across documents.
+    Also runs parallel with DB save from Step 5.
 
-    Also extracts issues from previous_reply documents (replied_issues pairs)
-    and marks them with has_reply_doc status.
+    Results merged into active case's issues list in snapshot.
     """
     active_case = get_active_case(snapshot)
     if not active_case:
@@ -589,69 +660,117 @@ async def _merge_issues_from_analyses(
 
     confirmed_primary = [
         r for r in routing_plan
-        if not r["needs_confirmation"]
+        if not r.get("needs_confirmation")
         and r["analysis"].get("is_primary")
         and not r["analysis"].get("is_previous_reply")
+        and not r["analysis"].get("is_user_draft_reply")
+    ]
+    reply_docs = [
+        r for r in routing_plan
+        if not r.get("needs_confirmation")
+        and (r["analysis"].get("is_previous_reply") or
+             r["analysis"].get("is_user_draft_reply") or
+             r["analysis"].get("has_replied_issues"))
     ]
 
-    for entry in confirmed_primary:
-        analysis = entry["analysis"]
+    async def _extract_issues_one(entry: dict):
         filename = entry["filename"]
-        new_issues = analysis.get("issues") or []
+        analysis = entry["analysis"]
+        if not analysis.get("has_issues"):
+            logger.debug(f"Step 6: skipping '{filename}' (has_issues=False)")
+            return filename, []
+        t0 = time.monotonic()
+        logger.info(f"Step 6: extracting issues from '{filename}'")
+        # Fetch this specific doc's text for focused extraction
+        full_text = await get_text_by_filename(session_id, active_case["case_id"], filename)
+        if not full_text:
+            # Fallback to consolidated primary text
+            full_text = await get_primary_texts(session_id, active_case["case_id"])
+        if not full_text:
+            return filename, []
+        new_issues = await run_in_threadpool(
+            extract_issues,
+            full_text,
+            active_case.get("issues", []),
+        )
+        logger.info(
+            f"Step 6 done: '{filename}' — {len(new_issues)} new issues "
+            f"({time.monotonic()-t0:.1f}s)"
+        )
+        return filename, new_issues
+
+    async def _extract_replied_one(entry: dict):
+        filename = entry["filename"]
+        analysis = entry["analysis"]
+        if not analysis.get("has_replied_issues"):
+            return filename, []
+        t0 = time.monotonic()
+        logger.info(f"Step 6: extracting replied-issue pairs from '{filename}'")
+        full_text = await get_text_by_filename(session_id, active_case["case_id"], filename)
+        if not full_text:
+            return filename, []
+        replied = await run_in_threadpool(extract_replied_issues, full_text)
+        logger.info(
+            f"Step 6 replied done: '{filename}' — {len(replied)} pairs "
+            f"({time.monotonic()-t0:.1f}s)"
+        )
+        return filename, replied
+
+    # Fire all extractions in parallel
+    issue_coros  = [_extract_issues_one(r) for r in confirmed_primary]
+    replied_coros = [_extract_replied_one(r) for r in reply_docs]
+    all_coros    = issue_coros + replied_coros
+
+    if not all_coros:
+        return
+
+    results = await asyncio.gather(*all_coros, return_exceptions=True)
+
+    # Merge new issues into snapshot
+    for r in results[:len(issue_coros)]:
+        if isinstance(r, Exception):
+            logger.error(f"Step 6 issue extraction error: {r}")
+            continue
+        filename, new_issues = r
         if new_issues:
+            from services.document.doc_context import merge_issues
             active_case["issues"] = merge_issues(
                 active_case.get("issues", []),
                 new_issues,
                 source_doc=filename,
             )
 
-    # Handle replied_issues from previous_reply documents
-    for entry in routing_plan:
-        if entry["needs_confirmation"]:
+    # Store replied-issue pairs on the matching doc entry
+    for r in results[len(issue_coros):]:
+        if isinstance(r, Exception):
+            logger.error(f"Step 6 replied-issue extraction error: {r}")
             continue
-        analysis = entry["analysis"]
-        if not analysis.get("is_previous_reply"):
-            continue
-        filename = entry["filename"]
-        replied_pairs = analysis.get("replied_issues") or []
-
-        for pair in replied_pairs:
-            issue_text  = pair.get("issue_text", "").strip()
-            reply_text  = pair.get("reply_text", "").strip()
-            if not issue_text:
-                continue
-
-            # Check if this issue already exists in the case
-            existing_issues = active_case.get("issues", [])
-            matched = None
-            for iss in existing_issues:
-                # 80% text similarity check
-                a = issue_text[:80].lower()
-                b = iss["text"][:80].lower()
-                common = sum(1 for x, y in zip(a, b) if x == y)
-                shorter = min(len(a), len(b))
-                if shorter > 0 and common / shorter > 0.80:
-                    matched = iss
+        filename, replied_pairs = r
+        if replied_pairs:
+            for doc_entry in active_case.get("documents", []):
+                if doc_entry["filename"] == filename:
+                    doc_entry["replied_issues"] = replied_pairs
                     break
+            # Mark matching issues as has_reply_doc
+            for pair in replied_pairs:
+                issue_text = pair.get("issue_text", "")
+                for iss in active_case.get("issues", []):
+                    a = issue_text[:80].lower()
+                    b = iss["text"][:80].lower()
+                    shorter = min(len(a), len(b))
+                    if shorter > 0:
+                        common = sum(1 for x, y in zip(a, b) if x == y)
+                        if common / shorter > 0.80:
+                            if not iss.get("reply"):
+                                iss["status"]       = "has_reply_doc"
+                                iss["replied_by_doc"] = filename
+                            break
 
-            if matched:
-                if not matched.get("reply"):
-                    matched["status"]       = "has_reply_doc"
-                    matched["replied_by_doc"] = filename
-            else:
-                # New issue from the reply doc (not yet in primary extraction)
-                new_id = max((i["id"] for i in existing_issues), default=0) + 1
-                existing_issues.append({
-                    "id":           new_id,
-                    "text":         issue_text,
-                    "source_doc":   filename,
-                    "reply":        None,
-                    "status":       "has_reply_doc",
-                    "replied_by_doc": filename,
-                })
-
-    # Rebuild case summary from all primary doc brief_summaries
+    # Rebuild case summary
     active_case["summary"] = build_case_summary(active_case)
+
+
+# ─── Issue extraction helper (single doc text) ────────────────────────────────
 
 
 # ─── Pending confirmation resolution ─────────────────────────────────────────
@@ -722,7 +841,7 @@ async def _resolve_pending_confirmations(
             fake_extracted.append({"filename": r["filename"], "full_text": full_text})
 
         await _apply_routing_and_save(resolved, fake_extracted, snapshot, session_id)
-        await _merge_issues_from_analyses(resolved, snapshot, session_id)
+        await _extract_all_issues(resolved, snapshot, session_id)
 
     if still_pending:
         msg = pending[0].get("confirmation_message", "Could you please clarify?")
@@ -890,28 +1009,37 @@ async def _handle_draft_issues(
     question: str,
     background_tasks: BackgroundTasks,
     db: AsyncSession,
+    snapshot: dict = None,
 ) -> AsyncGenerator[str, None]:
     mode        = active_case.get("mode", MODE_DEFENSIVE)
     recipient   = (active_case.get("parties") or {}).get("recipient")
-    sender      = (active_case.get("parties") or {}).get("sender")
     doc_summary = active_case.get("summary", "")
     total_global = len(active_case["issues"])
 
-    ref_text           = await get_reference_texts(session_id, active_case["case_id"])
-    previous_replies   = _build_previous_replies_text(active_case)
+    ref_text         = await get_reference_texts(session_id, active_case["case_id"])
+    previous_replies = _build_previous_replies_text(active_case)
+
+    # Build Stage2BResult cache from snapshot for each issue's source_doc
+    stage2b_results: Dict[str, object] = {}
+    entities_cache = (snapshot or {}).get("legal_entities_cache", {})
+    for filename, raw_entities in entities_cache.items():
+        try:
+            stage2b_results[filename] = entities_to_stage2b_result(raw_entities)
+        except Exception as e:
+            logger.debug(f"Could not build Stage2BResult for '{filename}': {e}")
 
     all_sources     = []
     full_reply_text = ""
     active_case["state"] = "reply_in_progress"
 
     async for issue_number, reply, sources, usage in process_issues_streaming(
-        issues=[i["text"] for i in issues_to_draft],
+        issues=issues_to_draft,          # list of issue dicts with source_doc
         mode=mode,
         recipient=recipient,
-        sender=sender,
         doc_summary=doc_summary,
         reference_docs_text=ref_text,
         previous_replies_text=previous_replies,
+        stage2b_results=stage2b_results,
         max_parallel=3,
     ):
         await track_usage(user_id, session_id, db, usage=usage)
@@ -1026,6 +1154,7 @@ async def _handle_update_reply(
     session_id: str,
     user_id: int,
     background_tasks: BackgroundTasks,
+    snapshot: dict = None,
 ) -> AsyncGenerator[str, None]:
     from services.document.issue_replier import _process_single_issue
 
@@ -1040,12 +1169,22 @@ async def _handle_update_reply(
 
     mode        = active_case.get("mode", MODE_DEFENSIVE)
     recipient   = (active_case.get("parties") or {}).get("recipient")
-    sender      = (active_case.get("parties") or {}).get("sender")
     doc_summary = active_case.get("summary", "")
     ref_text    = await get_reference_texts(session_id, active_case["case_id"])
     prev_replies = _build_previous_replies_text(active_case)
     all_texts    = [i["text"] for i in all_issues]
     issue_num    = (all_texts.index(target["text"]) + 1) if target["text"] in all_texts else 1
+
+    # Get cached Stage2BResult for this issue's source document
+    stage2b = None
+    source_doc = target.get("source_doc")
+    if source_doc and snapshot:
+        raw_ent = snapshot.get("legal_entities_cache", {}).get(source_doc)
+        if raw_ent:
+            try:
+                stage2b = entities_to_stage2b_result(raw_ent)
+            except Exception:
+                pass
 
     header = f"\n\n---\n\n### Updated Reply — Issue {issue_id}\n\n> {target['text']}\n\n"
     yield _content(header)
@@ -1053,7 +1192,7 @@ async def _handle_update_reply(
     _, reply, sources, _ = await run_in_threadpool(
         _process_single_issue,
         target["text"], issue_num, len(all_issues), all_texts,
-        mode, recipient, sender, doc_summary, ref_text, prev_replies,
+        mode, recipient, doc_summary, ref_text, prev_replies, stage2b,
     )
 
     for i in range(0, len(reply), 50):
@@ -1260,20 +1399,31 @@ async def document_stream(
 
             # ── Step 2: Analysis ───────────────────────────────────────────
             doc_analyses  = []
+            entities_cache: Dict[str, dict] = {}
             intent_result = {}
 
             if has_files:
-                # Per-doc comprehensive analysis (parallel)
-                doc_analyses = await _analyze_all_documents(
+                # Track 2A+2C + Track 2B — fire simultaneously
+                doc_analyses, entities_cache = await _run_tracks_2ac_and_2b(
                     extracted_docs, resolved_question, snapshot
                 )
-                # Intent classification (sequential, needs doc metadata)
-                intent_result = await run_in_threadpool(
-                    classify_intent_with_docs,
-                    resolved_question, doc_analyses, snapshot
+                # Remove None results from failed analyses
+                doc_analyses = [a for a in doc_analyses if a is not None]
+
+                # Intent comes from combined 2A+2C result.
+                # Use the first primary doc's intent, or the first doc's intent.
+                primary_analysis = next(
+                    (a for a in doc_analyses if a.get("is_primary")),
+                    doc_analyses[0] if doc_analyses else {}
                 )
+                intent_result = {
+                    "intent":       primary_analysis.get("intent", "summarize"),
+                    "mode":         primary_analysis.get("mode"),
+                    "issue_numbers": primary_analysis.get("issue_numbers", []),
+                    "case_id":      primary_analysis.get("case_id"),
+                }
             else:
-                # Intent only — no docs in this request
+                # Text-only request — intent classification only
                 intent_result = await run_in_threadpool(
                     classify_intent_no_docs, resolved_question, snapshot
                 )
@@ -1300,7 +1450,7 @@ async def document_stream(
                     await _apply_routing_and_save(
                         confirmed, extracted_docs, snapshot, session_id
                     )
-                    await _merge_issues_from_analyses(confirmed, snapshot, session_id)
+                    await _extract_all_issues(confirmed, snapshot, session_id)
 
                 # Store pending in snapshot
                 snapshot["_pending_confirmations"] = [
@@ -1324,11 +1474,19 @@ async def document_stream(
 
             # ── Step 5: Apply routing ──────────────────────────────────────
             if confirmed:
-                await _apply_routing_and_save(
-                    confirmed, extracted_docs, snapshot, session_id
+                # Cache Stage2BResult entities in snapshot for Step 8
+                snapshot.setdefault("legal_entities_cache", {})
+                for filename, raw_entities in entities_cache.items():
+                    snapshot["legal_entities_cache"][filename] = raw_entities
+
+                # DB save + issue extraction run in parallel
+                await asyncio.gather(
+                    _apply_routing_and_save(
+                        confirmed, extracted_docs, snapshot, session_id
+                    ),
+                    # Step 6 fires here in parallel with DB save
+                    _extract_all_issues(confirmed, snapshot, session_id),
                 )
-                # ── Step 6: Merge issues from analyses ─────────────────────
-                await _merge_issues_from_analyses(confirmed, snapshot, session_id)
 
             # Reload active case after routing
             active_case = get_active_case(snapshot)
@@ -1384,7 +1542,7 @@ async def document_stream(
                         else:
                             async for chunk in _handle_draft_issues(
                                 active_case, issues_to_draft, session_id, user_id,
-                                resolved_question, background_tasks, db
+                                resolved_question, background_tasks, db, snapshot
                             ):
                                 yield chunk
 
@@ -1414,7 +1572,7 @@ async def document_stream(
                         else:
                             async for chunk in _handle_draft_issues(
                                 active_case, issues_to_draft, session_id, user_id,
-                                resolved_question, background_tasks, db
+                                resolved_question, background_tasks, db, snapshot
                             ):
                                 yield chunk
 
@@ -1442,7 +1600,7 @@ async def document_stream(
                         else:
                             async for chunk in _handle_draft_issues(
                                 active_case, issues_to_draft, session_id, user_id,
-                                resolved_question, background_tasks, db
+                                resolved_question, background_tasks, db, snapshot
                             ):
                                 yield chunk
 
@@ -1470,7 +1628,7 @@ async def document_stream(
                     await add_message(session_id, "assistant", msg, user_id)
                 else:
                     async for chunk in _handle_update_reply(
-                        active_case, issue_numbers[0], session_id, user_id, background_tasks
+                        active_case, issue_numbers[0], session_id, user_id, background_tasks, snapshot
                     ):
                         yield chunk
 
