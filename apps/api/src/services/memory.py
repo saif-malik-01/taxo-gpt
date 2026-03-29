@@ -2,6 +2,7 @@ import json
 import logging
 import secrets
 import string
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -60,8 +61,6 @@ async def get_session_history(session_id: str, limit: int = 50):
                 msg_dict["sources"] = sources
             
             history.append(msg_dict)
-        logger.warning(f"Redis error {history}")
-    
 
         if history:
             try:
@@ -124,13 +123,23 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession, usage: di
         db.add(user_usage)
         await db.flush()
 
+    # --- Token tracking (lifetime analytics + monthly window) ---
     if usage:
-        user_usage.total_tokens_used = (user_usage.total_tokens_used or 0) + usage.get("totalTokens", 0)
+        input_t  = usage.get("inputTokens",  0)
+        output_t = usage.get("outputTokens", 0)
+        total_t  = usage.get("totalTokens",  input_t + output_t)
+        # Lifetime accumulators
+        user_usage.input_tokens_used  = (user_usage.input_tokens_used  or 0) + input_t
+        user_usage.output_tokens_used = (user_usage.output_tokens_used or 0) + output_t
+        user_usage.total_tokens_used  = (user_usage.total_tokens_used  or 0) + total_t
+        # Monthly rolling window (for abuse guard)
+        user_usage.monthly_tokens_used = (user_usage.monthly_tokens_used or 0) + total_t
 
+    # --- Per-query balance deduction ---
     if force_deduct:
-        # Credit deduction logic simplified for now
-        user_usage.simple_query_used = (user_usage.simple_query_used or 0) + 1
-    
+        user_usage.simple_query_used    = (user_usage.simple_query_used    or 0) + 1
+        user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 1_000_000) - 1)
+
     await db.commit()
 
 async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession, chat_mode: str = None, extra_tokens: int = 0):
@@ -140,9 +149,83 @@ async def check_credits(user_id: int, session_id: str, has_files: bool, db: Asyn
         usage = UserUsage(user_id=user_id)
         db.add(usage)
         await db.commit()
-    
-    # Static check for simple queries for now
-    if usage.simple_query_balance <= 0:
-        return False, "Insufficient balance."
+
+    # --- Guard 1: Balance check ---
+    if (usage.simple_query_balance or 0) <= 0:
+        return False, "Insufficient balance. Please upgrade your plan."
+
+    # --- Guard 2: Monthly token abuse guard (lazy 30-day rolling window reset) ---
+    now = datetime.now(timezone.utc)
+    reset_date = usage.monthly_reset_date
+    # Normalise to UTC if DB returns a naive datetime
+    if reset_date is not None and reset_date.tzinfo is None:
+        reset_date = reset_date.replace(tzinfo=timezone.utc)
+
+    if reset_date is None or (now - reset_date) >= timedelta(days=30):
+        # New month window — reset the counter
+        usage.monthly_tokens_used = 0
+        usage.monthly_reset_date  = now
+        await db.commit()
+        logger.info(f"Monthly token window reset for user {user_id}")
+    elif (usage.monthly_tokens_used or 0) >= settings.GLOBAL_MONTHLY_TOKEN_LIMIT:
+        limit_m = settings.GLOBAL_MONTHLY_TOKEN_LIMIT // 1_000_000
+        next_reset = reset_date + timedelta(days=30)
+        days_left = max(0, (next_reset - now).days)
+        return False, (
+            f"You have reached the monthly usage limit of {limit_m}M tokens. "
+            f"Your limit resets in {days_left} day(s)."
+        )
+
+    # --- Guard 3: Per-session token cap (FUP) ---
+    # Token limit: 100K for simple chat, 60K for draft sessions.
+    token_limit = (
+        settings.SESSION_TOKEN_LIMIT_DRAFT
+        if chat_mode == "draft"
+        else settings.SESSION_TOKEN_LIMIT_SIMPLE
+    )
+    session_token_res = await db.execute(
+        select(
+            sa_func.coalesce(
+                sa_func.sum(ChatMessage.prompt_tokens + ChatMessage.response_tokens), 0
+            )
+        ).where(ChatMessage.session_id == session_id)
+    )
+    session_tokens_used = session_token_res.scalar() or 0
+
+    if session_tokens_used >= token_limit:
+        limit_k = token_limit // 1000
+        return False, (
+            f"This session has reached its {limit_k}K token limit. "
+            "Please start a new session to continue."
+        )
 
     return True, None
+
+async def edit_message_and_truncate(session_id: str, message_id: int, new_content: str):
+    """
+    Updates a message's content and deletes all subsequent messages in the session.
+    """
+    from sqlalchemy import delete
+    async with AsyncSessionLocal() as db:
+        # 1. Update the message
+        res = await db.execute(select(ChatMessage).where(ChatMessage.id == message_id))
+        msg = res.scalars().first()
+        if msg:
+            msg.content = new_content
+            # 2. Delete all messages created AFTER this one in the same session
+            # We assume message IDs are sequential for a session.
+            await db.execute(
+                delete(ChatMessage).where(
+                    ChatMessage.session_id == session_id,
+                    ChatMessage.id > message_id
+                )
+            )
+            await db.commit()
+            
+            # 3. Invalidate Redis cache
+            try:
+                redis = await get_redis()
+                await redis.delete(SESSION_KEY.format(session_id))
+            except Exception as e:
+                logger.warning(f"Redis cache delete error in edit: {e}")
+        return msg

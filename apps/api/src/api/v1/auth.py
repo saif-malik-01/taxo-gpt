@@ -1,7 +1,7 @@
 import logging
 import uuid
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from sqlalchemy import func
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +14,7 @@ import httpx
 from apps.api.src.services.auth.jwt import create_access_token
 from apps.api.src.services.auth.utils import verify_password, get_password_hash
 from apps.api.src.services.auth.deps import auth_guard
-from apps.api.src.db.session import get_db, add_session, remove_session
+from apps.api.src.db.session import get_db, add_session, remove_session, list_sessions, heartbeat_session
 from apps.api.src.db.models.base import User, UserProfile, UserUsage
 from apps.api.src.core.config import settings
 
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
 
 @router.post("/login", response_model=LoginResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(payload: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     email = payload.email.lower()
     result = await db.execute(select(User).where(func.lower(User.email) == email))
     user = result.scalars().first()
@@ -43,10 +43,16 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Email not verified. Please check your inbox.")
 
     session_id = str(uuid.uuid4())
+    metadata = {
+        "ip": request.client.host if request.client else "unknown",
+        "user_agent": request.headers.get("user-agent", "unknown"),
+        "identifier": payload.identifier
+    }
+    
     try:
-        await add_session(user.id, session_id, user.max_sessions)
+        await add_session(user.id, session_id, user.max_sessions, metadata)
     except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        raise HTTPException(status_code=403, detail=str(e)) # Rejects login due to Limit constraint!
 
     token = create_access_token({
         "sub": user.email,
@@ -57,7 +63,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     return {"access_token": token}
 
 @router.post("/google", response_model=LoginResponse)
-async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(get_db)):
+async def google_login(payload: GoogleLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     try:
         if payload.credential.startswith("ya29."):
             async with httpx.AsyncClient() as client:
@@ -109,7 +115,15 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
                 await db.commit()
 
         session_id = str(uuid.uuid4())
-        await add_session(user.email, session_id, user.max_sessions)
+        metadata = {
+            "ip": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown"),
+            "identifier": "Google Social Login"
+        }
+        try:
+            await add_session(user.id, session_id, user.max_sessions, metadata)
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
 
         token = create_access_token({
             "sub": user.email, "id": user.id, "role": user.role, "session_id": session_id
@@ -121,7 +135,7 @@ async def google_login(payload: GoogleLoginRequest, db: AsyncSession = Depends(g
         raise HTTPException(status_code=401, detail=str(e))
 
 @router.post("/facebook", response_model=LoginResponse)
-async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depends(get_db)):
+async def facebook_login(payload: FacebookLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     try:
         async with httpx.AsyncClient() as client:
             fb_res = await client.get(
@@ -159,7 +173,16 @@ async def facebook_login(payload: FacebookLoginRequest, db: AsyncSession = Depen
                 await db.commit()
 
         session_id = str(uuid.uuid4())
-        await add_session(user.email, session_id, user.max_sessions)
+        metadata = {
+            "ip": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown"),
+            "identifier": "Facebook Social Login"
+        }
+        try:
+            await add_session(user.id, session_id, user.max_sessions, metadata)
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+
         token = create_access_token({
             "sub": user.email, "id": user.id, "role": user.role, "session_id": session_id
         })
@@ -230,6 +253,37 @@ async def logout(user=Depends(auth_guard)):
     if user_id and session_id:
         await remove_session(user_id, session_id)
     return {"status": "logged out"}
+
+@router.post("/heartbeat")
+async def maintain_heartbeat(user=Depends(auth_guard)):
+    """
+    Called by Frontend via setInterval every 1 or 2 minutes to block session from 
+    garbage collection and dying from inactivity TTL. Needs Bearer token.
+    """
+    user_id = user.get("id")
+    session_id = user.get("session_id")
+    
+    alive = await heartbeat_session(user_id, session_id)
+    if not alive:
+        # If frontend missed strict TTL, we forcibly bounce them out
+        raise HTTPException(status_code=401, detail="Session expired due to inactivity or closure.")
+    
+    return {"status": "alive"}
+
+@router.get("/sessions")
+async def list_active_sessions(user=Depends(auth_guard)):
+    """
+    Company Admin View - See exactly who is logged in simultaneously right now
+    """
+    return await list_sessions(user.get("id"))
+
+@router.delete("/sessions/{revoke_session_id}")
+async def revoke_active_session(revoke_session_id: str, user=Depends(auth_guard)):
+    """
+    Immediately destroy a ghost session so another user can freely log in
+    """
+    await remove_session(user.get("id"), revoke_session_id)
+    return {"status": "revoked"}
 
 @router.get("/me")
 async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):

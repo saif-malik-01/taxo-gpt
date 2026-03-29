@@ -136,12 +136,20 @@ class BedrockLLMClient:
             },
         )
 
+        usage: dict = {}
         for event in resp["stream"]:
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]
                 text = delta.get("text")
                 if text:
                     yield text
+            elif "metadata" in event:
+                # AWS sends token usage in the final metadata event
+                usage = event["metadata"].get("usage", {})
+
+        # Yield usage as a special sentinel so callers can capture real token counts
+        if usage:
+            yield f"\n\n__USAGE__{json.dumps(usage)}"
 
     def _stream_invoke(self, user_message, max_tokens, temperature):
         body = {

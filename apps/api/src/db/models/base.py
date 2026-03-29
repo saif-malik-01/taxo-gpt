@@ -68,10 +68,15 @@ class UserUsage(Base):
     simple_query_used = Column(Integer, default=0)
     draft_reply_used = Column(Integer, default=0)
     
-    # Token Tracking (Global FUP)
+    # Token Tracking — Lifetime (for billing analytics)
     input_tokens_used = Column(BigInteger, default=0)
     output_tokens_used = Column(BigInteger, default=0)
     total_tokens_used = Column(BigInteger, default=0)
+    
+    # Token Tracking — Monthly rolling window (abuse / FUP guard)
+    # Resets lazily on first request after 30 days from monthly_reset_date.
+    monthly_tokens_used = Column(BigInteger, default=0)
+    monthly_reset_date  = Column(DateTime(timezone=True), server_default=func.now())
     
     last_updated = Column(DateTime(timezone=True), onupdate=func.now())
     

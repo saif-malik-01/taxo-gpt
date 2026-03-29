@@ -4,6 +4,8 @@ from typing import Optional
 class LoginRequest(BaseModel):
     email: str
     password: str
+    identifier: Optional[str] = None # User device or Employee Name Name
+
 
 class LoginResponse(BaseModel):
     access_token: str

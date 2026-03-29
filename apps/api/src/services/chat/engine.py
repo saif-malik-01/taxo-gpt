@@ -65,7 +65,8 @@ async def chat_stream(
                     "type": "retrieval",
                     "intent": meta.get("intent"),
                     "confidence": meta.get("confidence"),
-                    "sources": meta.get("retrieved_documents", [])
+                    "sources": meta.get("retrieved_documents", []),
+                    "usage": meta.get("usage", {}),   # real token counts from Bedrock
                 }
             except Exception as e:
                 logger.error(f"Error parsing pipeline metadata: {e}")

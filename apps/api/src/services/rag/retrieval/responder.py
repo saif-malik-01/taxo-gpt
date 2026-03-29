@@ -262,6 +262,7 @@ class LLMResponder:
         )
         retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
 
+        usage_data: dict = {}
         for chunk in self._llm.call_stream(
             system_prompt=system_prompt,
             user_message=user_message,
@@ -269,13 +270,21 @@ class LLMResponder:
             temperature=0.1,
             label="stage6_stream",
         ):
-            yield chunk
+            # Intercept the __USAGE__ sentinel emitted by _stream_converse
+            if chunk.startswith("\n\n__USAGE__"):
+                try:
+                    usage_data = _json.loads(chunk[len("\n\n__USAGE__"):])
+                except Exception:
+                    pass
+            else:
+                yield chunk
 
         meta = {
             "__meta__": True,
             "intent":      intent.intent,
             "confidence":  intent.confidence,
             "retrieved_documents": retrieved_docs,
+            "usage":       usage_data,   # real inputTokens/outputTokens/totalTokens
         }
         yield "\n\n__META__" + _json.dumps(meta)
 

@@ -12,7 +12,7 @@ from apps.api.src.db.models.base import ChatSession, ChatMessage, Feedback, Shar
 from sqlalchemy import select, delete, desc
 from apps.api.src.services.memory import (
     check_credits, track_usage, get_session_history, 
-    add_message, get_user_profile
+    add_message, get_user_profile, edit_message_and_truncate
 )
 from apps.api.src.services.auth.deps import auth_guard
 from apps.api.src.services.chat.engine import chat_stream
@@ -94,12 +94,13 @@ async def ask_gst_stream_simple(
 
     async def stream_generator():
         try:
-            # ── Save user message ──────────────────────────────────────────────
-            await add_message(session_id, "user", question, user_id)
+            # ── Handle Message (New vs Edit) ──────────────────────────────
+            if payload.message_id:
+                await edit_message_and_truncate(session_id, payload.message_id, question)
+            else:
+                await add_message(session_id, "user", question, user_id)
 
             history = await get_session_history(session_id)
-            is_new_session = len(history) <= 1
-            await track_usage(user_id, session_id, db, force_deduct=is_new_session)
 
             profile = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
@@ -107,6 +108,7 @@ async def ask_gst_stream_simple(
             # ── Stream Response ────────────────────────────────────────────────
             full_response = ""
             source_ids = []
+            llm_usage = {}  # real token counts from Bedrock (captured below)
             async for event in chat_stream(
                 query=question, 
                 history=history, 
@@ -115,26 +117,37 @@ async def ask_gst_stream_simple(
                 if event.get("type") == "content":
                     full_response += event.get("delta", "")
                 elif event.get("type") == "retrieval":
-                    # Capture IDs for hydration
+                    # Capture source IDs for hydration
                     for s in event.get("sources", []):
                         if s.get("chunk_id"):
                             source_ids.append(s["chunk_id"])
+                    # Capture real token usage from Bedrock metadata
+                    llm_usage = event.get("usage", {})
                 
                 yield json.dumps(event) + "\n"
 
-            # ── Auto-update Profile (Background) ───────────────────────────────
-            if is_new_session:
-                background_tasks.add_task(auto_update_profile, user_id, question, db)
-                
-            # Make sure we save the bot message so history stays correct
+            # ── Save bot message with real token counts ─────────────────────
             if full_response:
-                bot_msg = await add_message(session_id, "bot", full_response, user_id, source_ids=source_ids)
-                # Yield a final completion event with the message ID
+                bot_msg = await add_message(
+                    session_id, "bot", full_response, user_id,
+                    prompt_tokens=llm_usage.get("inputTokens", 0),
+                    response_tokens=llm_usage.get("outputTokens", 0),
+                    source_ids=source_ids,
+                )
                 yield json.dumps({
                     "type": "completion", 
                     "session_id": session_id,
                     "message_id": bot_msg.id
                 }) + "\n"
+
+            # ── Track usage: deduct 1 credit, log tokens ────────────────────
+            # force_deduct=True: every question deducts 1 from simple_query_balance
+            await track_usage(user_id, session_id, db, usage=llm_usage, force_deduct=True)
+
+            # ── Auto-update Profile (Background) ───────────────────────────────
+            is_new_session = len(history) <= 1
+            if is_new_session:
+                background_tasks.add_task(auto_update_profile, user_id, question, db)
 
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
@@ -159,7 +172,11 @@ async def ask_gst_stream_draft(
 
     async def stream_generator():
         try:
-            await add_message(session_id, "user", question, user_id, chat_mode="draft")
+            if payload.message_id:
+                await edit_message_and_truncate(session_id, payload.message_id, question)
+            else:
+                await add_message(session_id, "user", question, user_id, chat_mode="draft")
+            
             history = await get_session_history(session_id)
             is_new_session = len(history) <= 1
             await track_usage(user_id, session_id, db, force_deduct=True) # Draft always deducts
