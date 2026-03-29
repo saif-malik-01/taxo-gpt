@@ -1,0 +1,8 @@
+# Core dependencies for the Injection/Ingestion pipeline
+qdrant-client==1.11.3
+boto3==1.35.36
+botocore==1.35.36
+python-dotenv==1.0.1
+
+# Optional but recommended for schema validation
+pydantic==2.9.2

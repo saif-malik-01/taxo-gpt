@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+python-jose[cryptography]
+bcrypt
+celery
+redis
+qdrant-client
+boto3
+pytest
+pytest-asyncio
+httpx
+python-multipart
+python-dotenv
+portalocker
+botocore[crt]
