@@ -1,43 +1,72 @@
 """
 services/document/issue_replier.py
 
-Generates draft replies for each extracted issue using:
-  1. Retrieval pipeline (stages 1-5) — finds relevant legal material
-  2. Mode-based reranking — boosts/demotes judgment chunks by decision type
-  3. LLM generation — drafts a precise, legally grounded reply
+Step 8A — Retrieval for each issue using the SAME pipeline as Feature 1.
+  query = issue text only (no summary, no parties, no mode)
+  Calls pipeline.query_stages_1_to_5() exactly as the simple chatbot does.
 
-Retrieval strategy per issue:
-  - The issue text (verbatim, with section/rule/notification references) is sent
-    to query_stages_1_to_5. Stage 2A regex extraction picks up section numbers,
-    rule numbers, notification/circular numbers from the issue text automatically.
-    Stage 4 then does direct field-match scrolls (scroll1/scroll2) for those.
-  - No keyword-based filtering — pipeline handles everything.
-  - After retrieval, apply mode-based reranking on judgment chunks.
+Judgment reranking (applied to top 50 after RRF):
+  Read chunk.ext.decision (NOT a top-level field).
+  Preferred alignment per mode:
+    defensive  → in_favour_of_assessee  : +0.2
+    in_favour  → in_favour_of_department: +0.2
+  Mismatching judgment chunks: -0.3 (floor 0.0)
+  Non-judgment chunks: score unchanged.
+  Re-sort → take top 20 (any type, no filter).
 
-Mode-based reranking:
-  defensive: in_favour_of_assessee judgments → score × 1.4
-             in_favour_of_revenue judgments  → score × 0.5 (kept, ratio useful)
-  in_favour: in_favour_of_revenue judgments  → score × 1.4
-             in_favour_of_assessee judgments → score × 0.5
+Step 8B — LLM draft generation.
+  NEVER truncate issue text.
+  NEVER truncate retrieved chunks.
+  Soft components (prior replied pairs, other issue IDs, reference summaries)
+  trimmed by COUNT only — never mid-sentence.
 
-Reference documents (from session_doc_store) are included in the reply prompt.
-Previous reply documents (replied_issues from doc_classifier) are ALSO included
-so the LLM maintains consistency with positions already taken.
+Modes:
+  MODE_DEFENSIVE = "defensive"
+  MODE_IN_FAVOUR = "in_favour"
 """
 
 import asyncio
 import logging
 import threading
-from typing import AsyncGenerator, Dict, List, Optional, Tuple
-
-from starlette.concurrency import run_in_threadpool
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 MODE_DEFENSIVE = "defensive"
 MODE_IN_FAVOUR = "in_favour"
 
-# ── LLM client (lazy, thread-safe) ───────────────────────────────────────────
+_MATCH_BOOST    =  0.2
+_MISMATCH_PENALTY = -0.3
+_SCORE_FLOOR    =  0.0
+
+_TOP_POOL  = 50   # retrieve this many before reranking
+_TOP_FINAL = 20   # send this many to LLM
+
+# ── Pipeline singleton ────────────────────────────────────────────────────────
+
+_pipeline    = None
+_pipe_lock   = threading.Lock()
+
+
+def set_pipeline(p) -> None:
+    global _pipeline
+    with _pipe_lock:
+        _pipeline = p
+
+
+def _get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        with _pipe_lock:
+            if _pipeline is None:
+                from retrieval.pipeline import RetrievalPipeline
+                _pipeline = RetrievalPipeline()
+                _pipeline.setup()
+                logger.info("RetrievalPipeline initialised from issue_replier")
+    return _pipeline
+
+
+# ── LLM singleton ─────────────────────────────────────────────────────────────
 
 _llm      = None
 _llm_lock = threading.Lock()
@@ -53,438 +82,379 @@ def _get_llm():
     return _llm
 
 
-# ── Pipeline reference (injected at startup) ──────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 8A — RETRIEVAL
+# ═════════════════════════════════════════════════════════════════════════════
 
-_pipeline_ref  = None
-_pipeline_lock = threading.Lock()
-
-
-def _get_pipeline():
-    return _pipeline_ref
-
-
-def set_pipeline(pipeline):
-    global _pipeline_ref
-    with _pipeline_lock:
-        _pipeline_ref = pipeline
-
-
-# ── Mode-based reranking ──────────────────────────────────────────────────────
-
-def _rerank_chunks_for_mode(chunks: list, mode: str) -> list:
+def _rerank_for_mode(chunks: list, mode: str) -> list:
     """
-    Rerank retrieved chunks based on the reply mode.
-
-    For DEFENSIVE mode:
-      Boost judgments decided in favour of assessee/taxpayer.
-      Demote (but keep) judgments in favour of revenue — ratio decidendi
-      of adverse judgments can still help distinguish the current facts.
-
-    For IN_FAVOUR mode:
-      Boost judgments decided in favour of revenue/department.
-      Demote judgments in favour of assessee.
-
-    Non-judgment chunks (sections, rules, notifications, circulars) are
-    NOT reranked — they are equally relevant regardless of mode.
+    Judgment reranking.
+    Only touches chunk_type == 'judgment' chunks with ext.decision present.
+    All other chunks pass through with score unchanged.
     """
-    if not chunks or mode not in (MODE_DEFENSIVE, MODE_IN_FAVOUR):
+    preferred = {
+        MODE_DEFENSIVE: "in_favour_of_assessee",
+        MODE_IN_FAVOUR: "in_favour_of_department",
+    }
+    if mode not in preferred:
         return chunks
 
-    reranked = []
+    want = preferred[mode]
     for chunk in chunks:
-        score = getattr(chunk, "score", chunk.get("score", 0) if isinstance(chunk, dict) else 0)
-        payload = chunk.payload if hasattr(chunk, "payload") else chunk
-        chunk_type = payload.get("chunk_type", "")
-
-        if chunk_type == "judgment":
-            decision = (payload.get("ext") or {}).get("decision", "")
-
-            if mode == MODE_DEFENSIVE:
-                if "in_favour_of_assessee" in decision:
-                    score = score * 1.4
-                elif "in_favour_of_revenue" in decision:
-                    score = score * 0.5
-
-            elif mode == MODE_IN_FAVOUR:
-                if "in_favour_of_revenue" in decision:
-                    score = score * 1.4
-                elif "in_favour_of_assessee" in decision:
-                    score = score * 0.5
-
-        # Store adjusted score back
-        if hasattr(chunk, "score"):
-            chunk.score = score
+        payload = getattr(chunk, "payload", None) or {}
+        if payload.get("chunk_type") != "judgment":
+            continue
+        ext      = payload.get("ext") or {}
+        decision = ext.get("decision")
+        if not decision:
+            continue
+        if decision == want:
+            chunk.score += _MATCH_BOOST
         else:
-            chunk["score"] = score
-        reranked.append(chunk)
+            chunk.score += _MISMATCH_PENALTY
+            chunk.score  = max(chunk.score, _SCORE_FLOOR)
 
-    return sorted(reranked, key=lambda c: (
-        c.score if hasattr(c, "score") else c.get("score", 0)
-    ), reverse=True)
+    chunks.sort(key=lambda c: c.score, reverse=True)
+    return chunks
 
 
-# ── Retrieval for a single issue ──────────────────────────────────────────────
-
-def _retrieve_for_issue(
-    issue: str,
+def retrieve_for_issue(
+    issue_text: str,
     mode: str,
-    stage2b_result=None,    # pre-built Stage2BResult from Step 2B cache
-) -> List[dict]:
+    stage2b_result=None,
+) -> list:
     """
-    Use the RetrievalPipeline (stages 1-5) to find legal material for this issue.
+    Step 8A: Retrieve legal material for one issue.
+    - Query = issue text only (no summary, no parties, no mode)
+    - Uses the SAME pipeline.query_stages_1_to_5() as Feature 1
+    - Applies judgment reranking on top 50 → returns top 20
 
-    Changes from previous version:
-      - stage2b_result: cached Stage2BResult from Step 2B passed in directly.
-        If provided, passes it to query_stages_1_to_5 to skip Stage 2B LLM
-        re-extraction per issue. Saves ~20s per issue.
-      - doc_summary removed from query: issue text already has all legal
-        entities verbatim. Summary adds noise to vector search.
-      - Conditions instruction added to query framing so retrieval biases
-        toward chunks containing applicability conditions.
-
-    After retrieval, apply mode-based reranking on judgment chunks.
-    Returns list of chunk payloads (plain dicts), top 15 after reranking.
+    stage2b_result: cached Stage2BResult from Step 2B — passed to pipeline
+                    so it skips re-extraction of legal entities.
     """
+    from retrieval.models import SessionMessage
     pipeline = _get_pipeline()
     if pipeline is None:
-        logger.warning("Pipeline not available for issue retrieval")
+        logger.warning("Retrieval pipeline not available")
         return []
-
-    if mode == MODE_DEFENSIVE:
-        query = (
-            f"Legal exceptions, defences, and relief available to the assessee "
-            f"regarding: {issue}. "
-            f"Judgments in favour of assessee. Provisos and exceptions in sections. "
-            f"Conditions in rules and notifications that exempt or exclude this situation. "
-            f"Circulars and notifications granting relief or clarification."
-        )
-    else:
-        query = (
-            f"Legal basis and provisions establishing taxpayer liability regarding: {issue}. "
-            f"Judgments in favour of revenue/department. "
-            f"Sections, rules, and notifications confirming taxability or compliance obligation. "
-            f"Conditions that trigger the obligation or liability."
-        )
 
     try:
-        # Pass cached Stage2BResult if available — skips Stage 2B LLM call
-        if stage2b_result is not None:
-            try:
-                staged = pipeline.query_stages_1_to_5(
-                    query, [],
-                    prebuilt_stage2b=stage2b_result,
-                )
-            except TypeError:
-                # pipeline.query_stages_1_to_5 doesn't support prebuilt_stage2b yet
-                staged = pipeline.query_stages_1_to_5(query, [])
-        else:
-            staged = pipeline.query_stages_1_to_5(query, [])
+        # Call the same stages 1-5 as the simple chatbot
+        # Empty session_history — issue retrieval is stateless per-issue
+        staged = pipeline.query_stages_1_to_5(
+            user_query      = issue_text,   # issue text only — nothing else
+            session_history = [],
+        )
+        # staged = (final_query, session_history, chunks, citation_result, intent, cross_refs)
+        _, _, chunks, _, _, _ = staged
 
-        chunks   = staged[2]  # ScoredChunk list
-        reranked = _rerank_chunks_for_mode(chunks, mode)
-        return [c.payload for c in reranked[:15]]
+        if not chunks:
+            return []
 
+        # Apply judgment reranking on full pool (up to _TOP_POOL)
+        pool    = chunks[:_TOP_POOL]
+        ranked  = _rerank_for_mode(pool, mode)
+        top_20  = ranked[:_TOP_FINAL]
+
+        logger.info(
+            f"8A retrieval: issue_len={len(issue_text)} "
+            f"pool={len(pool)} → top20={len(top_20)} "
+            f"types={[c.payload.get('chunk_type') for c in top_20[:5]]}"
+        )
+        return top_20
     except Exception as e:
-        logger.error(f"Issue retrieval failed: {e}")
+        logger.error(f"Retrieval error for issue: {e}", exc_info=True)
         return []
 
 
-# ── Chunk renderer for LLM prompt ────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# STEP 8B — DRAFT GENERATION
+# ═════════════════════════════════════════════════════════════════════════════
 
-def _render_chunks(chunks: list) -> str:
-    parts = []
-    for c in chunks:
-        chunk_type = c.get("chunk_type", "source").upper()
-        ext        = c.get("ext") or {}
-        source     = (
-            ext.get("citation")            or
-            ext.get("notification_number") or
-            ext.get("circular_number")     or
-            ext.get("rule_number_full")    or
-            ext.get("section_number")      or
-            c.get("parent_doc", "source")
+_SYSTEM_DEFENSIVE = """\
+You are a senior Indian tax law expert specialising in GST, Income Tax, and Customs.
+Your task: draft a formal legal reply defending the taxpayer against a specific allegation.
+
+REPLY OBJECTIVE — DEFENSIVE:
+1. Identify every statutory provision (sub-section, proviso, exception, condition) that extinguishes or reduces the demand.
+2. Cite judgments where the assessee succeeded on similar facts. Apply their ratio to the current facts explicitly — do not merely cite; explain WHY the ratio applies.
+3. If an adverse judgment is retrieved, distinguish it on facts — explain concretely how the taxpayer's situation differs from the facts in that judgment.
+4. Conclude: why the demand is not legally sustainable and should be dropped.
+
+OUTPUT FORMAT:
+Write in formal legal language as paragraph-form prose (not bullet points).
+Cite sections as: 'Section X of the CGST Act, 2017' or 'Rule X of the CGST Rules, 2017'.
+Cite judgments as: '[Case Name] — [Court] — [Year] — [Citation if available]'.
+Do not add subject line, salutation, or closing — only the substantive reply paragraphs."""
+
+_SYSTEM_IN_FAVOUR = """\
+You are a senior Indian tax law expert specialising in GST, Income Tax, and Customs.
+Your task: draft a formal legal reply establishing why the department's demand is correct and sustainable.
+
+REPLY OBJECTIVE — IN FAVOUR OF DEPARTMENT:
+1. Identify the statutory provisions and rules that create the liability.
+2. Apply the conditions in those provisions to the taxpayer's specific facts to show all conditions for the demand are satisfied.
+3. Cite judgments where the department succeeded on similar facts. Apply their ratio.
+4. Address and pre-empt defences the taxpayer might raise — use statutory text or contrary judgments.
+5. Conclude: why the demand is legally correct and must be upheld.
+
+OUTPUT FORMAT:
+Write in formal legal language as paragraph-form prose (not bullet points).
+Cite sections as: 'Section X of the CGST Act, 2017' or 'Rule X of the CGST Rules, 2017'.
+Cite judgments as: '[Case Name] — [Court] — [Year] — [Citation if available]'.
+Do not add subject line, salutation, or closing — only the substantive reply paragraphs."""
+
+
+def _format_chunk(chunk) -> str:
+    """Format a retrieved chunk for inclusion in the Step 8B prompt."""
+    payload = getattr(chunk, "payload", {}) or {}
+    chunk_type = payload.get("chunk_type", "document")
+    text       = payload.get("text", "")
+
+    if chunk_type == "judgment":
+        ext = payload.get("ext") or {}
+        header = (
+            f"--- JUDGMENT ---\n"
+            f"Case: {ext.get('case_name','N/A')} | "
+            f"Court: {ext.get('court','N/A')} | "
+            f"Year: {ext.get('judgment_date','N/A')}\n"
+            f"Citation: {ext.get('citation','N/A')}\n"
+            f"Decision: {ext.get('decision','N/A')}\n"
+            f"Ratio:"
         )
-        decision = ext.get("decision", "")
-        decision_tag = f" [{decision.replace('_', ' ')}]" if decision else ""
-        parts.append(
-            f"[{chunk_type} | {source}{decision_tag}]\n{c.get('text', '')}"
-        )
-    return "\n\n".join(parts)
-
-
-# ── Prompt builder ────────────────────────────────────────────────────────────
-
-def _build_issue_prompt(
-    issue: str,
-    issue_number: int,
-    total_issues: int,
-    all_issues: list,
-    chunks: list,
-    mode: str,
-    recipient: str = None,
-    doc_summary: str = None,
-    reference_docs_text: str = None,
-    previous_replies_text: str = None,
-) -> str:
-    # sender removed — legal arguments don't change based on which officer issued notice
-    if mode == MODE_DEFENSIVE:
-        mode_instruction = (
-            "Prepare a strong defensive reply protecting the notice recipient.\n"
-            "- Find every applicable legal exception, proviso, and precedent in the recipient's favour.\n"
-            "- Identify conditions in rules and notifications that EXCLUDE or EXEMPT this situation.\n"
-            "- Prioritise judgments decided in favour of the assessee.\n"
-            "- Quote statutory wording, notifications, and judgment extracts precisely.\n"
-            "- Ground every argument in a specific section, sub-section, proviso, or clause.\n"
-            "- Address any adverse judgments by distinguishing the facts.\n"
-            "- Conclude by establishing that the allegation is not legally sustainable."
-        )
+        return f"{header}\n{text}"
+    elif chunk_type == "section":
+        refs = payload.get("cross_references") or {}
+        section_ref = (refs.get("sections") or [""])[ 0] if refs.get("sections") else ""
+        header = f"--- SECTION ---\n{section_ref}:"
+        return f"{header}\n{text}"
+    elif chunk_type == "rule":
+        refs = payload.get("cross_references") or {}
+        rule_ref = (refs.get("rules") or [""])[0] if refs.get("rules") else ""
+        header = f"--- RULE ---\n{rule_ref}:"
+        return f"{header}\n{text}"
+    elif chunk_type in ("notification", "circular"):
+        refs = payload.get("cross_references") or {}
+        notif = (refs.get("notifications") or refs.get("circulars") or [""])[0] or ""
+        header = f"--- {chunk_type.upper()} ---\n{notif}:"
+        return f"{header}\n{text}"
     else:
-        mode_instruction = (
-            "Prepare a reply establishing the legal basis for the allegation.\n"
-            "- Find every provision and precedent supporting the revenue's position.\n"
-            "- Identify conditions in rules and notifications that TRIGGER the obligation.\n"
-            "- Prioritise judgments decided in favour of revenue.\n"
-            "- Quote statutory wording, notifications, and judgment extracts precisely.\n"
-            "- Ground every argument in a specific section, sub-section, proviso, or clause.\n"
-            "- Conclude by establishing that the obligation applies and the allegation is sustainable."
-        )
-
-    doc_details = f"Notice Recipient: {recipient}" if recipient else "Recipient: Not specified"
-
-    ref_block = ""
-    if reference_docs_text and reference_docs_text.strip():
-        ref_block = (
-            "\n============================================================\n"
-            "REFERENCE DOCUMENTS\n"
-            "============================================================\n"
-            + reference_docs_text.strip() + "\n"
-        )
-
-    prev_reply_block = ""
-    if previous_replies_text and previous_replies_text.strip():
-        prev_reply_block = (
-            "\n============================================================\n"
-            "PREVIOUS REPLIES (for related/older notices in this case)\n"
-            "IMPORTANT: Maintain consistency with positions already taken.\n"
-            "Do NOT contradict established facts. You may extend arguments.\n"
-            "============================================================\n"
-            + previous_replies_text.strip() + "\n"
-        )
-
-    other_issues = [iss for idx, iss in enumerate(all_issues) if idx != issue_number - 1]
-    other_block  = (
-        "\n".join(f"{i+1}. {iss}" for i, iss in enumerate(other_issues))
-        if other_issues else "This is the only issue."
-    )
-
-    return f"""You are preparing the reply for Issue {issue_number} of {total_issues}.
-
-============================================================
-DOCUMENT DETAILS
-============================================================
-{doc_details}
-
-============================================================
-DOCUMENT SUMMARY
-============================================================
-{doc_summary.strip() if doc_summary else "Not available"}
-{ref_block}{prev_reply_block}
-============================================================
-OTHER ISSUES IN THIS NOTICE (for consistency)
-============================================================
-{other_block}
-
-============================================================
-CURRENT ISSUE — Issue {issue_number} of {total_issues}
-============================================================
-{issue}
-
-============================================================
-INSTRUCTION
-============================================================
-{mode_instruction}
-
-Your reply must:
-1. Acknowledge the allegation precisely using facts from the document summary.
-2. Provide counter-arguments grounded in the specific facts of this notice.
-3. Cite specific sections, provisos, notifications, circulars, or judgments.
-4. For judgments — state the decision and apply the ratio to this issue.
-5. Identify and use conditions in rules/notifications: conditions that EXCLUDE
-   this situation (for defensive) or conditions that TRIGGER liability (for in_favour).
-6. Conclude with a clear statement on why this issue should be decided in the
-   client's favour (defensive) or why liability is established (in_favour).
-
-LEGAL MATERIAL (judgments, sections, rules, notifications, circulars):
-{_render_chunks(chunks) or "No specific legal material retrieved."}
-
-Write the reply for Issue {issue_number} only. Professional, precise, legally grounded.
-Do NOT add closing statement, signature block, or date.
-"""
+        return f"--- {chunk_type.upper()} ---\n{text}"
 
 
-_DOC_SYSTEM = (
-    "You are a senior Indian tax law professional preparing formal legal draft replies "
-    "to GST notices, show cause notices, and orders. "
-    "Your replies must be legally precise, cite exact provisions, and be professionally worded. "
-    "Conditions in rules, notifications, and circulars that determine applicability "
-    "must be identified and used to strengthen the reply."
-)
-
-
-# ── Previous replies text builder ─────────────────────────────────────────────
-
-def _build_previous_replies_text(case: dict) -> str:
+def _build_draft_prompt(
+    issue_text: str,
+    top_chunks: list,
+    other_issue_summaries: List[str],
+    prior_replied_pairs: List[dict],
+    reference_doc_summaries: List[dict],
+    user_draft_text: Optional[str] = None,
+) -> str:
     """
-    Build a text block of previous replies from uploaded reply documents.
-    These are the replied_issues pairs stored in doc entries.
+    Build the user-turn message for Step 8B.
+    NEVER truncate issue_text or top_chunks.
+    Soft components trimmed by count only.
     """
     parts = []
-    for doc in (case.get("documents") or []):
-        replied_issues = doc.get("replied_issues") or []
-        if not replied_issues:
-            continue
-        doc_type = doc.get("legal_doc_type", "previous reply")
-        parts.append(f"[{doc_type.upper()} — Previously submitted reply]")
-        for pair in replied_issues:
-            parts.append(f"Issue: {pair.get('issue_text', '')}")
-            parts.append(f"Reply given: {pair.get('reply_text', '')[:1000]}")
+
+    # ── Core: issue text (NEVER truncated) ────────────────────────────────
+    parts.append("## ISSUE TO BE REPLIED")
+    parts.append(issue_text)
+    parts.append("")
+
+    # ── Core: retrieved legal material (NEVER truncated) ─────────────────
+    if top_chunks:
+        parts.append("## RETRIEVED LEGAL MATERIAL")
+        parts.append("Use the following to build the reply (ordered by relevance):")
+        parts.append("")
+        for chunk in top_chunks:
+            parts.append(_format_chunk(chunk))
             parts.append("")
+
+    # ── Soft: other issues (IDs + 10-word summary — trim by count if budget tight) ──
+    if other_issue_summaries:
+        parts.append("## OTHER ALLEGATIONS IN THIS NOTICE (for consistency — do NOT address here)")
+        for s in other_issue_summaries[:6]:  # cap at 6 to keep budget
+            parts.append(s)
+        parts.append("")
+
+    # ── Soft: prior replied pairs (cap at 3 most relevant) ────────────────
+    if prior_replied_pairs:
+        parts.append("## PREVIOUSLY REPLIED ISSUES (maintain consistency — do not contradict)")
+        for pair in prior_replied_pairs[:3]:
+            parts.append(f"Prior allegation: {pair.get('issue_text','')}")
+            parts.append(f"Reply taken:      {pair.get('reply_text','')}")
+            parts.append("---")
+        parts.append("")
+
+    # ── Soft: reference document summaries ────────────────────────────────
+    if reference_doc_summaries:
+        parts.append("## REFERENCE DOCUMENTS PROVIDED")
+        for ref in reference_doc_summaries[:5]:
+            parts.append(f"{ref.get('filename','doc')}: {ref.get('brief_summary','')}")
+        parts.append("")
+
+    # ── Soft: user's draft reply (if present — NEVER truncated) ───────────
+    if user_draft_text:
+        parts.append("## USER'S DRAFT REPLY — IMPROVE WITHOUT CONTRADICTING")
+        parts.append(
+            "The user has prepared the following draft. "
+            "Improve its legal grounding and citations. "
+            "Do NOT contradict the core position or remove any argument the user made. "
+            "Only add depth, legal citations, and stronger reasoning."
+        )
+        parts.append(user_draft_text)
+        parts.append("")
+
     return "\n".join(parts)
 
 
-# ── Core single-issue processor ───────────────────────────────────────────────
-
 def _process_single_issue(
-    issue: str,
-    issue_number: int,
+    issue_text: str,
+    issue_num: int,
     total_issues: int,
-    all_issues: list,
+    all_issue_texts: List[str],
     mode: str,
-    recipient: str = None,
-    doc_summary: str = None,
-    reference_docs_text: str = None,
-    previous_replies_text: str = None,
-    stage2b_result=None,    # cached from Step 2B, passed in for fast retrieval
+    reference_doc_summaries: List[dict],
+    prior_replied_pairs: List[dict],
+    stage2b_result=None,
+    user_draft_text: Optional[str] = None,
 ) -> Tuple[int, str, list, dict]:
     """
-    Retrieve legal material + generate LLM reply for one issue.
-    Returns: (issue_number, reply_text, sources_list, usage_dict)
-    Runs in a thread (called via run_in_threadpool).
+    Synchronous: retrieve + draft for one issue.
+    Returns (issue_num, reply_text, sources, usage_dict)
     """
-    try:
-        logger.info(f"Processing Issue {issue_number}/{total_issues}: {issue[:80]}...")
+    # Step 8A: retrieve
+    top_chunks = retrieve_for_issue(issue_text, mode, stage2b_result)
 
-        # Use cached Stage2BResult — no re-extraction of legal entities
-        chunks = _retrieve_for_issue(issue, mode, stage2b_result=stage2b_result)
+    # Other issues — IDs + 10-word summaries
+    other_summaries = []
+    for idx, txt in enumerate(all_issue_texts, 1):
+        if txt != issue_text:
+            words = txt.split()[:12]
+            other_summaries.append(f"Issue {idx}: {' '.join(words)}...")
 
-        prompt = _build_issue_prompt(
-            issue, issue_number, total_issues, all_issues,
-            chunks, mode, recipient, doc_summary,
-            reference_docs_text, previous_replies_text,
+    # Step 8B: draft
+    system_prompt = _SYSTEM_DEFENSIVE if mode == MODE_DEFENSIVE else _SYSTEM_IN_FAVOUR
+    user_message  = _build_draft_prompt(
+        issue_text              = issue_text,
+        top_chunks              = top_chunks,
+        other_issue_summaries   = other_summaries,
+        prior_replied_pairs     = prior_replied_pairs,
+        reference_doc_summaries = reference_doc_summaries,
+        user_draft_text         = user_draft_text,
+    )
+
+    llm   = _get_llm()
+    reply = llm.call(
+        system_prompt = system_prompt,
+        user_message  = user_message,
+        max_tokens    = 8192,
+        temperature   = 0.2,
+        label         = f"step_8b_issue_{issue_num}",
+    )
+    reply = (reply or "").strip()
+    if not reply:
+        reply = (
+            "Could not generate a draft reply for this issue. "
+            "Please try again or provide additional context."
         )
 
-        reply = _get_llm().call(
-            system_prompt=_DOC_SYSTEM,
-            user_message=prompt,
-            max_tokens=2048,
-            temperature=0.0,
-            label=f"issue_{issue_number}",
-        )
-        if not reply:
-            reply = f"[Could not generate reply for Issue {issue_number}]"
+    # Build sources list for the retrieval event
+    sources = []
+    for chunk in top_chunks:
+        payload = getattr(chunk, "payload", {}) or {}
+        ext     = payload.get("ext") or {}
+        sources.append({
+            "chunk_type": payload.get("chunk_type"),
+            "case_name":  ext.get("case_name") or payload.get("summary","")[:80],
+            "court":      ext.get("court"),
+            "citation":   ext.get("citation"),
+            "score":      round(getattr(chunk, "score", 0), 4),
+        })
 
-        sources = [
-            {
-                "id":         c.get("_chunk_id", ""),
-                "chunk_type": c.get("chunk_type", ""),
-                "text":       (c.get("text") or "")[:300],
-                "metadata":   c.get("ext") or {},
-            }
-            for c in chunks
-        ]
-
-        usage = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
-        logger.info(f"Issue {issue_number} done ({len(reply)} chars)")
-        return issue_number, reply, sources, usage
-
-    except Exception as e:
-        logger.error(f"Issue {issue_number} failed: {e}", exc_info=True)
-        return (
-            issue_number,
-            f"[Error for Issue {issue_number}: {str(e)}]",
-            [],
-            {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
-        )
+    usage = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+    return issue_num, reply, sources, usage
 
 
-# ── Async streaming generator ─────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Async streaming driver for multiple issues
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def process_issues_streaming(
-    issues: list,               # list of issue dicts: {id, text, source_doc, ...}
+    issues: List[dict],
     mode: str,
-    recipient: str = None,      # sender removed — doesn't affect legal arguments
-    doc_summary: str = None,
-    reference_docs_text: str = None,
-    previous_replies_text: str = None,
-    stage2b_results: dict = None,  # {source_doc_filename: Stage2BResult} from cache
+    reference_doc_summaries: List[dict],
+    prior_replied_pairs: List[dict],
+    stage2b_results: Dict[str, Any],
     max_parallel: int = 3,
 ) -> AsyncGenerator[Tuple[int, str, list, dict], None]:
     """
-    Async generator — yields (issue_number, reply, sources, usage) in strict
-    sequential order (1, 2, 3…) regardless of completion order.
-    Up to max_parallel issues run concurrently in threadpool.
+    Process up to max_parallel issues concurrently.
+    Yields (issue_number, reply_text, sources, usage) in issue order.
 
-    stage2b_results: maps each issue's source_doc to its cached Stage2BResult
-    from Step 2B. Each issue uses its own document's pre-extracted legal entities
-    for retrieval — no re-extraction per issue.
+    stage2b_results: {filename: Stage2BResult} — from snapshot legal_entities_cache
     """
-    total     = len(issues)
+    from starlette.concurrency import run_in_threadpool
+
+    all_issue_texts = [i.get("issue_text", "") for i in issues]
+
     semaphore = asyncio.Semaphore(max_parallel)
-    loop      = asyncio.get_running_loop()
-    futures: Dict[int, asyncio.Future] = {
-        i + 1: loop.create_future() for i in range(total)
-    }
 
-    # Build flat list of issue texts for the "other issues" block in prompts
-    all_issue_texts = [
-        (i["text"] if isinstance(i, dict) else i)
-        for i in issues
-    ]
-
-    async def bounded_process(issue_obj, issue_number):
+    async def _process_one(issue: dict, local_num: int) -> Tuple[int, str, list, dict]:
         async with semaphore:
-            try:
-                issue_text = issue_obj["text"] if isinstance(issue_obj, dict) else issue_obj
-                source_doc = issue_obj.get("source_doc") if isinstance(issue_obj, dict) else None
+            source_doc    = issue.get("source_doc", "")
+            stage2b       = stage2b_results.get(source_doc)
+            issue_text    = issue.get("issue_text", "")
+            user_draft    = issue.get("user_draft_text")
 
-                # Look up cached Stage2BResult for this issue's source document
-                stage2b = (stage2b_results or {}).get(source_doc) if source_doc else None
+            num, reply, sources, usage = await run_in_threadpool(
+                _process_single_issue,
+                issue_text,
+                local_num,
+                len(issues),
+                all_issue_texts,
+                mode,
+                reference_doc_summaries,
+                prior_replied_pairs,
+                stage2b,
+                user_draft,
+            )
+            return num, reply, sources, usage
 
-                result = await run_in_threadpool(
-                    _process_single_issue,
-                    issue_text, issue_number, total, all_issue_texts,
-                    mode, recipient, doc_summary,
-                    reference_docs_text, previous_replies_text,
-                    stage2b,
-                )
-                futures[issue_number].set_result(result)
-            except Exception as e:
-                logger.error(f"Issue {issue_number} task failed: {e}", exc_info=True)
-                futures[issue_number].set_result((
-                    issue_number,
-                    f"[Error for Issue {issue_number}: {str(e)}]",
-                    [],
-                    {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
-                ))
+    tasks   = [asyncio.create_task(_process_one(iss, i+1)) for i, iss in enumerate(issues)]
+    # Gather but yield in ORDER (not completion order) so UI is stable
+    for task in tasks:
+        num, reply, sources, usage = await task
+        yield num, reply, sources, usage
 
-    logger.info(f"Processing {total} issues (max {max_parallel} concurrent)")
-    tasks = [
-        asyncio.create_task(bounded_process(issue, i + 1))
-        for i, issue in enumerate(issues)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Build prior replied pairs text (helper for document.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def build_prior_replied_pairs(case: dict) -> List[dict]:
+    """
+    Collect replied_issues pairs from all previous_reply and user_draft_reply docs.
+    Returns list of {issue_text, reply_text} dicts.
+    Capped at 10 most recent.
+    """
+    pairs = []
+    for doc in case.get("docs", []):
+        if doc.get("role") in ("previous_reply", "user_draft_reply"):
+            for p in doc.get("replied_issues", []):
+                if p.get("issue_text") and p.get("reply_text"):
+                    pairs.append(p)
+    return pairs[-10:]
+
+
+def build_reference_doc_summaries(case: dict) -> List[dict]:
+    """
+    Collect brief_summary from reference docs in the case.
+    Returns list of {filename, brief_summary} dicts.
+    """
+    return [
+        {"filename": d.get("filename",""), "brief_summary": d.get("brief_summary","")}
+        for d in case.get("docs", [])
+        if d.get("role") == "reference" and d.get("brief_summary")
     ]
-
-    for issue_num in range(1, total + 1):
-        yield await futures[issue_num]
-
-    await asyncio.gather(*tasks, return_exceptions=True)
-    logger.info(f"All {total} issues processed")
