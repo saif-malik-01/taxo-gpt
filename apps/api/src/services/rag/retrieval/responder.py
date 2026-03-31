@@ -587,11 +587,7 @@ def _fetch_full_judgment(qdrant: QdrantClient, payload: Dict) -> Dict:
         return {}
 
     must_cond = []
-    if file_hash:
-        must_cond.append(qmodels.FieldCondition(
-            key="_file_hash", match=qmodels.MatchValue(value=file_hash)
-        ))
-    elif citation:
+    if citation:
         must_cond.append(qmodels.FieldCondition(
             key="ext.citation", match=qmodels.MatchValue(value=citation)
         ))
