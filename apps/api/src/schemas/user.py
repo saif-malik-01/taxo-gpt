@@ -20,3 +20,12 @@ class UserResponseAdmin(BaseModel):
     facebook_id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+class UserCreateAdmin(BaseModel):
+    email: str
+    password: str
+    full_name: Optional[str] = None
+    mobile_number: Optional[str] = None
+    country: Optional[str] = None
+    role: str = "user"
+    is_verified: bool = True

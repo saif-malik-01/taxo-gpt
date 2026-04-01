@@ -29,6 +29,7 @@ PAYLOAD_INDEXES = [
     ("temporal.financial_year",      "keyword"),
     ("ext.court_level",              "keyword"),
     ("ext.decision",                 "keyword"),
+    ("ext.citation",                 "keyword"),
 ]
 
 # Number of persistent Qdrant connections in the pool

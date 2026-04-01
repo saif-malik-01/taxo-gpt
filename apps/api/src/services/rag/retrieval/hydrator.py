@@ -73,6 +73,8 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
             with_vectors=False,
         )
         
+        seen_identifiers = set()
+
         for r in results:
             if not r.payload: continue
             payload = r.payload
@@ -80,6 +82,15 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
             # Use existing summary builder
             # score is 0.0 for history as it's not a search result anymore
             summary = _doc_summary(payload, "history", 0.0)
+            
+            # Deduplicate ONLY judgments — other chunks preserve their individual texts
+            identifier = summary.get("identifier")
+            is_judgment = payload.get("chunk_type") == "judgment"
+            
+            if identifier and is_judgment:
+                if identifier in seen_identifiers:
+                    continue
+                seen_identifiers.add(identifier)
             
             # Ensure the Point ID is set correctly in the summary for the frontend
             summary["chunk_id"] = str(r.id)

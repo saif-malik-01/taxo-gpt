@@ -8,16 +8,43 @@ from pydantic import BaseModel
 
 from apps.api.src.services.auth.deps import admin_guard
 from apps.api.src.db.session import get_db
-from apps.api.src.db.models.base import User, CreditPackage, Coupon, PaymentTransaction, ChatMessage, ChatSession, UserUsage
+from apps.api.src.db.models.base import User, UserProfile, CreditPackage, Coupon, PaymentTransaction, ChatMessage, ChatSession, UserUsage
+from apps.api.src.services.auth.utils import get_password_hash
 from apps.api.src.schemas.payments import (
     PackageCreate, PackageUpdate, CouponCreate, CouponUpdate,
     PackageResponse, CouponResponse
 )
-from apps.api.src.schemas.user import UserResponseAdmin
+from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
 # --- User Management ---
+
+@router.post("/users", response_model=UserResponseAdmin)
+async def create_user(payload: UserCreateAdmin, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower()
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    new_user = User(
+        email=email, 
+        password_hash=get_password_hash(payload.password),
+        full_name=payload.full_name,
+        mobile_number=payload.mobile_number,
+        country=payload.country,
+        role=payload.role,
+        is_verified=payload.is_verified
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    db.add(UserProfile(user_id=new_user.id))
+    db.add(UserUsage(user_id=new_user.id))
+    await db.commit()
+    
+    return new_user
 class UserUpdateAdmin(BaseModel):
     role: Optional[str] = None
     max_sessions: Optional[int] = None
@@ -55,6 +82,33 @@ async def update_user(user_id: int, payload: UserUpdateAdmin, admin_user=Depends
     await db.commit()
     await db.refresh(user)
     return user
+
+@router.get("/users/{user_id}/usage")
+async def get_user_usage(
+    user_id: int, 
+    admin_user=Depends(admin_guard), 
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get the exact remaining credit balance and usage stats for a specific user.
+    """
+    result = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
+    usage = result.scalars().first()
+    
+    if not usage:
+        usage = UserUsage(user_id=user_id)
+        db.add(usage)
+        await db.commit()
+        await db.refresh(usage)
+        
+    return {
+        "user_id": usage.user_id,
+        "simple_query_balance": usage.simple_query_balance,
+        "draft_reply_balance": usage.draft_reply_balance,
+        "monthly_tokens_used": usage.monthly_tokens_used,
+        "monthly_reset_date": usage.monthly_reset_date,
+        "total_tokens_used": usage.total_tokens_used
+    }
 
 @router.patch("/users/{user_id}/usage")
 async def update_user_usage(
