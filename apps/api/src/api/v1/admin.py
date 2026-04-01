@@ -8,43 +8,16 @@ from pydantic import BaseModel
 
 from apps.api.src.services.auth.deps import admin_guard
 from apps.api.src.db.session import get_db
-from apps.api.src.db.models.base import User, UserProfile, CreditPackage, Coupon, PaymentTransaction, ChatMessage, ChatSession, UserUsage
-from apps.api.src.services.auth.utils import get_password_hash
+from apps.api.src.db.models.base import User, CreditPackage, Coupon, PaymentTransaction, ChatMessage, ChatSession, UserUsage
 from apps.api.src.schemas.payments import (
     PackageCreate, PackageUpdate, CouponCreate, CouponUpdate,
     PackageResponse, CouponResponse
 )
-from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
+from apps.api.src.schemas.user import UserResponseAdmin
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
 # --- User Management ---
-
-@router.post("/users", response_model=UserResponseAdmin)
-async def create_user(payload: UserCreateAdmin, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
-    email = payload.email.lower()
-    result = await db.execute(select(User).where(func.lower(User.email) == email))
-    if result.scalars().first():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    new_user = User(
-        email=email, 
-        password_hash=get_password_hash(payload.password),
-        full_name=payload.full_name,
-        mobile_number=payload.mobile_number,
-        country=payload.country,
-        role=payload.role,
-        is_verified=payload.is_verified
-    )
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-
-    db.add(UserProfile(user_id=new_user.id))
-    db.add(UserUsage(user_id=new_user.id))
-    await db.commit()
-    
-    return new_user
 class UserUpdateAdmin(BaseModel):
     role: Optional[str] = None
     max_sessions: Optional[int] = None
@@ -82,33 +55,6 @@ async def update_user(user_id: int, payload: UserUpdateAdmin, admin_user=Depends
     await db.commit()
     await db.refresh(user)
     return user
-
-@router.get("/users/{user_id}/usage")
-async def get_user_usage(
-    user_id: int, 
-    admin_user=Depends(admin_guard), 
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get the exact remaining credit balance and usage stats for a specific user.
-    """
-    result = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
-    usage = result.scalars().first()
-    
-    if not usage:
-        usage = UserUsage(user_id=user_id)
-        db.add(usage)
-        await db.commit()
-        await db.refresh(usage)
-        
-    return {
-        "user_id": usage.user_id,
-        "simple_query_balance": usage.simple_query_balance,
-        "draft_reply_balance": usage.draft_reply_balance,
-        "monthly_tokens_used": usage.monthly_tokens_used,
-        "monthly_reset_date": usage.monthly_reset_date,
-        "total_tokens_used": usage.total_tokens_used
-    }
 
 @router.patch("/users/{user_id}/usage")
 async def update_user_usage(
@@ -168,7 +114,7 @@ async def create_package(payload: PackageCreate, admin_user=Depends(admin_guard)
 
 @router.get("/payments/packages", response_model=List[PackageResponse])
 async def list_all_packages(admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
-    res = await db.execute(select(CreditPackage))
+    res = await db.execute(select(CreditPackage).where(CreditPackage.is_deleted == False))
     return res.scalars().all()
 
 @router.post("/payments/coupons", response_model=CouponResponse)
@@ -338,13 +284,26 @@ async def delete_package(package_id: int, admin_user=Depends(admin_guard), db: A
     pkg = res.scalars().first()
     if not pkg:
         raise HTTPException(status_code=404, detail="Package not found")
+    
+    # Check if package is used in any transactions
+    txn_res = await db.execute(select(PaymentTransaction).where(PaymentTransaction.package_id == package_id).limit(1))
+    has_transactions = txn_res.scalars().first() is not None
+
+    if has_transactions:
+        # Soft delete
+        pkg.is_deleted = True
+        pkg.is_active = False
+        await db.commit()
+        return {"status": "archived", "message": "Package archived as it has transaction history"}
+    
+    # Hard delete
     await db.delete(pkg)
     await db.commit()
     return {"status": "deleted"}
 
 @router.get("/payments/coupons", response_model=List[CouponResponse])
 async def list_coupons(admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
-    res = await db.execute(select(Coupon))
+    res = await db.execute(select(Coupon).where(Coupon.is_deleted == False))
     return res.scalars().all()
 
 @router.patch("/payments/coupons/{coupon_id}", response_model=CouponResponse)
@@ -368,6 +327,19 @@ async def delete_coupon(coupon_id: int, admin_user=Depends(admin_guard), db: Asy
     coupon = res.scalars().first()
     if not coupon:
         raise HTTPException(status_code=404, detail="Coupon not found")
+    
+    # Check if coupon is used in any transactions
+    txn_res = await db.execute(select(PaymentTransaction).where(PaymentTransaction.coupon_id == coupon_id).limit(1))
+    has_transactions = txn_res.scalars().first() is not None
+
+    if has_transactions:
+        # Soft delete
+        coupon.is_deleted = True
+        coupon.is_active = False
+        await db.commit()
+        return {"status": "archived", "message": "Coupon archived as it has transaction history"}
+    
+    # Hard delete
     await db.delete(coupon)
     await db.commit()
     return {"status": "deleted"}

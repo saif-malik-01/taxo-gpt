@@ -259,16 +259,33 @@ async def maintain_heartbeat(user=Depends(auth_guard)):
     """
     Called by Frontend via setInterval every 1 or 2 minutes to block session from 
     garbage collection and dying from inactivity TTL. Needs Bearer token.
+    
+    Returns a refreshed token if the current one is nearing its 30-minute expiry.
     """
+    import time
     user_id = user.get("id")
     session_id = user.get("session_id")
+    exp = user.get("exp")
     
     alive = await heartbeat_session(user_id, session_id)
     if not alive:
-        # If frontend missed strict TTL, we forcibly bounce them out
+        # If frontend missed strict TTL (5 mins), we forcibly bounce them out
         raise HTTPException(status_code=401, detail="Session expired due to inactivity or closure.")
     
-    return {"status": "alive"}
+    response = {"status": "alive"}
+    
+    # Token Rotation: If token expires within next 10 minutes, issue a fresh one
+    # This ensures the session stays active indefinitely as long as tab is open.
+    if exp and (exp - time.time() < 600):
+        new_token = create_access_token({
+            "sub": user.get("sub"),
+            "id": user_id,
+            "role": user.get("role"),
+            "session_id": session_id
+        })
+        response["new_access_token"] = new_token
+        
+    return response
 
 @router.get("/sessions")
 async def list_active_sessions(user=Depends(auth_guard)):
