@@ -56,23 +56,28 @@ async def chat_stream(
     stream_gen = pipeline.query_stage_6_stream(*staged)
 
     while True:
-        chunk = await run_in_threadpool(next, stream_gen, None)
-        if chunk is None:
-            break
+        try:
+            # Use 'STOP' sentinel to safely detect end of synchronous generator
+            chunk = await run_in_threadpool(next, stream_gen, "STOP")
+            if chunk == "STOP":
+                break
 
-        if chunk.startswith("\n\n__META__"):
-            try:
-                meta_json = chunk.replace("\n\n__META__", "")
-                meta = json.loads(meta_json)
-                
-                yield {
-                    "type": "retrieval",
-                    "intent": meta.get("intent"),
-                    "confidence": meta.get("confidence"),
-                    "sources": meta.get("retrieved_documents", []),
-                    "usage": meta.get("usage", {}),   # real token counts from Bedrock
-                }
-            except Exception as e:
-                logger.error(f"Error parsing pipeline metadata: {e}")
-        else:
-            yield {"type": "content", "delta": chunk}
+            if isinstance(chunk, str) and chunk.startswith("\n\n__META__"):
+                try:
+                    meta_json = chunk.replace("\n\n__META__", "")
+                    meta = json.loads(meta_json)
+                    yield {
+                        "type": "retrieval",
+                        "intent": meta.get("intent"),
+                        "confidence": meta.get("confidence"),
+                        "sources": meta.get("retrieved_documents", []),
+                        "usage": meta.get("usage", {}),
+                    }
+                except Exception as e:
+                    logger.error(f"Error parsing pipeline metadata: {e}")
+            else:
+                yield {"type": "content", "delta": chunk}
+        except Exception as e:
+            logger.error(f"Stream generation error in engine: {e}")
+            yield {"type": "error", "message": "Stream interrupted"}
+            break
