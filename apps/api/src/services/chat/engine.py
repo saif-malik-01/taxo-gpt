@@ -55,7 +55,11 @@ async def chat_stream(
     # 2. Run Stage 6 (Streaming response)
     stream_gen = pipeline.query_stage_6_stream(*staged)
 
-    for chunk in stream_gen:
+    while True:
+        chunk = await run_in_threadpool(next, stream_gen, None)
+        if chunk is None:
+            break
+
         if chunk.startswith("\n\n__META__"):
             try:
                 meta_json = chunk.replace("\n\n__META__", "")
