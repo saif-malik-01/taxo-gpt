@@ -56,6 +56,35 @@ async def update_user(user_id: int, payload: UserUpdateAdmin, admin_user=Depends
     await db.refresh(user)
     return user
 
+@router.get("/users/{user_id}/usage")
+async def get_user_usage(
+    user_id: int, 
+    admin_user=Depends(admin_guard), 
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get the usage and token balances for a specific user.
+    """
+    result = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
+    usage = result.scalars().first()
+    
+    if not usage:
+        return {
+            "user_id": user_id,
+            "simple_query_balance": 1000000, 
+            "draft_reply_balance": 3,
+            "monthly_tokens_used": 0,
+            "monthly_reset_date": datetime.now(timezone.utc)
+        }
+    
+    return {
+        "user_id": usage.user_id,
+        "simple_query_balance": usage.simple_query_balance,
+        "draft_reply_balance": usage.draft_reply_balance,
+        "monthly_tokens_used": usage.monthly_tokens_used,
+        "monthly_reset_date": usage.monthly_reset_date
+    }
+
 @router.patch("/users/{user_id}/usage")
 async def update_user_usage(
     user_id: int, 
