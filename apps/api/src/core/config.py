@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     TITAN_NORMALIZE: bool = True
     PIPELINE_MAX_RETRIES: int = 3
     PIPELINE_RETRY_DELAY: float = 2.0
-    GLOBAL_EXECUTOR_WORKERS: int = 20
+    GLOBAL_EXECUTOR_WORKERS: int = 100
 
     class Config:
         env_file = ".env"
