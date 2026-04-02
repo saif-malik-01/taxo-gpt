@@ -71,7 +71,7 @@ class EmailService:
 
     @staticmethod
     def send_password_reset_email(email: str, token: str, full_name: str = None):
-        reset_url = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+        reset_url = f"{settings.FRONTEND_URL}/auth/reset-password?token={token}"
         subject = "Reset Your TaxoBuddy Password"
         name_greeting = f"Hi {full_name}," if full_name else "Hi there,"
         
