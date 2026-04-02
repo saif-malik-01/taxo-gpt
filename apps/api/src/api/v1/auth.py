@@ -94,6 +94,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request, db: AsyncS
 
             if user:
                 user.google_id = google_id
+                user.is_verified = True # Linked social means verified
                 if not user.full_name and name:
                     user.full_name = name
                 await db.commit()
@@ -113,6 +114,11 @@ async def google_login(payload: GoogleLoginRequest, request: Request, db: AsyncS
                 db.add(UserProfile(user_id=user.id))
                 db.add(UserUsage(user_id=user.id))
                 await db.commit()
+
+        # Always verify if social login was successful
+        if not user.is_verified:
+            user.is_verified = True
+            await db.commit()
 
         session_id = str(uuid.uuid4())
         metadata = {
@@ -159,6 +165,7 @@ async def facebook_login(payload: FacebookLoginRequest, request: Request, db: As
 
             if user:
                 user.facebook_id = fb_id
+                user.is_verified = True # Linked social means verified
                 await db.commit()
             else:
                 user = User(
@@ -171,6 +178,11 @@ async def facebook_login(payload: FacebookLoginRequest, request: Request, db: As
                 db.add(UserProfile(user_id=user.id))
                 db.add(UserUsage(user_id=user.id))
                 await db.commit()
+
+        # Always verify if social login was successful
+        if not user.is_verified:
+            user.is_verified = True
+            await db.commit()
 
         session_id = str(uuid.uuid4())
         metadata = {
