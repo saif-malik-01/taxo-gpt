@@ -14,7 +14,7 @@ from apps.api.src.schemas.payments import (
 )
 from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
 from apps.api.src.services.auth.utils import get_password_hash
-from apps.api.src.db.models.base import UserProfile, UserUsage, User
+from apps.api.src.db.models.base import UserProfile, UserUsage, User, ChatSession, ChatMessage, CreditPackage, PaymentTransaction, Coupon
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
