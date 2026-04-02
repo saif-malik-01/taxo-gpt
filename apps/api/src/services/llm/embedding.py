@@ -8,8 +8,8 @@ Each instance creates its own boto3 client (thread-safe).
 import json
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
+from apps.api.src.services.rag.executor import rag_executor
 
 import boto3
 from botocore.exceptions import ClientError
@@ -91,11 +91,10 @@ class TitanEmbeddingGenerator:
             return text_vec, text_vec
 
         results = {}
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            ft = ex.submit(self._invoke, text)
-            fs = ex.submit(self._invoke, summary)
-            results["text"]    = ft.result()
-            results["summary"] = fs.result()
+        ft = rag_executor.submit(self._invoke, text)
+        fs = rag_executor.submit(self._invoke, summary)
+        results["text"]    = ft.result()
+        results["summary"] = fs.result()
 
         text_vec    = results["text"]
         summary_vec = results["summary"] or text_vec

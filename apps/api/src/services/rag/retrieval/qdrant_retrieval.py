@@ -32,7 +32,7 @@ Scroll bonuses (additive to cosine score):
 import math
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from qdrant_client import QdrantClient
@@ -47,6 +47,7 @@ from apps.api.src.core.config import (
 from apps.api.src.services.llm.embedding import TitanEmbeddingGenerator
 from apps.api.src.services.rag.pipeline.bm25_vectorizer import BM25Vectorizer
 from apps.api.src.services.rag.models import IntentResult, ScoredChunk, Stage2BResult
+from apps.api.src.services.rag.executor import rag_executor
 import logging
 
 logger = logging.getLogger(__name__)
@@ -132,36 +133,36 @@ class QdrantRetrieval:
         # -- Launch all parallel calls ---------------------------------
         t_start_parallel = time.time()
         futures_map: Dict[Any, str] = {}
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            if query_vector:
-                futures_map[ex.submit(self._vector_search, query_vector)] = "vector"
-            futures_map[ex.submit(self._bm25_search, sparse_indices, sparse_values)] = "bm25"
-            if run_scroll1:
-                futures_map[ex.submit(self._scroll1, stage2b)] = "scroll1"
-            if run_scroll2:
-                futures_map[ex.submit(self._scroll2, stage2b)] = "scroll2"
-            if run_scroll3:
-                futures_map[ex.submit(self._scroll3, stage2b)] = "scroll3"
-            if run_name:
-                futures_map[ex.submit(
-                    self._name_search, stage2b.parties + stage2b.person_names
-                )] = "name_search"
-            if run_case_num:
-                futures_map[ex.submit(
-                    self._case_number_search, stage2b.case_number
-                )] = "case_search"
+        
+        if query_vector:
+            futures_map[rag_executor.submit(self._vector_search, query_vector)] = "vector"
+        futures_map[rag_executor.submit(self._bm25_search, sparse_indices, sparse_values)] = "bm25"
+        if run_scroll1:
+            futures_map[rag_executor.submit(self._scroll1, stage2b)] = "scroll1"
+        if run_scroll2:
+            futures_map[rag_executor.submit(self._scroll2, stage2b)] = "scroll2"
+        if run_scroll3:
+            futures_map[rag_executor.submit(self._scroll3, stage2b)] = "scroll3"
+        if run_name:
+            futures_map[rag_executor.submit(
+                self._name_search, stage2b.parties + stage2b.person_names
+            )] = "name_search"
+        if run_case_num:
+            futures_map[rag_executor.submit(
+                self._case_number_search, stage2b.case_number
+            )] = "case_search"
 
-            raw_results: Dict[str, Any] = {}
-            for fut in as_completed(futures_map):
-                source = futures_map[fut]
-                t_fut_start = time.time()
-                try:
-                    raw_results[source] = fut.result()
-                    t_fut = (time.time() - t_fut_start) * 1000
-                    logger.debug(f"  [{source}] completed in {t_fut:.1f}ms")
-                except Exception as e:
-                    logger.error(f"  [{source}] failed: {e}")
-                    raw_results[source] = []
+        raw_results: Dict[str, Any] = {}
+        for fut in as_completed(futures_map):
+            source = futures_map[fut]
+            t_fut_start = time.time()
+            try:
+                raw_results[source] = fut.result()
+                t_fut = (time.time() - t_fut_start) * 1000
+                logger.debug(f"  [{source}] completed in {t_fut:.1f}ms")
+            except Exception as e:
+                logger.error(f"  [{source}] failed: {e}")
+                raw_results[source] = []
         
         t_parallel = (time.time() - t_start_parallel) * 1000
         logger.info(f"Parallel retrieval pool calls done in {t_parallel:.1f}ms")
@@ -819,16 +820,15 @@ class QdrantRetrieval:
             return []
 
         results: List[Tuple[str, Dict]] = []
-        with ThreadPoolExecutor(max_workers=min(12, len(calls))) as ex:
-            future_map = {
-                ex.submit(self._scroll, conditions, limit, label): label
-                for conditions, limit, label in calls
-            }
-            for future in as_completed(future_map):
-                try:
-                    results += future.result()
-                except Exception as e:
-                    logger.debug(f"scroll2 parallel call failed: {e}")
+        future_map = {
+            rag_executor.submit(self._scroll, conditions, limit, label): label
+            for conditions, limit, label in calls
+        }
+        for future in as_completed(future_map):
+            try:
+                results += future.result()
+            except Exception as e:
+                logger.debug(f"scroll2 parallel call failed: {e}")
 
         return results
 
@@ -909,23 +909,22 @@ class QdrantRetrieval:
             return []
 
         raw: List[Tuple[str, Dict]] = []
-        with ThreadPoolExecutor(max_workers=min(12, len(calls))) as ex:
-            future_map = {
-                ex.submit(
-                    self._scroll,
-                    [qmodels.FieldCondition(key="chunk_type",
-                                            match=qmodels.MatchValue(value="judgment")),
-                     qmodels.FieldCondition(key=key,
-                                            match=qmodels.MatchText(text=word))],
-                    10, f"name_{word[:12]}_{key.split('.')[-1]}"
-                ): (word, key)
-                for word, key in calls
-            }
-            for future in as_completed(future_map):
-                try:
-                    raw += future.result()
-                except Exception as e:
-                    logger.debug(f"Name search failed: {e}")
+        future_map = {
+            rag_executor.submit(
+                self._scroll,
+                [qmodels.FieldCondition(key="chunk_type",
+                                        match=qmodels.MatchValue(value="judgment")),
+                 qmodels.FieldCondition(key=key,
+                                        match=qmodels.MatchText(text=word))],
+                10, f"name_{word[:12]}_{key.split('.')[-1]}"
+            ): (word, key)
+            for word, key in calls
+        }
+        for future in as_completed(future_map):
+            try:
+                raw += future.result()
+            except Exception as e:
+                logger.debug(f"Name search failed: {e}")
 
         return _dedup_by_citation(raw, max_citations=5)
 

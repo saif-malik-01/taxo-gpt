@@ -14,6 +14,7 @@ Flow:
 import os
 import logging
 from typing import List, Optional
+from apps.api.src.services.rag.executor import rag_executor
 
 from qdrant_client import QdrantClient
 
@@ -109,24 +110,22 @@ class RetrievalPipeline:
         keyword_doc = build_bm25_keyword_document(stage2a, stage2b)
 
         # -- Stage 3 + Stage 4 -----------------------------------------
-        from concurrent.futures import ThreadPoolExecutor
         citation_result = None
         chunks = []
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fut_citation = ex.submit(
-                self._citation.run,
-                stage2a.citation, stage2b.citation, stage2b,
-                intent.intent, intent.confidence,
-            )
-            fut_retrieval = ex.submit(
-                self._retrieval.retrieve,
-                final_query, keyword_doc, stage2b, intent,
-                None,
-                stage2b.citation or stage2a.citation,
-            )
-            citation_result = fut_citation.result()
-            chunks          = fut_retrieval.result()
+        fut_citation = rag_executor.submit(
+            self._citation.run,
+            stage2a.citation, stage2b.citation, stage2b,
+            intent.intent, intent.confidence,
+        )
+        fut_retrieval = rag_executor.submit(
+            self._retrieval.retrieve,
+            final_query, keyword_doc, stage2b, intent,
+            None,
+            stage2b.citation or stage2a.citation,
+        )
+        citation_result = fut_citation.result()
+        chunks          = fut_retrieval.result()
 
         # -- Stage 5  -  Filter ------------------------------------------
         chunks = self._scorer.filter(chunks, stage2b, intent)
