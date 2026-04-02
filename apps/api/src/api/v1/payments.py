@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update
 from typing import Optional, List
@@ -12,7 +12,7 @@ from apps.api.src.schemas.payments import (
     PackageUpdate, CouponCreate, CouponUpdate, CouponValidateRequest
 )
 
-from apps.api.src.services.payments import create_razorpay_order, verify_payment, validate_coupon_logic
+from apps.api.src.services.payments import create_razorpay_order, verify_payment, validate_coupon_logic, send_invoice_background
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
@@ -22,17 +22,24 @@ async def list_packages(db: AsyncSession = Depends(get_db)):
     return res.scalars().all()
 
 @router.post("/create-order")
-async def create_order(payload: OrderRequest, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+async def create_order(payload: OrderRequest, background_tasks: BackgroundTasks, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
     user_id = user.get("id")
     try:
         order = await create_razorpay_order(user_id, payload.package_name, payload.coupon_code, db)
+        
+        # If it's a free activation, the order is already completed
+        if isinstance(order, dict) and order.get("is_free"):
+            background_tasks.add_task(send_invoice_background, order.get("order_id"))
+            
         return order
     except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/verify")
-async def verify(payload: VerifyRequest, db: AsyncSession = Depends(get_db)):
+async def verify(payload: VerifyRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     success = await verify_payment(payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature, db)
-    if success: return {"status": "success"}
+    if success: 
+        background_tasks.add_task(send_invoice_background, payload.razorpay_order_id)
+        return {"status": "success"}
     raise HTTPException(status_code=400, detail="Payment verification failed")
 
 @router.get("/history")

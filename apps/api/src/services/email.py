@@ -1,5 +1,6 @@
 import smtplib
 import logging
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -50,19 +51,28 @@ class EmailService:
         <html>
             <head>
                 <style>
-                    body {{ background-color: #0a0a0a; color: #ffffff; font-family: sans-serif; padding: 40px; }}
-                    .container {{ max-width: 600px; margin: auto; background: #121212; padding: 40px; border-radius: 16px; border: 1px solid #333; }}
-                    .button {{ background: #ffffff; color: #000000; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block; margin: 20px 0; }}
-                    .brand {{ color: #fb923c; font-size: 24px; font-weight: bold; margin-bottom: 20px; }}
+                    body {{ background-color: #f4f7fa; color: #1e293b; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 40px; margin: 0; }}
+                    .container {{ max-width: 600px; margin: auto; background: #ffffff; padding: 40px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                    .brand {{ color: #fb923c; font-size: 28px; font-weight: bold; margin-bottom: 24px; text-align: center; }}
+                    .content {{ line-height: 1.6; color: #334155; font-size: 16px; }}
+                    .button {{ background: #fb923c; color: #ffffff !important; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 24px 0; text-align: center; }}
+                    .footer {{ margin-top: 32px; font-size: 12px; color: #94a3b8; text-align: center; }}
                 </style>
             </head>
             <body>
                 <div class="container">
                     <div class="brand">TaxoBuddy</div>
-                    <div>{name_greeting}</div>
-                    <p>Welcome to TaxoBuddy. Please verify your email to start.</p>
-                    <a href="{verification_url}" class="button">Verify Account</a>
-                    <p>Or copy this link: {verification_url}</p>
+                    <div class="content">
+                        <p>{name_greeting}</p>
+                        <p>Welcome to TaxoBuddy! We're excited to have you on board. To get started with professional tax intelligence, please verify your account by clicking the button below.</p>
+                        <div style="text-align: center;">
+                            <a href="{verification_url}" class="button">Verify My Account</a>
+                        </div>
+                        <p style="font-size: 14px; color: #64748b;">If the button doesn't work, copy and paste this link into your browser:<br>{verification_url}</p>
+                    </div>
+                    <div class="footer">
+                        © {datetime.now().year} TaxoBuddy. All rights reserved.
+                    </div>
                 </div>
             </body>
         </html>
@@ -79,20 +89,28 @@ class EmailService:
         <html>
             <head>
                 <style>
-                    body {{ background-color: #0a0a0a; color: #ffffff; font-family: sans-serif; padding: 40px; }}
-                    .container {{ max-width: 600px; margin: auto; background: #121212; padding: 40px; border-radius: 16px; border: 1px solid #333; }}
-                    .button {{ background: #ffffff; color: #000000; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block; margin: 20px 0; }}
-                    .brand {{ color: #fb923c; font-size: 24px; font-weight: bold; margin-bottom: 20px; }}
+                    body {{ background-color: #f4f7fa; color: #1e293b; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 40px; margin: 0; }}
+                    .container {{ max-width: 600px; margin: auto; background: #ffffff; padding: 40px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                    .brand {{ color: #fb923c; font-size: 28px; font-weight: bold; margin-bottom: 24px; text-align: center; }}
+                    .content {{ line-height: 1.6; color: #334155; font-size: 16px; }}
+                    .button {{ background: #fb923c; color: #ffffff !important; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 24px 0; text-align: center; }}
+                    .footer {{ margin-top: 32px; font-size: 12px; color: #94a3b8; text-align: center; }}
                 </style>
             </head>
             <body>
                 <div class="container">
                     <div class="brand">TaxoBuddy</div>
-                    <div>{name_greeting}</div>
-                    <p>We received a request to reset your password. Click the button below to proceed. This link will expire in 1 hour.</p>
-                    <a href="{reset_url}" class="button">Reset Password</a>
-                    <p>Or copy this link: {reset_url}</p>
-                    <p>If you didn't request this, you can safely ignore this email.</p>
+                    <div class="content">
+                        <p>{name_greeting}</p>
+                        <p>We received a request to reset the password for your TaxoBuddy account. If you made this request, please click the button below to set a new password. This link will expire in 1 hour.</p>
+                        <div style="text-align: center;">
+                            <a href="{reset_url}" class="button">Reset Password</a>
+                        </div>
+                        <p style="font-size: 14px; color: #64748b;">If you didn't request a password reset, you can safely ignore this email.</p>
+                    </div>
+                    <div class="footer">
+                        © {datetime.now().year} TaxoBuddy. All rights reserved.
+                    </div>
                 </div>
             </body>
         </html>
@@ -101,5 +119,50 @@ class EmailService:
 
     @staticmethod
     def send_invoice_email(email: str, invoice_pdf: bytes, order_id: str, amount: float, full_name: str = None):
-        # (Restore invoice template from backup if needed)
-        pass
+        subject = f"Invoice for your TaxoBuddy Order {order_id}"
+        amount_inr = amount / 100
+        name_greeting = f"Hi {full_name}," if full_name else "Hi there,"
+        
+        html_content = f"""
+        <html>
+            <head>
+                <style>
+                    body {{ background-color: #f8fafc; color: #1e293b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 40px; margin: 0; }}
+                    .container {{ max-width: 600px; margin: auto; background: #ffffff; padding: 40px; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px rgba(0,0,0,0.05); }}
+                    .brand {{ color: #fb923c; font-size: 28px; font-weight: bold; margin-bottom: 24px; text-align: center; }}
+                    .content {{ line-height: 1.6; color: #334155; }}
+                    .amount-box {{ background: #f1f5f9; padding: 24px; border-radius: 14px; margin: 24px 0; border: 1px solid #e2e8f0; text-align: center; }}
+                    .amount-value {{ font-size: 28px; font-weight: bold; color: #fb923c; }}
+                    .footer {{ color: #64748b; font-size: 13px; margin-top: 32px; text-align: center; padding-top: 24px; border-top: 1px solid #e2e8f0; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="brand">TaxoBuddy</div>
+                    <div class="content">
+                        <p>{name_greeting}</p>
+                        <p>Thank you for choosing TaxoBuddy! Your order <strong>{order_id}</strong> has been successfully processed.</p>
+                        
+                        <div class="amount-box">
+                            <div style="font-size: 14px; color: #64748b; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;">Total Amount Paid</div>
+                            <div class="amount-value">INR {amount_inr:,.2f}</div>
+                        </div>
+                        
+                        <p>We've attached your official tax invoice to this email for your records. Your purchased credits have been added to your account and are ready for use.</p>
+                        <p>If you have any questions or need further assistance, please don't hesitate to reach out to our support team.</p>
+                    </div>
+                    <div class="footer">
+                        © {datetime.now().year} TaxoBuddy Professional Tax Intelligence.<br>
+                        This is an automated receipt for your recent transaction.
+                    </div>
+                </div>
+            </body>
+        </html>
+        """
+        
+        attachments = [{
+            "filename": f"TaxoBuddy_Invoice_{order_id}.pdf",
+            "content": invoice_pdf
+        }]
+        
+        return EmailService.send_email(subject, html_content, email, attachments)

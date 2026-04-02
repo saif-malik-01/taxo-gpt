@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import json
-from typing import AsyncGenerator, List, Dict, Optional, Tuple
+import threading   
+from typing import AsyncGenerator, List, Dict, Optional
 from starlette.concurrency import run_in_threadpool
 
 from apps.api.src.services.rag.retrieval.pipeline import RetrievalPipeline
@@ -9,13 +10,17 @@ from apps.api.src.services.rag.models import SessionMessage
 
 logger = logging.getLogger(__name__)
 
-_pipeline = None
+_pipeline: Optional[RetrievalPipeline] = None
+_pipeline_lock = threading.Lock()
 
-def get_pipeline():
+def get_pipeline() -> RetrievalPipeline:
     global _pipeline
     if _pipeline is None:
-        _pipeline = RetrievalPipeline()
-        _pipeline.setup()
+        with _pipeline_lock:
+            if _pipeline is None:
+                p = RetrievalPipeline()
+                p.setup()
+                _pipeline = p
     return _pipeline
 
 def _map_history(history: List[Dict]) -> List[SessionMessage]:
@@ -32,52 +37,75 @@ def _map_history(history: List[Dict]) -> List[SessionMessage]:
             continue
     return pipeline_history
 
+def _stage6_to_queue(
+    pipeline: RetrievalPipeline,
+    staged: tuple,
+    queue: "asyncio.Queue[object]",
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    try:
+        for chunk in pipeline.query_stage_6_stream(*staged):
+            asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
+    except Exception as e:
+        logger.error(f"Stage 6 thread error: {e}", exc_info=True)
+        asyncio.run_coroutine_threadsafe(
+            queue.put({"__error__": str(e)}), loop
+        ).result()
+    finally:
+        asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+
 async def chat_stream(
-    query: str, 
-    history: list = [], 
-    profile_summary: Optional[str] = None, 
+    query: str,
+    history: list = [],
+    profile_summary: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
-    """
-    Call the new RetrievalPipeline in streaming mode and map events back to our JSON protocol.
-    """
+
     pipeline = await run_in_threadpool(get_pipeline)
-    
+
     context_prefix = ""
     if profile_summary:
         context_prefix += f"[User Profile: {profile_summary}]\n"
-    
     final_query = f"{context_prefix}{query}" if context_prefix else query
     session_history = _map_history(history)
 
-    # 1. Run Stages 1-5 (Initial retrieval/filtering)
-    staged = await run_in_threadpool(pipeline.query_stages_1_to_5, final_query, session_history)
-    
-    # 2. Run Stage 6 (Streaming response)
-    stream_gen = pipeline.query_stage_6_stream(*staged)
+    staged = await run_in_threadpool(
+        pipeline.query_stages_1_to_5, final_query, session_history
+    )
+
+    loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+    loop.run_in_executor(
+        None,
+        _stage6_to_queue,
+        pipeline,
+        staged,
+        queue,
+        loop,
+    )
 
     while True:
-        try:
-            # Use 'STOP' sentinel to safely detect end of synchronous generator
-            chunk = await run_in_threadpool(next, stream_gen, "STOP")
-            if chunk == "STOP":
-                break
+        chunk = await queue.get()
 
-            if isinstance(chunk, str) and chunk.startswith("\n\n__META__"):
-                try:
-                    meta_json = chunk.replace("\n\n__META__", "")
-                    meta = json.loads(meta_json)
-                    yield {
-                        "type": "retrieval",
-                        "intent": meta.get("intent"),
-                        "confidence": meta.get("confidence"),
-                        "sources": meta.get("retrieved_documents", []),
-                        "usage": meta.get("usage", {}),
-                    }
-                except Exception as e:
-                    logger.error(f"Error parsing pipeline metadata: {e}")
-            else:
-                yield {"type": "content", "delta": chunk}
-        except Exception as e:
-            logger.error(f"Stream generation error in engine: {e}")
-            yield {"type": "error", "message": "Stream interrupted"}
+        if chunk is None:
             break
+
+        if isinstance(chunk, dict) and "__error__" in chunk:
+            yield {"type": "error", "message": chunk["__error__"]}
+            break
+
+        if isinstance(chunk, str) and chunk.startswith("\n\n__META__"):
+            try:
+                meta = json.loads(chunk.replace("\n\n__META__", ""))
+                yield {
+                    "type":       "retrieval",
+                    "intent":     meta.get("intent"),
+                    "confidence": meta.get("confidence"),
+                    "sources":    meta.get("retrieved_documents", []),
+                    "usage":      meta.get("usage", {}),
+                }
+            except Exception as e:
+                logger.error(f"Meta parse error: {e}")
+        else:
+            yield {"type": "content", "delta": chunk}
