@@ -20,6 +20,8 @@ class User(Base):
     max_sessions = Column(Integer, default=1)  # Dynamic session limit
     is_verified = Column(Boolean, default=False)
     verification_token = Column(String, unique=True, index=True, nullable=True)
+    reset_password_token = Column(String, unique=True, index=True, nullable=True)
+    reset_password_expires = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")

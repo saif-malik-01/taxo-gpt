@@ -8,12 +8,13 @@ from pydantic import BaseModel
 
 from apps.api.src.services.auth.deps import admin_guard
 from apps.api.src.db.session import get_db
-from apps.api.src.db.models.base import User, CreditPackage, Coupon, PaymentTransaction, ChatMessage, ChatSession, UserUsage
 from apps.api.src.schemas.payments import (
     PackageCreate, PackageUpdate, CouponCreate, CouponUpdate,
     PackageResponse, CouponResponse
 )
-from apps.api.src.schemas.user import UserResponseAdmin
+from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
+from apps.api.src.services.auth.utils import get_password_hash
+from apps.api.src.db.models.base import UserProfile, UserUsage, User
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -21,6 +22,8 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 class UserUpdateAdmin(BaseModel):
     role: Optional[str] = None
     max_sessions: Optional[int] = None
+    password: Optional[str] = None
+    is_verified: Optional[bool] = None
 
 class UserUsageUpdateAdmin(BaseModel):
     simple_query_balance: Optional[int] = None
@@ -31,6 +34,34 @@ class UserUsageUpdateAdmin(BaseModel):
 async def list_users(admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User))
     return result.scalars().all()
+
+@router.post("/users", response_model=UserResponseAdmin)
+async def create_user_admin(payload: UserCreateAdmin, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    email = payload.email.lower()
+    # Check if exists
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    new_user = User(
+        email=email,
+        password_hash=get_password_hash(payload.password),
+        full_name=payload.full_name,
+        mobile_number=payload.mobile_number,
+        country=payload.country,
+        role=payload.role,
+        is_verified=payload.is_verified
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    # Initialize profile and usage
+    db.add(UserProfile(user_id=new_user.id))
+    db.add(UserUsage(user_id=new_user.id))
+    await db.commit()
+    
+    return new_user
 
 @router.get("/users/{user_id}", response_model=UserResponseAdmin)
 async def get_user(user_id: int, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
@@ -51,6 +82,10 @@ async def update_user(user_id: int, payload: UserUpdateAdmin, admin_user=Depends
         user.role = payload.role
     if payload.max_sessions is not None:
         user.max_sessions = payload.max_sessions
+    if payload.password is not None:
+        user.password_hash = get_password_hash(payload.password)
+    if payload.is_verified is not None:
+        user.is_verified = payload.is_verified
     
     await db.commit()
     await db.refresh(user)

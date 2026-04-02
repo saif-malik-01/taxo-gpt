@@ -21,7 +21,7 @@ from apps.api.src.core.config import settings
 from apps.api.src.schemas.auth import (
     LoginRequest, LoginResponse, GoogleLoginRequest, 
     FacebookLoginRequest, RegisterRequest, RegisterResponse,
-    VerifyEmailRequest, ResendVerificationRequest
+    VerifyEmailRequest, ResendVerificationRequest, ForgotPasswordRequest, ResetPasswordRequest
 )
 from apps.api.src.schemas.user import ProfileUpdate
 from apps.api.src.services.email import EmailService
@@ -245,6 +245,42 @@ async def resend_verification(payload: ResendVerificationRequest, db: AsyncSessi
     await db.commit()
     EmailService.send_verification_email(email=user.email, token=token, full_name=user.full_name)
     return {"message": "Verification email resent."}
+    
+@router.post("/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    from datetime import datetime, timedelta, timezone
+    email = payload.email.lower()
+    result = await db.execute(select(User).where(func.lower(User.email) == email))
+    user = result.scalars().first()
+    
+    # We return success even if user not found for security (prevent email enumeration)
+    if user:
+        token = str(uuid.uuid4())
+        user.reset_password_token = token
+        user.reset_password_expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        await db.commit()
+        EmailService.send_password_reset_email(email=user.email, token=token, full_name=user.full_name)
+    
+    return {"message": "If that email is registered, you will receive a reset link shortly."}
+
+@router.post("/reset-password")
+async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    from datetime import datetime, timezone
+    result = await db.execute(select(User).where(User.reset_password_token == payload.token))
+    user = result.scalars().first()
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid token")
+    
+    if user.reset_password_expires < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Token expired")
+    
+    user.password_hash = get_password_hash(payload.new_password)
+    user.reset_password_token = None
+    user.reset_password_expires = None
+    await db.commit()
+    
+    return {"message": "Password reset successful.", "is_success": True}
 
 @router.post("/logout")
 async def logout(user=Depends(auth_guard)):
