@@ -109,23 +109,18 @@ class RetrievalPipeline:
         stage2a, stage2b, intent = self._extractor.extract(final_query)
         keyword_doc = build_bm25_keyword_document(stage2a, stage2b)
 
-        # -- Stage 3 + Stage 4 -----------------------------------------
-        citation_result = None
-        chunks = []
-
-        fut_citation = rag_executor.submit(
-            self._citation.run,
+        # -- Stage 3: Citation (Sequential) ----------------------------
+        citation_result = self._citation.run(
             stage2a.citation, stage2b.citation, stage2b,
             intent.intent, intent.confidence,
         )
-        fut_retrieval = rag_executor.submit(
-            self._retrieval.retrieve,
+
+        # -- Stage 4: Retrieval (Parallel searches within) -------------
+        chunks = self._retrieval.retrieve(
             final_query, keyword_doc, stage2b, intent,
             None,
             stage2b.citation or stage2a.citation,
         )
-        citation_result = fut_citation.result()
-        chunks          = fut_retrieval.result()
 
         # -- Stage 5  -  Filter ------------------------------------------
         chunks = self._scorer.filter(chunks, stage2b, intent)
