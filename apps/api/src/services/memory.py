@@ -150,6 +150,21 @@ async def check_credits(user_id: int, session_id: str, has_files: bool, db: Asyn
         db.add(usage)
         await db.commit()
 
+    # --- Guard 0: Expiry check ---
+    now = datetime.now(timezone.utc)
+    # Ensure current timestamp is tz-aware if the DB one is
+    if usage.credits_expire_at:
+        expire_at = usage.credits_expire_at
+        if expire_at.tzinfo is None:
+            expire_at = expire_at.replace(tzinfo=timezone.utc)
+            
+        if now > expire_at:
+            # Credits have expired, wipe balances
+            usage.simple_query_balance = 0
+            usage.draft_reply_balance = 0
+            await db.commit()
+            return False, "Your credits have expired on {}. Please purchase a new package to continue.".format(expire_at.strftime("%Y-%m-%d"))
+
     # --- Guard 1: Balance check ---
     if (usage.simple_query_balance or 0) <= 0:
         return False, "Insufficient balance. Please upgrade your plan."

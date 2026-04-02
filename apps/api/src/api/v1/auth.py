@@ -1,5 +1,7 @@
 import logging
 import uuid
+import json
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from sqlalchemy import func
@@ -226,7 +228,10 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     await db.refresh(new_user)
 
     db.add(UserProfile(user_id=new_user.id))
-    db.add(UserUsage(user_id=new_user.id))
+    db.add(UserUsage(
+        user_id=new_user.id,
+        credits_expire_at=datetime.now(timezone.utc) + timedelta(days=365)
+    ))
     await db.commit()
 
     EmailService.send_verification_email(email=email, token=verification_token, full_name=payload.full_name)
@@ -381,13 +386,17 @@ async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
 
 @router.get("/credits")
 async def get_credits(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    from datetime import datetime, timedelta, timezone
     user_id = user.get("id")
     res = await db.execute(
         select(UserUsage).where(UserUsage.user_id == user_id)
     )
     usage = res.scalars().first()
     if not usage:
-        usage = UserUsage(user_id=user_id)
+        usage = UserUsage(
+            user_id=user_id,
+            credits_expire_at=datetime.now(timezone.utc) + timedelta(days=365)
+        )
         db.add(usage)
         await db.commit()
     

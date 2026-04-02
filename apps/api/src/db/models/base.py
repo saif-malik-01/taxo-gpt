@@ -80,6 +80,8 @@ class UserUsage(Base):
     monthly_tokens_used = Column(BigInteger, default=0)
     monthly_reset_date  = Column(DateTime(timezone=True), server_default=func.now())
     
+    credits_expire_at = Column(DateTime(timezone=True), nullable=True)
+    
     last_updated = Column(DateTime(timezone=True), onupdate=func.now())
     
     user = relationship("User", back_populates="usage")

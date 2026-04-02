@@ -66,6 +66,9 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
             
         usage.draft_reply_balance += package.credits_added
         
+        # Reset expiration to 1 year from now on purchase
+        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=365)
+        
         db.add(CreditLog(
             user_id=user_id, amount=package.credits_added, credit_type="draft",
             transaction_type="purchase", reference_id=order_id
@@ -108,6 +111,9 @@ async def verify_payment(order_id: str, payment_id: str, signature: str, db: Asy
             usage = UserUsage(user_id=transaction.user_id); db.add(usage); await db.flush()
             
         usage.draft_reply_balance += transaction.credits_added
+        
+        # Reset expiration to 1 year from now on purchase
+        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=365)
         db.add(CreditLog(
             user_id=transaction.user_id, amount=transaction.credits_added, credit_type="draft",
             transaction_type="purchase", reference_id=transaction.order_id
