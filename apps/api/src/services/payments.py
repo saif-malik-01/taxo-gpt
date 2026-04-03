@@ -1,7 +1,7 @@
 import razorpay
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -177,7 +177,15 @@ async def validate_coupon_logic(coupon_code: str, package_name: str, db: AsyncSe
     coupon = res_c.scalars().first()
     if not coupon: raise ValueError("Invalid or inactive coupon")
     
-    res_p = await db.execute(select(CreditPackage).where(CreditPackage.name == package_name))
+    now = datetime.now(timezone.utc)
+    if coupon.valid_from and coupon.valid_from > now:
+        raise ValueError("Coupon is not valid yet")
+    if coupon.valid_until and coupon.valid_until < now:
+        raise ValueError("Coupon has expired")
+    if coupon.max_uses and coupon.current_uses >= coupon.max_uses:
+        raise ValueError("Coupon maximum usage limit reached")
+    
+    res_p = await db.execute(select(CreditPackage).where(CreditPackage.name == package_name, CreditPackage.is_active == True))
     pkg = res_p.scalars().first()
     if not pkg: raise ValueError("Invalid package name")
     

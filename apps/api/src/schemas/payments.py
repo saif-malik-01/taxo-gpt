@@ -70,3 +70,34 @@ class CouponResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+class TransactionPackageInfo(BaseModel):
+    id: int
+    name: Optional[str] = None
+    title: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+class TransactionUserInfo(BaseModel):
+    id: int
+    email: str
+    full_name: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+class TransactionResponse(BaseModel):
+    id: int
+    order_id: str
+    payment_id: Optional[str] = None
+    amount: Optional[int] = 0
+    currency: Optional[str] = "INR"
+    credits_added: Optional[int] = 0
+    discount_amount: Optional[int] = 0
+    status: Optional[str] = "pending"
+    created_at: Optional[datetime] = None
+    package: Optional[TransactionPackageInfo] = None
+
+    model_config = {"from_attributes": True}
+
+class AdminTransactionResponse(TransactionResponse):
+    user: Optional[TransactionUserInfo] = None

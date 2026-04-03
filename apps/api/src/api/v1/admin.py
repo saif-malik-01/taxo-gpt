@@ -10,8 +10,9 @@ from apps.api.src.services.auth.deps import admin_guard
 from apps.api.src.db.session import get_db
 from apps.api.src.schemas.payments import (
     PackageCreate, PackageUpdate, CouponCreate, CouponUpdate,
-    PackageResponse, CouponResponse
+    PackageResponse, CouponResponse, AdminTransactionResponse
 )
+from sqlalchemy.orm import joinedload
 from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
 from apps.api.src.services.auth.utils import get_password_hash
 from apps.api.src.db.models.base import UserProfile, UserUsage, User, ChatSession, ChatMessage, CreditPackage, PaymentTransaction, Coupon
@@ -190,6 +191,17 @@ async def create_coupon(payload: CouponCreate, admin_user=Depends(admin_guard), 
     await db.refresh(new_coupon)
     return new_coupon
 
+@router.get("/payments/transactions", response_model=List[AdminTransactionResponse])
+async def list_all_transactions(admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+    """Get all payment transactions with package and user details across the platform."""
+    res = await db.execute(
+        select(PaymentTransaction)
+        .options(joinedload(PaymentTransaction.package), joinedload(PaymentTransaction.user))
+        .order_by(PaymentTransaction.created_at.desc())
+        .limit(200)
+    )
+    return res.scalars().all()
+
 @router.get("/analytics")
 async def get_analytics(
     user_id: Optional[int] = None,
@@ -357,6 +369,7 @@ async def delete_package(package_id: int, admin_user=Depends(admin_guard), db: A
         # Soft delete
         pkg.is_deleted = True
         pkg.is_active = False
+        pkg.name = f"{pkg.name}_deleted_{int(datetime.now(timezone.utc).timestamp())}"
         await db.commit()
         return {"status": "archived", "message": "Package archived as it has transaction history"}
     
@@ -400,6 +413,7 @@ async def delete_coupon(coupon_id: int, admin_user=Depends(admin_guard), db: Asy
         # Soft delete
         coupon.is_deleted = True
         coupon.is_active = False
+        coupon.code = f"{coupon.code}_deleted_{int(datetime.now(timezone.utc).timestamp())}"
         await db.commit()
         return {"status": "archived", "message": "Coupon archived as it has transaction history"}
     

@@ -4,12 +4,15 @@ from sqlalchemy import select, func, update
 from typing import Optional, List
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.orm import joinedload
+
 from apps.api.src.db.session import get_db
 from apps.api.src.services.auth.deps import auth_guard, admin_guard
 from apps.api.src.db.models.base import CreditPackage, Coupon, PaymentTransaction, User, CreditLog
 from apps.api.src.schemas.payments import (
     OrderRequest, VerifyRequest, PackageCreate, 
-    PackageUpdate, CouponCreate, CouponUpdate, CouponValidateRequest
+    PackageUpdate, CouponCreate, CouponUpdate, CouponValidateRequest,
+    TransactionResponse
 )
 
 from apps.api.src.services.payments import create_razorpay_order, verify_payment, validate_coupon_logic, send_invoice_background
@@ -53,5 +56,18 @@ async def validate_coupon(payload: CouponValidateRequest, db: AsyncSession = Dep
     try:
         return await validate_coupon_logic(payload.coupon_code, payload.package_name, db)
     except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/transactions", response_model=List[TransactionResponse])
+async def get_user_transactions(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    """Get the user's actual payment/order history with package details."""
+    user_id = user.get("id")
+    res = await db.execute(
+        select(PaymentTransaction)
+        .options(joinedload(PaymentTransaction.package))
+        .where(PaymentTransaction.user_id == user_id)
+        .order_by(PaymentTransaction.created_at.desc())
+        .limit(100)
+    )
+    return res.scalars().all()
 
 # All administrative package/coupon logic moved to api/v1/admin.py
