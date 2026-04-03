@@ -65,12 +65,6 @@ app.add_middleware(
 async def startup_event():
     logger.info(f"Starting {settings.PROJECT_NAME}...")
 
-    # Concurrency gate: caps simultaneous RAG pipelines to prevent thread
-    # explosion and OOM on the 1 vCPU / 2 GB ECS container.
-    # Requests exceeding this cap receive an immediate 503 (fast-fail).
-    app.state.chat_semaphore = asyncio.Semaphore(10)
-    logger.info("Chat concurrency semaphore initialised (max_slots=10)")
-
     try:
         start_scheduler()
         logger.info("Scheduler started")
