@@ -3,15 +3,17 @@ apps/api/src/services/rag/retrieval/hydrator.py
 Logic for converting a list of Qdrant chunk IDs back into full source objects (with full judgments).
 """
 
+import asyncio
 import json
 import logging
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
 
 from apps.api.src.core.config import settings
 from apps.api.src.db.session import get_redis
 from apps.api.src.services.rag.retrieval.responder import _fetch_full_judgment, _doc_summary
+from apps.api.src.services.rag.executor import rag_executor
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,10 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
 
     # 2. Fetch from Qdrant
     try:
-        results = qdrant.retrieve(
+        # Qdrant client here is synchronous (blocking). Offload to a worker
+        # so concurrent requests don't stall the event loop.
+        results = await run_in_threadpool(
+            qdrant.retrieve,
             collection_name=settings.QDRANT_COLLECTION,
             ids=ids_to_fetch,
             with_payload=True,
@@ -74,6 +79,10 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
         )
         
         seen_identifiers = set()
+
+        # We may need to reconstruct full judgments (extra blocking Qdrant scrolls).
+        # Run those on the same bounded pool used across RAG.
+        judgment_futures: List[tuple[int, Any]] = []
 
         for r in results:
             if not r.payload: continue
@@ -95,19 +104,48 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
             # Ensure the Point ID is set correctly in the summary for the frontend
             summary["chunk_id"] = str(r.id)
             
-            # Handle full judgments (just like active stream)
+            # Handle full judgments (just like active stream).
+            # We defer the actual blocking Qdrant scroll into a bounded worker.
             if payload.get("chunk_type") == "judgment":
-                full_judgment = _fetch_full_judgment(qdrant, payload)
-                if full_judgment:
-                    summary["full_judgment"] = full_judgment
+                idx = len(hydrated_sources)
+                full_future = rag_executor.submit(_fetch_full_judgment, qdrant, payload)
+                judgment_futures.append((idx, full_future))
             
-            # Cache the result for 24 hours
-            try:
-                await redis.setex(f"hydrated_source:{r.id}", 86400, json.dumps(summary))
-            except Exception: pass
-            
+            # Cache after enrichment: judgments need full_judgment first (see gather below).
+            if payload.get("chunk_type") != "judgment":
+                try:
+                    await redis.setex(
+                        f"hydrated_source:{r.id}", 86400, json.dumps(summary)
+                    )
+                except Exception:
+                    pass
+
             hydrated_sources.append(summary)
             
+        # Resolve all pending full-judgment futures.
+        # This prevents one judgment scroll from blocking other requests.
+        if judgment_futures:
+            idxs = [i for i, _ in judgment_futures]
+            futures = [f for _, f in judgment_futures]
+            full_judgments = await asyncio.gather(
+                *(asyncio.wrap_future(f) for f in futures),
+                return_exceptions=True,
+            )
+            for idx, full_data in zip(idxs, full_judgments):
+                if isinstance(full_data, Exception):
+                    full_data = None
+                if full_data:
+                    hydrated_sources[idx]["full_judgment"] = full_data
+                try:
+                    pt_id = hydrated_sources[idx]["chunk_id"]
+                    await redis.setex(
+                        f"hydrated_source:{pt_id}",
+                        86400,
+                        json.dumps(hydrated_sources[idx]),
+                    )
+                except Exception:
+                    pass
+
     except Exception as e:
         logger.error(f"Hydration error for IDs {ids_to_fetch}: {e}")
 
