@@ -5,7 +5,7 @@ Stage 6 — Cross-reference enrichment + LLM response generation.
 
 import re
 import json as _json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -13,6 +13,7 @@ from qdrant_client.http import models as qmodels
 
 from apps.api.src.core.config import settings
 from apps.api.src.services.llm.bedrock import BedrockLLMClient
+from apps.api.src.services.rag.executor import rag_executor
 from apps.api.src.services.rag.models import (
     CitationResult, FinalResponse, IntentResult,
     ScoredChunk, SessionMessage,
@@ -21,9 +22,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_MAX_CROSS_REFS  = 2          # reduced from 3 — fewer blocking Qdrant calls
-_MAX_TOKENS_RESP = 4096
-_ENRICH_WORKERS  = 6          # parallel scroll calls inside enrich()
+_MAX_CROSS_REFS        = 2    # max cross-ref chunks injected into final answer
+_MAX_TOKENS_RESP       = 4096
 _TOP_CHUNKS_FOR_ENRICH = 5    # only inspect top-5 chunks for cross-refs
 
 
@@ -85,10 +85,9 @@ class CrossRefEnricher:
     Fetches up to _MAX_CROSS_REFS supporting chunks from cross-references
     embedded in the top retrieved chunks.
 
-    All Qdrant scroll calls are executed in parallel (ThreadPoolExecutor)
-    so the total wait time equals the slowest single call, not the sum.
-    Capped at _TOP_CHUNKS_FOR_ENRICH source chunks and _ENRICH_WORKERS
-    parallel workers to keep latency bounded.
+    All Qdrant scroll calls are submitted to the shared global rag_executor
+    and collected with as_completed(), so total wait = slowest single call.
+    Capped at _TOP_CHUNKS_FOR_ENRICH source chunks to keep latency bounded.
     """
 
     def __init__(self, qdrant: QdrantClient):
@@ -140,25 +139,26 @@ class CrossRefEnricher:
             return []
 
         results: Dict[str, Dict] = {}
-        with ThreadPoolExecutor(max_workers=min(_ENRICH_WORKERS, len(lookups))) as ex:
-            future_map = {
-                ex.submit(self._scroll, key, value): cache_key
-                for key, value, cache_key in lookups
-            }
-            for future in as_completed(future_map):
-                cache_key = future_map[future]
-                try:
-                    chunks_found = future.result()
-                except Exception as e:
-                    logger.debug(f"Cross-ref fetch failed [{cache_key}]: {e}")
-                    continue
+        # Submit to the shared global pool — avoids creating a new
+        # ThreadPoolExecutor per request (which caused thread explosion under load).
+        future_map = {
+            rag_executor.submit(self._scroll, key, value): cache_key
+            for key, value, cache_key in lookups
+        }
+        for future in as_completed(future_map):
+            cache_key = future_map[future]
+            try:
+                chunks_found = future.result()
+            except Exception as e:
+                logger.debug(f"Cross-ref fetch failed [{cache_key}]: {e}")
+                continue
 
-                if chunks_found and cache_key not in results:
-                    results[cache_key] = chunks_found[0]
-                    if len(results) >= _MAX_CROSS_REFS:
-                        for f in future_map:
-                            f.cancel()
-                        break
+            if chunks_found and cache_key not in results:
+                results[cache_key] = chunks_found[0]
+                if len(results) >= _MAX_CROSS_REFS:
+                    for f in future_map:
+                        f.cancel()
+                    break
 
         result_list = list(results.values())[:_MAX_CROSS_REFS]
         logger.info(f"Cross-ref enrichment: {len(result_list)} extra chunks "
@@ -560,22 +560,22 @@ def _build_docs_list(
         _add(chunk, "cross_reference", 0.0)
         
     if qdrant and judgments_to_fetch:
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            future_to_id = {
-                ex.submit(_fetch_full_judgment, qdrant, payload): ident
-                for ident, payload in judgments_to_fetch.items()
-            }
-            for future in as_completed(future_to_id):
-                ident = future_to_id[future]
-                try:
-                    full_data = future.result()
-                    if full_data:
-                        for d in docs:
-                            if d.get("identifier") == ident:
-                                d["full_judgment"] = full_data
-                                break
-                except Exception as e:
-                    logger.error(f"Error fetching full judgment for {ident}: {e}")
+        # Reuse global pool — no per-call ThreadPoolExecutor creation.
+        future_to_id = {
+            rag_executor.submit(_fetch_full_judgment, qdrant, payload): ident
+            for ident, payload in judgments_to_fetch.items()
+        }
+        for future in as_completed(future_to_id):
+            ident = future_to_id[future]
+            try:
+                full_data = future.result()
+                if full_data:
+                    for d in docs:
+                        if d.get("identifier") == ident:
+                            d["full_judgment"] = full_data
+                            break
+            except Exception as e:
+                logger.error(f"Error fetching full judgment for {ident}: {e}")
 
     return docs
 

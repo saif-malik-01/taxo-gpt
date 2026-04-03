@@ -1,8 +1,9 @@
+import asyncio
 import uuid
 import json
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
@@ -79,6 +80,7 @@ async def delete_session(session_id: str, user=Depends(auth_guard), db: AsyncSes
 
 @router.post("/chat/ask/stream/simple")
 async def ask_gst_stream_simple(
+    request: Request,
     payload: ChatRequest,
     background_tasks: BackgroundTasks,
     user=Depends(auth_guard),
@@ -88,11 +90,22 @@ async def ask_gst_stream_simple(
     session_id = payload.session_id or str(uuid.uuid4())
     user_id = user.get("id")
 
+    # ── Concurrency gate ───────────────────────────────────────────────────────
+    # Fast-reject when all 5 RAG pipeline slots are occupied. Prevents thread
+    # explosion and OOM crashes on the 1 vCPU / 2 GB ECS container.
+    sem: asyncio.Semaphore = request.app.state.chat_semaphore
+    if not sem._value:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is at capacity. Please try again in a moment."
+        )
+
     allowed, error_msg = await check_credits(user_id, session_id, False, db, chat_mode="simple")
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
     async def stream_generator():
+        await sem.acquire()
         try:
             # ── Handle Message (New vs Edit) ──────────────────────────────
             if payload.message_id:
@@ -152,11 +165,15 @@ async def ask_gst_stream_simple(
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
             yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+        finally:
+            sem.release()
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
+
 @router.post("/chat/ask/stream/draft")
 async def ask_gst_stream_draft(
+    request: Request,
     payload: ChatRequest,
     background_tasks: BackgroundTasks,
     user=Depends(auth_guard),
@@ -166,11 +183,20 @@ async def ask_gst_stream_draft(
     session_id = payload.session_id or str(uuid.uuid4())
     user_id = user.get("id")
 
+    # ── Concurrency gate ──────────────────────────────────────────────────────────────────────────────
+    sem: asyncio.Semaphore = request.app.state.chat_semaphore
+    if not sem._value:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is at capacity. Please try again in a moment."
+        )
+
     allowed, error_msg = await check_credits(user_id, session_id, True, db, chat_mode="draft")
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
     async def stream_generator():
+        await sem.acquire()
         try:
             if payload.message_id:
                 await edit_message_and_truncate(session_id, payload.message_id, question)
@@ -206,6 +232,8 @@ async def ask_gst_stream_draft(
         except Exception as e:
             logger.error(f"Draft stream error: {e}", exc_info=True)
             yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+        finally:
+            sem.release()
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 

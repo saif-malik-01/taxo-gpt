@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     TITAN_NORMALIZE: bool = True
     PIPELINE_MAX_RETRIES: int = 3
     PIPELINE_RETRY_DELAY: float = 2.0
-    GLOBAL_EXECUTOR_WORKERS: int = 100
+    GLOBAL_EXECUTOR_WORKERS: int = 4   # 1 vCPU: 4 workers is optimal for I/O-bound Qdrant/Bedrock tasks
 
     class Config:
         env_file = ".env"
