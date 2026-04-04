@@ -311,7 +311,7 @@ async def logout(user=Depends(auth_guard)):
     return {"status": "logged out"}
 
 @router.post("/heartbeat")
-async def maintain_heartbeat(user=Depends(auth_guard)):
+async def maintain_heartbeat(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
     """
     Called by Frontend via setInterval every 1 or 2 minutes to block session from 
     garbage collection and dying from inactivity TTL. Needs Bearer token.
