@@ -26,24 +26,33 @@ async def auto_update_profile(user_id: int, query: str, response: str):
             current_summary = profile.dynamic_summary or "No facts known yet."
 
             # 2. Extract ONLY explicit user attributes from the user's own message
-            extraction_prompt = f"""You are a background system that extracts PERMANENT USER ATTRIBUTES from a user's message.
+            extraction_prompt = f"""You are a background system that extracts PERMANENT, LONG-TERM user attributes from a message. 
 
-STRICT RULES:
-- Extract ONLY what the user explicitly stated about themselves in their own message
-- ONLY extract: profession, designation, industry, GST registration type, preferred response style, preferred language, ongoing matters they explicitly stated they are working on
-- DO NOT extract: case names, judgment names, legal topics, questions they asked, legal issues they mentioned
-- DO NOT infer anything — only extract directly stated facts
-- DO NOT extract anything from context or implications
-- If the user did not explicitly state anything about themselves, output "NONE"
+Your goal is to extract ONLY facts that will still be true and useful 6 months from now.
 
-User Message:
+STRICT EXTRACTION RULES:
+1. ONLY extract information the user EXPLICITLY stated about themselves.
+2. ONLY extract: 
+   - Profession/Designation (e.g. "CA", "Advocate", "Business Owner")
+   - Industry/Sector (e.g. "Real Estate", "Exports", "E-commerce")
+   - Technical Profile (e.g. "Composition taxpayer", "SEZ unit")
+   - Permanent Preferences (e.g. "always give me sections first", "respond in Hindi")
+3. NEVER extract:
+   - Case names, party names, or legal citations.
+   - Specific questions, problems, or transient issues ("I have a notice today").
+   - Names of clients or temporary project details.
+   - Opinions or feelings that might change.
+4. "IF IN DOUBT, LEAVE IT OUT": If a fact seems temporary, specific to a single interaction, or ambiguous, do not extract it.
+5. If NO permanent long-term facts are explicitly stated, output exactly "NONE".
+
+User Message to Analyze:
 {query}
 
-Return JSON only:
+Output Format (JSON only):
 {{
-  "user_preferences": [],
-  "facts": [],
-  "ongoing_goals": []
+  "user_preferences": ["Style/language preferences. Example: 'Prefers Hindi responses'"],
+  "facts": ["Self-identity facts. Example: 'CA by profession', 'Works in Exports'"],
+  "ongoing_goals": ["Enduring career/business goals. Example: 'Wants to specialize in SEZ consulting'"]
 }}"""
 
             raw_output, usage = await run_in_threadpool(call_bedrock, extraction_prompt)
