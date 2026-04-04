@@ -116,7 +116,11 @@ async def get_user_profile(user_id: int):
         return res.scalar_one_or_none()
 
 async def track_usage(user_id: int, session_id: str, db: AsyncSession, usage: dict = None, force_deduct: bool = False):
-    res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
+    res = await db.execute(
+        select(UserUsage)
+        .options(selectinload(UserUsage.user))
+        .where(UserUsage.user_id == user_id)
+    )
     user_usage = res.scalars().first()
     if not user_usage:
         user_usage = UserUsage(user_id=user_id)
@@ -139,6 +143,21 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession, usage: di
     if force_deduct:
         user_usage.simple_query_used    = (user_usage.simple_query_used    or 0) + 1
         user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 1_000_000) - 1)
+        
+        # --- Low credit notification (Target: specifically 1 credit left) ---
+        if user_usage.simple_query_balance == 1 and user_usage.user:
+            try:
+                # We run this in a threadpool to avoid blocking the async flow if SMTP is slow
+                await run_in_threadpool(
+                    EmailService.send_low_credit_notification,
+                    email=user_usage.user.email,
+                    balance=1,
+                    credit_type="tax intelligence",
+                    full_name=user_usage.user.full_name
+                )
+                logger.info(f"Low credit notification sent to user {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to send low credit notification: {e}")
 
     await db.commit()
 

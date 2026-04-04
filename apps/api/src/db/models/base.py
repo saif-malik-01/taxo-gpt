@@ -22,6 +22,8 @@ class User(Base):
     verification_token = Column(String, unique=True, index=True, nullable=True)
     reset_password_token = Column(String, unique=True, index=True, nullable=True)
     reset_password_expires = Column(DateTime(timezone=True), nullable=True)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    reengagement_email_sent_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")

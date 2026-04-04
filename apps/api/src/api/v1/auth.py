@@ -52,6 +52,7 @@ async def login(payload: LoginRequest, request: Request, db: AsyncSession = Depe
     }
     
     try:
+        user.last_login_at = datetime.now(timezone.utc)
         await add_session(user.id, session_id, user.max_sessions, metadata)
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e)) # Rejects login due to Limit constraint!
@@ -129,6 +130,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request, db: AsyncS
             "identifier": "Google Social Login"
         }
         try:
+            user.last_login_at = datetime.now(timezone.utc)
             await add_session(user.id, session_id, user.max_sessions, metadata)
         except ValueError as e:
             raise HTTPException(status_code=403, detail=str(e))
@@ -193,6 +195,7 @@ async def facebook_login(payload: FacebookLoginRequest, request: Request, db: As
             "identifier": "Facebook Social Login"
         }
         try:
+            user.last_login_at = datetime.now(timezone.utc)
             await add_session(user.id, session_id, user.max_sessions, metadata)
         except ValueError as e:
             raise HTTPException(status_code=403, detail=str(e))
@@ -324,6 +327,13 @@ async def maintain_heartbeat(user=Depends(auth_guard)):
     if not alive:
         # If frontend missed strict TTL (5 mins), we forcibly bounce them out
         raise HTTPException(status_code=401, detail="Session expired due to inactivity or closure.")
+    
+    # Update last active time
+    result = await db.execute(select(User).where(User.id == user_id))
+    db_user = result.scalars().first()
+    if db_user:
+        db_user.last_login_at = datetime.now(timezone.utc)
+        await db.commit()
     
     response = {"status": "alive"}
     
