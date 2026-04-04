@@ -118,8 +118,9 @@ class EmailService:
         return EmailService.send_email(subject, html_content, email)
 
     @staticmethod
-    def send_invoice_email(email: str, invoice_pdf: bytes, order_id: str, amount: float, full_name: str = None):
-        subject = f"Invoice for your TaxoBuddy Order {order_id}"
+    def send_invoice_email(email: str, invoice_pdf: bytes, order_id: str, amount: float, invoice_num: str = None, full_name: str = None):
+        invoice_identifier = invoice_num or order_id
+        subject = f"Invoice {invoice_identifier} for your TaxoBuddy Order"
         amount_inr = amount / 100
         name_greeting = f"Hi {full_name}," if full_name else "Hi there,"
         
@@ -142,6 +143,7 @@ class EmailService:
                     <div class="content">
                         <p>{name_greeting}</p>
                         <p>Thank you for choosing TaxoBuddy! Your order <strong>{order_id}</strong> has been successfully processed.</p>
+                        <p>Official Invoice Number: <strong>{invoice_identifier}</strong></p>
                         
                         <div class="amount-box">
                             <div style="font-size: 14px; color: #64748b; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;">Total Amount Paid</div>
@@ -161,7 +163,7 @@ class EmailService:
         """
         
         attachments = [{
-            "filename": f"TaxoBuddy_Invoice_{order_id}.pdf",
+            "filename": f"TaxoBuddy_Invoice_{invoice_identifier.replace('/', '_')}.pdf",
             "content": invoice_pdf
         }]
         

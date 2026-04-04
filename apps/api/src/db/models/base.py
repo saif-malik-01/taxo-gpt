@@ -112,6 +112,7 @@ class PaymentTransaction(Base):
     
     order_id = Column(String, unique=True, index=True) # Razorpay Order ID
     payment_id = Column(String, nullable=True) # Razorpay Payment ID
+    invoice_number = Column(String, unique=True, index=True, nullable=True) # TB/26-27/001
     amount = Column(Integer) # In paise/cents
     currency = Column(String, default="INR")
     

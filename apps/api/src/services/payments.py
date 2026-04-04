@@ -2,7 +2,7 @@ import razorpay
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -16,6 +16,34 @@ logger = logging.getLogger(__name__)
 
 # Initialize Razorpay client
 client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+
+async def assign_invoice_number(db: AsyncSession, transaction: PaymentTransaction):
+    """
+    Generates and assigns an invoice number following the TB/YY-YY/NNN pattern.
+    Resets NNN for each financial year (April - March).
+    """
+    now = datetime.now(timezone.utc)
+    # Financial Year Logic (India)
+    if now.month >= 4:
+        fy_start = now.year
+        fy_end = now.year + 1
+    else:
+        fy_start = now.year - 1
+        fy_end = now.year
+    
+    fy_str = f"{str(fy_start)[2:]}-{str(fy_end)[2:]}"
+    prefix = f"TB/{fy_str}/"
+    
+    # Query count of completed transactions with same FY prefix
+    res = await db.execute(
+        select(func.count(PaymentTransaction.id))
+        .where(PaymentTransaction.invoice_number.like(f"{prefix}%"))
+    )
+    count = res.scalar() or 0
+    next_number = f"{prefix}{str(count + 1).zfill(3)}"
+    
+    transaction.invoice_number = next_number
+    return next_number
 
 async def create_razorpay_order(user_id: int, package_name: str, coupon_code: str | None, db: AsyncSession):
     res = await db.execute(select(CreditPackage).where(CreditPackage.name == package_name, CreditPackage.is_active == True))
@@ -58,6 +86,8 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="completed"
         )
         db.add(transaction)
+        await db.flush() # Get id
+        await assign_invoice_number(db, transaction)
         
         res_u = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
         usage = res_u.scalars().first()
@@ -104,6 +134,7 @@ async def verify_payment(order_id: str, payment_id: str, signature: str, db: Asy
         if not transaction or transaction.status == "completed": return False
         
         transaction.payment_id = payment_id; transaction.status = "completed"
+        await assign_invoice_number(db, transaction)
         
         res = await db.execute(select(UserUsage).where(UserUsage.user_id == transaction.user_id))
         usage = res.scalars().first()
@@ -148,6 +179,7 @@ async def send_invoice_background(order_id: str):
                 
                 transaction_info = {
                     "order_id": full_tx.order_id,
+                    "invoice_number": full_tx.invoice_number or full_tx.order_id, # Fallback
                     "payment_id": full_tx.payment_id or "N/A",
                     "date": full_tx.created_at or current_time,
                     "user_name": full_tx.user.full_name,
@@ -163,6 +195,7 @@ async def send_invoice_background(order_id: str):
                     email=full_tx.user.email,
                     invoice_pdf=pdf_bytes,
                     order_id=full_tx.order_id,
+                    invoice_num=full_tx.invoice_number,
                     amount=full_tx.amount or 0,
                     full_name=full_tx.user.full_name
                 )

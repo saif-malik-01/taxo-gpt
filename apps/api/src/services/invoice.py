@@ -40,12 +40,13 @@ class InvoiceGenerator:
         pdf.set_font("Helvetica", "", 10)
         date_obj = transaction_data.get("date") or datetime.now()
         current_date = date_obj.strftime("%B %d, %Y")
+        invoice_num = transaction_data.get("invoice_number", "N/A")
         order_id = transaction_data.get("order_id", "N/A")
         payment_id = transaction_data.get("payment_id", "N/A")
         
-        pdf.cell(100, 7, f"Invoice Date: {current_date}", ln=False)
+        pdf.cell(100, 7, f"Invoice No: {invoice_num}", ln=False)
         pdf.cell(0, 7, f"Order ID: {order_id}", ln=True, align="R")
-        pdf.cell(100, 7, "", ln=False)
+        pdf.cell(100, 7, f"Invoice Date: {current_date}", ln=False)
         pdf.cell(0, 7, f"Payment ID: {payment_id}", ln=True, align="R")
         pdf.ln(10)
         
