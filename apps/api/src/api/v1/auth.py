@@ -221,6 +221,8 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
         password_hash=get_password_hash(payload.password),
         full_name=payload.full_name,
         mobile_number=payload.mobile_number,
+        state=payload.state,
+        gst_number=payload.gst_number,
         country=payload.country,
         role=payload.role,
         is_verified=False,
@@ -380,8 +382,8 @@ async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
     return {
         "user": {
             "id": db_user.id, "email": db_user.email, "full_name": db_user.full_name,
-            "mobile_number": db_user.mobile_number, "country": db_user.country,
-            "role": db_user.role, 
+            "mobile_number": db_user.mobile_number, "state": db_user.state, "gst_number": db_user.gst_number,
+            "country": db_user.country, "role": db_user.role, 
             "profile": {
                 "dynamic_summary": db_user.profile.dynamic_summary if db_user.profile else None,
                 "preferences": db_user.profile.preferences if db_user.profile else {}
@@ -428,11 +430,28 @@ async def update_profile(payload: ProfileUpdate, user=Depends(auth_guard), db: A
     if not profile:
         profile = UserProfile(user_id=db_user.id); db.add(profile)
     
+    if payload.full_name is not None: db_user.full_name = payload.full_name
+    if payload.mobile_number is not None: db_user.mobile_number = payload.mobile_number
+    if payload.state is not None: db_user.state = payload.state
+    if payload.gst_number is not None: db_user.gst_number = payload.gst_number
+
     if payload.dynamic_summary is not None: profile.dynamic_summary = payload.dynamic_summary
     if payload.preferences is not None: profile.preferences = payload.preferences
         
     await db.commit()
-    return {"status": "profile updated", "profile": {
-        "dynamic_summary": profile.dynamic_summary,
-        "preferences": profile.preferences
-    }}
+    await db.refresh(db_user)
+    await db.refresh(profile)
+
+    return {
+        "status": "profile updated", 
+        "user": {
+            "full_name": db_user.full_name,
+            "mobile_number": db_user.mobile_number,
+            "state": db_user.state,
+            "gst_number": db_user.gst_number
+        },
+        "profile": {
+            "dynamic_summary": profile.dynamic_summary,
+            "preferences": profile.preferences
+        }
+    }

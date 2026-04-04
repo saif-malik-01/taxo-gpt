@@ -3,6 +3,10 @@ from typing import Optional
 from datetime import datetime
 
 class ProfileUpdate(BaseModel):
+    full_name: Optional[str] = None
+    mobile_number: Optional[str] = None
+    state: Optional[str] = None
+    gst_number: Optional[str] = None
     dynamic_summary: Optional[str] = None
     preferences: Optional[dict] = None
 
@@ -11,6 +15,8 @@ class UserResponseAdmin(BaseModel):
     full_name: Optional[str] = None
     email: str
     mobile_number: Optional[str] = None
+    state: Optional[str] = None
+    gst_number: Optional[str] = None
     country: Optional[str] = None
     role: str
     max_sessions: int
@@ -26,6 +32,8 @@ class UserCreateAdmin(BaseModel):
     password: str
     full_name: Optional[str] = None
     mobile_number: Optional[str] = None
+    state: Optional[str] = None
+    gst_number: Optional[str] = None
     country: Optional[str] = None
     role: str = "user"
     is_verified: bool = True

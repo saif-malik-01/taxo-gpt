@@ -25,6 +25,10 @@ class UserUpdateAdmin(BaseModel):
     max_sessions: Optional[int] = None
     password: Optional[str] = None
     is_verified: Optional[bool] = None
+    full_name: Optional[str] = None
+    mobile_number: Optional[str] = None
+    state: Optional[str] = None
+    gst_number: Optional[str] = None
 
 class UserUsageUpdateAdmin(BaseModel):
     simple_query_balance: Optional[int] = None
@@ -49,6 +53,8 @@ async def create_user_admin(payload: UserCreateAdmin, admin_user=Depends(admin_g
         password_hash=get_password_hash(payload.password),
         full_name=payload.full_name,
         mobile_number=payload.mobile_number,
+        state=payload.state,
+        gst_number=payload.gst_number,
         country=payload.country,
         role=payload.role,
         is_verified=payload.is_verified
@@ -87,6 +93,14 @@ async def update_user(user_id: int, payload: UserUpdateAdmin, admin_user=Depends
         user.password_hash = get_password_hash(payload.password)
     if payload.is_verified is not None:
         user.is_verified = payload.is_verified
+    if payload.full_name is not None:
+        user.full_name = payload.full_name
+    if payload.mobile_number is not None:
+        user.mobile_number = payload.mobile_number
+    if payload.state is not None:
+        user.state = payload.state
+    if payload.gst_number is not None:
+        user.gst_number = payload.gst_number
     
     await db.commit()
     await db.refresh(user)

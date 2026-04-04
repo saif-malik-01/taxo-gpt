@@ -12,6 +12,8 @@ class User(Base):
     full_name = Column(String, nullable=True)
     email = Column(String, unique=True, index=True, nullable=False)
     mobile_number = Column(String, nullable=True)
+    state = Column(String, nullable=True)
+    gst_number = Column(String, nullable=True)
     country = Column(String, nullable=True)
     password_hash = Column(String, nullable=True)
     google_id = Column(String, unique=True, index=True, nullable=True)
