@@ -5,6 +5,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
@@ -251,11 +252,56 @@ async def share_session(session_id: str, user=Depends(auth_guard), db: AsyncSess
     await db.commit()
     return {"shared_id": shared_id, "url": f"/chat/share/{shared_id}"}
 
+@router.post("/chat/share/message/{message_id}")
+async def share_message(message_id: int, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+    # Verify message exists and belongs to user
+    user_id = user.get("id")
+    res = await db.execute(
+        select(ChatMessage)
+        .join(ChatSession)
+        .where(ChatMessage.id == message_id, ChatSession.user_id == user_id)
+    )
+    msg = res.scalars().first()
+    if not msg: raise HTTPException(status_code=404, detail="Message not found or unauthorized")
+    
+    # Create shared link entry
+    shared_id = str(uuid.uuid4())[:8] # Short ID
+    db.add(SharedSession(id=shared_id, message_id=message_id, session_id=msg.session_id))
+    await db.commit()
+    return {"shared_id": shared_id, "url": f"/chat/share/{shared_id}"}
+
 @router.get("/chat/share/{shared_id}")
-async def get_shared_session(shared_id: str, db: AsyncSession = Depends(get_db)):
+async def get_shared_content(shared_id: str, db: AsyncSession = Depends(get_db)):
     res = await db.execute(select(SharedSession).where(SharedSession.id == shared_id))
     shared = res.scalars().first()
-    if not shared: raise HTTPException(status_code=404, detail="Shared session not found")
+    if not shared: raise HTTPException(status_code=404, detail="Shared content not found")
     
+    if shared.message_id:
+        # Fetch the specific message and its immediate predecessor (the prompt)
+        res = await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.session_id == shared.session_id,
+                ChatMessage.id <= shared.message_id
+            )
+            .order_by(ChatMessage.id.desc())
+            .limit(2)
+        )
+        messages = sorted(res.scalars().all(), key=lambda x: x.id)
+        
+        from apps.api.src.services.rag.retrieval.hydrator import hydrate_sources
+        from apps.api.src.services.chat.engine import get_pipeline
+        
+        history = []
+        for m in messages:
+            msg_dict = {"id": m.id, "role": m.role, "content": m.content}
+            if m.source_ids:
+                pipeline = await run_in_threadpool(get_pipeline)
+                msg_dict["sources"] = await hydrate_sources(m.source_ids, pipeline._qdrant)
+            history.append(msg_dict)
+            
+        return {"history": history, "type": "message"}
+    
+    # Default: Full session history
     history = await get_session_history(shared.session_id)
-    return {"history": history}
+    return {"history": history, "type": "session"}

@@ -184,11 +184,13 @@ class SharedSession(Base):
     __tablename__ = "shared_sessions"
 
     id = Column(String, primary_key=True, index=True) # Obfuscated ID (e.g., short UUID or random string)
-    session_id = Column(String, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False)
+    session_id = Column(String, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=True)
+    message_id = Column(BigInteger, ForeignKey("chat_messages.id", ondelete="CASCADE"), nullable=True) # New field
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=True)
 
     session = relationship("ChatSession", back_populates="shared_links")
+    message = relationship("ChatMessage")
 
 
 class CreditLog(Base):
