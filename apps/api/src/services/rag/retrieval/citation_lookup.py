@@ -68,7 +68,10 @@ class CitationLookup:
 
             if len(case_note.split()) >= 20:
                 logger.info(f"Citation: using case_note ({len(case_note.split())} words)")
-                chunks = [sample]
+                payload = scroll_result[0].payload or {}
+                # Inject point ID for hydration standard
+                payload["_point_id"] = str(scroll_result[0].id)
+                chunks = [payload]
             else:
                 all_results, _ = self._qdrant.scroll(
                     collection_name=self._col,
@@ -86,7 +89,12 @@ class CitationLookup:
                     with_payload=True,
                     with_vectors=False,
                 )
-                chunks = [r.payload for r in all_results if r.payload]
+                chunks = []
+                for r in all_results:
+                    if r.payload:
+                        p = r.payload
+                        p["_point_id"] = str(r.id)
+                        chunks.append(p)
                 chunks.sort(key=lambda c: c.get("chunk_index", 0))
                 logger.info(f"Citation: fetched {len(chunks)} chunks for {citation}")
 

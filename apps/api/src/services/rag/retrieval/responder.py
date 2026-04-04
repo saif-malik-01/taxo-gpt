@@ -178,7 +178,13 @@ class CrossRefEnricher:
                 with_payload=True,
                 with_vectors=False,
             )
-            return [r.payload for r in results if r.payload]
+            chunks = []
+            for r in results:
+                if r.payload:
+                    p = r.payload
+                    p["_point_id"] = str(r.id)
+                    chunks.append(p)
+            return chunks
         except Exception as e:
             logger.debug(f"Cross-ref scroll {key}={value} failed: {e}")
             return []
@@ -541,7 +547,7 @@ def _build_docs_list(
         seen_identifiers.add(identifier)
         summary_dict = _doc_summary(payload, label, score)
         # Store the original Qdrant point ID
-        resolved_id = chunk_id or payload.get("chunk_id") or payload.get("id")
+        resolved_id = chunk_id or payload.get("_point_id") or payload.get("chunk_id") or payload.get("id")
         if resolved_id:
             summary_dict["chunk_id"] = str(resolved_id)
         
@@ -644,7 +650,7 @@ def _map_judgment_metadata(ext: Dict, full_text: str) -> Dict:
 def _doc_summary(payload: Dict, label: str, score: float) -> Dict:
     ext = payload.get("ext") or {}
     return {
-        "chunk_id":   payload.get("chunk_id") or payload.get("id"), # Try to get ID
+        "chunk_id":   payload.get("_point_id") or payload.get("chunk_id") or payload.get("id"), # Try to get ID
         "chunk_type": payload.get("chunk_type", ""),
         "text":       payload.get("text", ""),
         "identifier": (
