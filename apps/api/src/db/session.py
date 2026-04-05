@@ -12,8 +12,8 @@ from apps.api.src.core.config import settings
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
-    pool_size=20,
-    max_overflow=10,
+    pool_size=100,
+    max_overflow=50,
     pool_timeout=20,
     pool_recycle=1800,
 )
