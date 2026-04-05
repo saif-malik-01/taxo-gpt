@@ -16,7 +16,7 @@ import httpx
 from apps.api.src.services.auth.jwt import create_access_token
 from apps.api.src.services.auth.utils import verify_password, get_password_hash
 from apps.api.src.services.auth.deps import auth_guard
-from apps.api.src.db.session import get_db, add_session, remove_session, list_sessions, heartbeat_session
+from apps.api.src.db.session import get_db, add_session, remove_session, list_sessions, heartbeat_session, AsyncSessionLocal
 from apps.api.src.db.models.base import User, UserProfile, UserUsage
 from apps.api.src.core.config import settings
 
