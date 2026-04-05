@@ -545,7 +545,7 @@ class StreamSimpleShape(LoadTestShape):
     """
 
     stages = [
-        (300, 2, 1),   # 5 minutes at exactly 5 users
+        (300, 3, 1),   # 5 minutes at exactly 5 users
     ]
 
     def tick(self):

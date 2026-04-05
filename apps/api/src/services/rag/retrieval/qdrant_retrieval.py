@@ -747,18 +747,18 @@ class QdrantRetrieval:
                 num_only if num_only != num else None,
                 f"Section {num_only}" if num_only != num else None,
             ])))
-            for v in variants:
-                calls.append((
-                    [qmodels.FieldCondition(key="cross_references.sections",
-                                            match=qmodels.MatchValue(value=v))],
-                    15, f"s2_sec_{num}"
-                ))
-                calls.append((
-                    [qmodels.FieldCondition(key="ext.sections_referred",
-                                            match=qmodels.MatchValue(value=v))],
-                    10, f"s2_sec_ext_{num}"
-                ))
-            # Judgment ext.sections_in_dispute text search
+            # One MatchAny call per field instead of one call per variant string.
+            calls.append((
+                [qmodels.FieldCondition(key="cross_references.sections",
+                                        match=qmodels.MatchAny(any=variants))],
+                15, f"s2_sec_xref_{num}"
+            ))
+            calls.append((
+                [qmodels.FieldCondition(key="ext.sections_referred",
+                                        match=qmodels.MatchAny(any=variants))],
+                10, f"s2_sec_ext_{num}"
+            ))
+            # MatchText on full-text index — no MatchAny support, one call per bare number.
             for n in list(dict.fromkeys(filter(None, [num, num_only if num_only != num else None]))):
                 calls.append((
                     [qmodels.FieldCondition(key="chunk_type",
@@ -772,18 +772,17 @@ class QdrantRetrieval:
             num = _bare_number(rule)
             if not num:
                 continue
-            variants = [num, f"Rule {num}", f"rule {num}", f"{num}(1)", f"Rule {num}(1)"]
-            for v in variants:
-                calls.append((
-                    [qmodels.FieldCondition(key="cross_references.rules",
-                                            match=qmodels.MatchValue(value=v))],
-                    15, f"s2_rule_{num}"
-                ))
-                calls.append((
-                    [qmodels.FieldCondition(key="ext.rules_referred",
-                                            match=qmodels.MatchValue(value=v))],
-                    10, f"s2_rule_ext_{num}"
-                ))
+            variants = list(dict.fromkeys([num, f"Rule {num}", f"rule {num}", f"{num}(1)", f"Rule {num}(1)"]))
+            calls.append((
+                [qmodels.FieldCondition(key="cross_references.rules",
+                                        match=qmodels.MatchAny(any=variants))],
+                15, f"s2_rule_xref_{num}"
+            ))
+            calls.append((
+                [qmodels.FieldCondition(key="ext.rules_referred",
+                                        match=qmodels.MatchAny(any=variants))],
+                10, f"s2_rule_ext_{num}"
+            ))
 
         for notif in stage2b.notifications:
             num = _normalise_notif_num(notif)
