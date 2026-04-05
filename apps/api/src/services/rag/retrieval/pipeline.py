@@ -40,7 +40,8 @@ class RetrievalPipeline:
             port    = settings.QDRANT_PORT,
             api_key = settings.QDRANT_API_KEY,
             https   = settings.QDRANT_HTTPS,
-            timeout = settings.QDRANT_TIMEOUT
+            timeout = settings.QDRANT_TIMEOUT,
+            check_compatibility = False
         )
         logger.info(
             f"Qdrant: {settings.QDRANT_HOST}:{settings.QDRANT_PORT} "

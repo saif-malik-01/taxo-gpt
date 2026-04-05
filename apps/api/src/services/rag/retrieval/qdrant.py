@@ -34,6 +34,7 @@ class QdrantRetrieval:
             port=settings.QDRANT_PORT,
             api_key=settings.QDRANT_API_KEY,
             timeout=settings.QDRANT_TIMEOUT,
+            check_compatibility=False,
         )
         self._embedder = TitanEmbeddingGenerator()
         logger.info(f"QdrantRetrieval connected to {settings.QDRANT_HOST}:{settings.QDRANT_PORT}")
