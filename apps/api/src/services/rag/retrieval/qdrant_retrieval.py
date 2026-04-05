@@ -977,11 +977,11 @@ class QdrantRetrieval:
 # -- Text index setup ---------------------------------------------------------
 
 def ensure_text_indexes(qdrant: QdrantClient):
-    text_fields = [
+    fields = [
         "ext.case_name", "ext.petitioner", "ext.respondent",
         "ext.case_number", "ext.sections_in_dispute", "keywords",
     ]
-    for field in text_fields:
+    for field in fields:
         try:
             qdrant.create_payload_index(
                 collection_name=settings.QDRANT_COLLECTION,
@@ -997,27 +997,6 @@ def ensure_text_indexes(qdrant: QdrantClient):
             logger.info(f"Text index created: {field}")
         except Exception as e:
             logger.debug(f"Text index {field} skipped: {e}")
-
-    keyword_fields = [
-        "chunk_type",
-        "ext.section_number", "ext.rule_number_full", 
-        "ext.notification_number", "ext.circular_number",
-        "ext.form_name", "ext.form_number",
-        "ext.hsn_code", "ext.sac_code", "ext.chapter_code",
-        "cross_references.sections", "cross_references.rules",
-        "cross_references.notifications", "cross_references.circulars",
-        "cross_references.forms", "cross_references.hsn_codes", "cross_references.sac_codes"
-    ]
-    for field in keyword_fields:
-        try:
-            qdrant.create_payload_index(
-                collection_name=settings.QDRANT_COLLECTION,
-                field_name=field,
-                field_schema=qmodels.PayloadSchemaType.KEYWORD,
-            )
-            logger.info(f"Keyword index created: {field}")
-        except Exception as e:
-            logger.debug(f"Keyword index {field} skipped: {e}")
 
 
 # -- Match depth boost --------------------------------------------------------

@@ -71,7 +71,7 @@ from locust.exception import StopUser
 
 TEST_EMAIL = os.getenv("LOCUST_TEST_EMAIL", "admin@gst.com")
 TEST_PASSWORD = os.getenv("LOCUST_TEST_PASSWORD", "admin1234")
-STREAM_TIMEOUT_S = int(os.getenv("STREAM_TIMEOUT_S", "300"))
+STREAM_TIMEOUT_S = int(os.getenv("STREAM_TIMEOUT_S", "180"))
 
 logger = logging.getLogger("taxogpt.stream_simple")
 
@@ -545,7 +545,7 @@ class StreamSimpleShape(LoadTestShape):
     """
 
     stages = [
-        (300, 5, 1),   # 5 minutes at exactly 5 users
+        (300, 2, 1),   # 5 minutes at exactly 5 users
     ]
 
     def tick(self):
