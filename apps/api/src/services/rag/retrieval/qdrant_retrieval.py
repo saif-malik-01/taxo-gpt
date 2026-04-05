@@ -693,17 +693,10 @@ class QdrantRetrieval:
                 )
             results += self._scroll(
                 [qmodels.FieldCondition(key="chunk_type",
-                                        match=qmodels.MatchValue(value="notification")),
-                 qmodels.FieldCondition(key="cross_references.hsn_codes",
+                                        match=qmodels.MatchAny(any=["notification", "circular"])),
+                qmodels.FieldCondition(key="cross_references.hsn_codes",
                                         match=qmodels.MatchValue(value=code))],
-                limit=10, label=f"s1_hsn_notif_{code}"
-            )
-            results += self._scroll(
-                [qmodels.FieldCondition(key="chunk_type",
-                                        match=qmodels.MatchValue(value="circular")),
-                 qmodels.FieldCondition(key="cross_references.hsn_codes",
-                                        match=qmodels.MatchValue(value=code))],
-                limit=5, label=f"s1_hsn_circ_{code}"
+                limit=15, label=f"s1_hsn_notif_circ_{code}"
             )
 
         if stage2b.sac_code:
@@ -717,17 +710,10 @@ class QdrantRetrieval:
             )
             results += self._scroll(
                 [qmodels.FieldCondition(key="chunk_type",
-                                        match=qmodels.MatchValue(value="notification")),
-                 qmodels.FieldCondition(key="cross_references.sac_codes",
+                                        match=qmodels.MatchAny(any=["notification", "circular"])),
+                qmodels.FieldCondition(key="cross_references.sac_codes",
                                         match=qmodels.MatchValue(value=code))],
-                limit=10, label=f"s1_sac_notif_{code}"
-            )
-            results += self._scroll(
-                [qmodels.FieldCondition(key="chunk_type",
-                                        match=qmodels.MatchValue(value="circular")),
-                 qmodels.FieldCondition(key="cross_references.sac_codes",
-                                        match=qmodels.MatchValue(value=code))],
-                limit=5, label=f"s1_sac_circ_{code}"
+                limit=15, label=f"s1_sac_notif_circ_{code}"
             )
 
         return results
