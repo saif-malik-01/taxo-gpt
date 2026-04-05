@@ -12,9 +12,9 @@ from apps.api.src.core.config import settings
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
-    pool_size=100,
-    max_overflow=50,
-    pool_timeout=20,
+    pool_size=40,
+    max_overflow=20,
+    pool_timeout=40,
     pool_recycle=1800,
 )
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

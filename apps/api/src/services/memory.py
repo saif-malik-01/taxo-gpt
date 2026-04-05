@@ -115,7 +115,11 @@ async def get_user_profile(user_id: int):
         res = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
         return res.scalar_one_or_none()
 
-async def track_usage(user_id: int, session_id: str, db: AsyncSession, usage: dict = None, force_deduct: bool = False):
+async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, usage: dict = None, force_deduct: bool = False):
+    if db is None:
+        async with AsyncSessionLocal() as session:
+            return await track_usage(user_id, session_id, session, usage, force_deduct)
+
     res = await db.execute(
         select(UserUsage)
         .options(selectinload(UserUsage.user))
@@ -161,7 +165,11 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession, usage: di
 
     await db.commit()
 
-async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession, chat_mode: str = None, extra_tokens: int = 0):
+async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession = None, chat_mode: str = None, extra_tokens: int = 0):
+    if db is None:
+        async with AsyncSessionLocal() as session:
+            return await check_credits(user_id, session_id, has_files, session, chat_mode, extra_tokens)
+
     res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
     usage = res.scalars().first()
     if not usage:

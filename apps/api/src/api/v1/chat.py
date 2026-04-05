@@ -84,14 +84,13 @@ async def ask_gst_stream_simple(
     request: Request,
     payload: ChatRequest,
     background_tasks: BackgroundTasks,
-    user=Depends(auth_guard),
-    db: AsyncSession = Depends(get_db)
+    user=Depends(auth_guard)
 ):
     question = payload.question
     session_id = payload.session_id or str(uuid.uuid4())
     user_id = user.get("id")
 
-    allowed, error_msg = await check_credits(user_id, session_id, False, db, chat_mode="simple")
+    allowed, error_msg = await check_credits(user_id, session_id, False, chat_mode="simple")
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
@@ -145,12 +144,12 @@ async def ask_gst_stream_simple(
 
             # ── Track usage: deduct 1 credit, log tokens ────────────────────
             # force_deduct=True: every question deducts 1 from simple_query_balance
-            await track_usage(user_id, session_id, db, usage=llm_usage, force_deduct=True)
+            await track_usage(user_id, session_id, usage=llm_usage, force_deduct=True)
 
             # ── Auto-update Profile (Background) ───────────────────────────────
             is_new_session = len(history) <= 1
             if is_new_session:
-                background_tasks.add_task(auto_update_profile, user_id, question, db)
+                background_tasks.add_task(auto_update_profile, user_id, question, full_response)
 
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
@@ -164,14 +163,13 @@ async def ask_gst_stream_draft(
     request: Request,
     payload: ChatRequest,
     background_tasks: BackgroundTasks,
-    user=Depends(auth_guard),
-    db: AsyncSession = Depends(get_db)
+    user=Depends(auth_guard)
 ):
     question = payload.question
     session_id = payload.session_id or str(uuid.uuid4())
     user_id = user.get("id")
 
-    allowed, error_msg = await check_credits(user_id, session_id, True, db, chat_mode="draft")
+    allowed, error_msg = await check_credits(user_id, session_id, True, chat_mode="draft")
     if not allowed:
         raise HTTPException(status_code=402, detail=error_msg)
 
@@ -184,7 +182,7 @@ async def ask_gst_stream_draft(
             
             history = await get_session_history(session_id)
             is_new_session = len(history) <= 1
-            await track_usage(user_id, session_id, db, force_deduct=True) # Draft always deducts
+            await track_usage(user_id, session_id, force_deduct=True) # Draft always deducts
 
             profile = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
