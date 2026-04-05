@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
     QDRANT_API_KEY: str = ""
-    QDRANT_TIMEOUT: int = 20
+    QDRANT_TIMEOUT: int = 60
     QDRANT_COLLECTION: str = "tax_chunks"
     QDRANT_HTTPS: bool = False
     QDRANT_TEXT_VECTOR: str = "text_vector"    # Dense vector name

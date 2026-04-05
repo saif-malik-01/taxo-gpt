@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Iterator
 
 import boto3
 from botocore.exceptions import ClientError
+from botocore.config import Config
 
 from apps.api.src.core.config import settings
 
@@ -24,6 +25,10 @@ class BedrockLLMClient:
             region_name=settings.AWS_REGION,
             aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            config=Config(
+                max_pool_connections=50,  # Prevent connection queuing under concurrent load
+                retries={'max_attempts': settings.PIPELINE_MAX_RETRIES}
+            )
         )
         logger.info(f"BedrockLLMClient ready — model: {MODEL_ID}")
 
