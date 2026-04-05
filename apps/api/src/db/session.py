@@ -16,6 +16,7 @@ engine = create_async_engine(
     max_overflow=20,
     pool_timeout=40,
     pool_recycle=1800,
+    pool_pre_ping=True, 
 )
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()

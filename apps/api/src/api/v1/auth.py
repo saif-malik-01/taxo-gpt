@@ -313,7 +313,7 @@ async def logout(user=Depends(auth_guard)):
     return {"status": "logged out"}
 
 @router.post("/heartbeat")
-async def maintain_heartbeat(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
+async def maintain_heartbeat(user=Depends(auth_guard)):
     """
     Called by Frontend via setInterval every 1 or 2 minutes to block session from 
     garbage collection and dying from inactivity TTL. Needs Bearer token.
@@ -331,11 +331,12 @@ async def maintain_heartbeat(user=Depends(auth_guard), db: AsyncSession = Depend
         raise HTTPException(status_code=401, detail="Session expired due to inactivity or closure.")
     
     # Update last active time
-    result = await db.execute(select(User).where(User.id == user_id))
-    db_user = result.scalars().first()
-    if db_user:
-        db_user.last_login_at = datetime.now(timezone.utc)
-        await db.commit()
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.id == user_id))
+        db_user = result.scalars().first()
+        if db_user:
+            db_user.last_login_at = datetime.now(timezone.utc)
+            await db.commit()
     
     response = {"status": "alive"}
     
@@ -368,90 +369,92 @@ async def revoke_active_session(revoke_session_id: str, user=Depends(auth_guard)
     return {"status": "revoked"}
 
 @router.get("/me")
-async def get_me(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
-    email = user.get("sub")
-    res = await db.execute(
-        select(User).options(
-            selectinload(User.profile),
-            selectinload(User.usage)
-        ).where(func.lower(User.email) == email.lower())
-    )
-    db_user = res.scalars().first()
-    if not db_user: raise HTTPException(status_code=404, detail="User not found")
-        
-    return {
-        "user": {
-            "id": db_user.id, "email": db_user.email, "full_name": db_user.full_name,
-            "mobile_number": db_user.mobile_number, "state": db_user.state, "gst_number": db_user.gst_number,
-            "country": db_user.country, "role": db_user.role, 
-            "profile": {
-                "dynamic_summary": db_user.profile.dynamic_summary if db_user.profile else None,
-                "preferences": db_user.profile.preferences if db_user.profile else {}
-            },
-            "credits": {
-                "simple_query_balance": db_user.usage.simple_query_balance if db_user.usage else 0,
-                "draft_reply_balance": db_user.usage.draft_reply_balance if db_user.usage else 0,
-                "total_tokens_used": db_user.usage.total_tokens_used if db_user.usage else 0
+async def get_me(user=Depends(auth_guard)):
+    async with AsyncSessionLocal() as db:
+        email = user.get("sub")
+        res = await db.execute(
+            select(User).options(
+                selectinload(User.profile),
+                selectinload(User.usage)
+            ).where(func.lower(User.email) == email.lower())
+        )
+        db_user = res.scalars().first()
+        if not db_user: raise HTTPException(status_code=404, detail="User not found")
+            
+        return {
+            "user": {
+                "id": db_user.id, "email": db_user.email, "full_name": db_user.full_name,
+                "mobile_number": db_user.mobile_number, "state": db_user.state, "gst_number": db_user.gst_number,
+                "country": db_user.country, "role": db_user.role, 
+                "profile": {
+                    "dynamic_summary": db_user.profile.dynamic_summary if db_user.profile else None,
+                    "preferences": db_user.profile.preferences if db_user.profile else {}
+                },
+                "credits": {
+                    "simple_query_balance": db_user.usage.simple_query_balance if db_user.usage else 0,
+                    "draft_reply_balance": db_user.usage.draft_reply_balance if db_user.usage else 0,
+                    "total_tokens_used": db_user.usage.total_tokens_used if db_user.usage else 0
+                }
             }
         }
-    }
 
 @router.get("/credits")
-async def get_credits(user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
-    from datetime import datetime, timedelta, timezone
-    user_id = user.get("id")
-    res = await db.execute(
-        select(UserUsage).where(UserUsage.user_id == user_id)
-    )
-    usage = res.scalars().first()
-    if not usage:
-        usage = UserUsage(
-            user_id=user_id,
-            credits_expire_at=datetime.now(timezone.utc) + timedelta(days=365)
+async def get_credits(user=Depends(auth_guard)):
+    async with AsyncSessionLocal() as db:
+        user_id = user.get("id")
+        res = await db.execute(
+            select(UserUsage).where(UserUsage.user_id == user_id)
         )
-        db.add(usage)
-        await db.commit()
-    
-    return {
-        "simple_query_balance": usage.simple_query_balance,
-        "draft_reply_balance": usage.draft_reply_balance,
-        "total_tokens_used": usage.total_tokens_used
-    }
+        usage = res.scalars().first()
+        if not usage:
+            usage = UserUsage(
+                user_id=user_id,
+                credits_expire_at=datetime.now(timezone.utc) + timedelta(days=365)
+            )
+            db.add(usage)
+            await db.commit()
+        
+        return {
+            "simple_query_balance": usage.simple_query_balance,
+            "draft_reply_balance": usage.draft_reply_balance,
+            "total_tokens_used": usage.total_tokens_used
+        }
 
 @router.patch("/me")
-async def update_profile(payload: ProfileUpdate, user=Depends(auth_guard), db: AsyncSession = Depends(get_db)):
-    email = user.get("sub")
-    res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
-    db_user = res.scalars().first()
-    
-    res = await db.execute(select(UserProfile).where(UserProfile.user_id == db_user.id))
-    profile = res.scalars().first()
-    
-    if not profile:
-        profile = UserProfile(user_id=db_user.id); db.add(profile)
-    
-    if payload.full_name is not None: db_user.full_name = payload.full_name
-    if payload.mobile_number is not None: db_user.mobile_number = payload.mobile_number
-    if payload.state is not None: db_user.state = payload.state
-    if payload.gst_number is not None: db_user.gst_number = payload.gst_number
-
-    if payload.dynamic_summary is not None: profile.dynamic_summary = payload.dynamic_summary
-    if payload.preferences is not None: profile.preferences = payload.preferences
+async def update_profile(payload: ProfileUpdate, user=Depends(auth_guard)):
+    async with AsyncSessionLocal() as db:
+        email = user.get("sub")
+        res = await db.execute(select(User).where(func.lower(User.email) == email.lower()))
+        db_user = res.scalars().first()
         
-    await db.commit()
-    await db.refresh(db_user)
-    await db.refresh(profile)
+        res = await db.execute(select(UserProfile).where(UserProfile.user_id == db_user.id))
+        profile = res.scalars().first()
+        
+        if not profile:
+            profile = UserProfile(user_id=db_user.id); db.add(profile)
+        
+        if payload.full_name is not None: db_user.full_name = payload.full_name
+        if payload.mobile_number is not None: db_user.mobile_number = payload.mobile_number
+        if payload.state is not None: db_user.state = payload.state
+        if payload.gst_number is not None: db_user.gst_number = payload.gst_number
 
-    return {
-        "status": "profile updated", 
-        "user": {
-            "full_name": db_user.full_name,
-            "mobile_number": db_user.mobile_number,
-            "state": db_user.state,
-            "gst_number": db_user.gst_number
-        },
-        "profile": {
-            "dynamic_summary": profile.dynamic_summary,
-            "preferences": profile.preferences
+        if payload.dynamic_summary is not None: profile.dynamic_summary = payload.dynamic_summary
+        if payload.preferences is not None: profile.preferences = payload.preferences
+            
+        await db.commit()
+        await db.refresh(db_user)
+        await db.refresh(profile)
+
+        return {
+            "status": "profile updated", 
+            "user": {
+                "full_name": db_user.full_name,
+                "mobile_number": db_user.mobile_number,
+                "state": db_user.state,
+                "gst_number": db_user.gst_number
+            },
+            "profile": {
+                "dynamic_summary": profile.dynamic_summary,
+                "preferences": profile.preferences
+            }
         }
-    }
