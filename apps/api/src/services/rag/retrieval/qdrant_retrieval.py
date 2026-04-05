@@ -983,6 +983,41 @@ def ensure_text_indexes(qdrant: QdrantClient):
         except Exception as e:
             logger.debug(f"Text index {field} skipped: {e}")
 
+    # 2. Keyword Indexes (Essential for exact matches & MatchAny)
+    keyword_fields = [
+        "chunk_type",
+        "ext.citation",
+        "ext.section_number",
+        "ext.rule_number_full",
+        "ext.notification_number",
+        "ext.circular_number",
+        "ext.form_name",
+        "ext.form_number",
+        "ext.forms_prescribed",
+        "ext.hsn_code",
+        "ext.chapter_code",
+        "ext.sac_code",
+        "ext.sections_referred",
+        "ext.rules_referred",
+        "cross_references.sections",
+        "cross_references.rules",
+        "cross_references.notifications",
+        "cross_references.circulars",
+        "cross_references.forms",
+        "cross_references.hsn_codes",
+        "cross_references.sac_codes",
+    ]
+    for field in keyword_fields:
+        try:
+            qdrant.create_payload_index(
+                collection_name=settings.QDRANT_COLLECTION,
+                field_name=field,
+                field_schema=qmodels.PayloadSchemaType.KEYWORD,
+            )
+            logger.info(f"Keyword index created: {field}")
+        except Exception as e:
+            logger.debug(f"Keyword index {field} skipped: {e}")
+
 
 # -- Match depth boost --------------------------------------------------------
 
