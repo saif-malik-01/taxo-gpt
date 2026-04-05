@@ -5,16 +5,16 @@ import json
 from apps.api.src.core.config import settings
 
 # --- Postgres ---
-# pool_size=5   : persistent connections (matches RDS db.t3.small safe limit)
-# max_overflow=5: burst headroom (total max = 10, well within t3.small's ~80 max)
-# pool_timeout=10: fail fast — don't hang 30s (default) waiting for a free slot
+# pool_size=10  : persistent connections (safe for RDS db.t3.small, max_connections ~80)
+# max_overflow=10: burst headroom (total max = 20, well within t3.small's ~80 max)
+# pool_timeout=20: slightly longer wait to absorb brief spikes without failing early
 # pool_recycle=1800: recycle connections every 30 min to avoid stale/dead conns
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
-    pool_size=5,
-    max_overflow=5,
-    pool_timeout=10,
+    pool_size=10,
+    max_overflow=10,
+    pool_timeout=20,
     pool_recycle=1800,
 )
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

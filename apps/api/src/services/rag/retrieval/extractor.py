@@ -152,7 +152,7 @@ class Stage2BLLM:
         raw = self._llm.call_json(
             system_prompt=_S2B_SYSTEM,
             user_message=f"Query: {query}",
-            max_tokens=1024,
+            max_tokens=2048,  # Raised from 1024 — stage2b has 20 fields; complex queries exceed 1024 tokens
             label="stage2b",
         )
         if not raw:
