@@ -7,7 +7,7 @@ Citation is always separate from the RRF pool — pinned at rank 0.
 import logging
 from typing import Optional
 
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 
 from apps.api.src.core.config import settings
@@ -18,11 +18,11 @@ logger = logging.getLogger(__name__)
 
 class CitationLookup:
 
-    def __init__(self, qdrant: QdrantClient):
+    def __init__(self, qdrant: AsyncQdrantClient):
         self._qdrant = qdrant
         self._col    = settings.QDRANT_COLLECTION
 
-    def run(
+    async def run(
         self,
         stage2a_citation: Optional[str],
         stage2b_citation: Optional[str],
@@ -41,7 +41,7 @@ class CitationLookup:
         logger.info(f"Citation lookup: {citation}")
 
         try:
-            scroll_result, _ = self._qdrant.scroll(
+            scroll_result, _ = await self._qdrant.scroll(
                 collection_name=self._col,
                 scroll_filter=qmodels.Filter(must=[
                     qmodels.FieldCondition(
@@ -73,7 +73,7 @@ class CitationLookup:
                 payload["_point_id"] = str(scroll_result[0].id)
                 chunks = [payload]
             else:
-                all_results, _ = self._qdrant.scroll(
+                all_results, _ = await self._qdrant.scroll(
                     collection_name=self._col,
                     scroll_filter=qmodels.Filter(must=[
                         qmodels.FieldCondition(

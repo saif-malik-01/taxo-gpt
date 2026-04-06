@@ -1,26 +1,30 @@
 import asyncio
 import logging
 import json
-import threading   
 from typing import AsyncGenerator, List, Dict, Optional
-from starlette.concurrency import run_in_threadpool
 
 from apps.api.src.services.rag.retrieval.pipeline import RetrievalPipeline
 from apps.api.src.services.rag.models import SessionMessage
 
 logger = logging.getLogger(__name__)
 
-_pipeline: Optional[RetrievalPipeline] = None
-_pipeline_lock = threading.Lock()
+_UNSET = object()
+_pipeline = _UNSET
+_pipeline_lock: Optional[asyncio.Lock] = None
 
-def get_pipeline() -> RetrievalPipeline:
-    global _pipeline
-    if _pipeline is None:
-        with _pipeline_lock:
-            if _pipeline is None:
-                p = RetrievalPipeline()
-                p.setup()
-                _pipeline = p
+async def get_pipeline() -> RetrievalPipeline:
+    global _pipeline, _pipeline_lock
+    if _pipeline is not _UNSET:
+        return _pipeline
+
+    if _pipeline_lock is None:
+        _pipeline_lock = asyncio.Lock()
+
+    async with _pipeline_lock:
+        if _pipeline is _UNSET:
+            p = RetrievalPipeline()
+            await p.setup()
+            _pipeline = p
     return _pipeline
 
 def _map_history(history: List[Dict]) -> List[SessionMessage]:
@@ -37,22 +41,7 @@ def _map_history(history: List[Dict]) -> List[SessionMessage]:
             continue
     return pipeline_history
 
-def _stage6_to_queue(
-    pipeline: RetrievalPipeline,
-    staged: tuple,
-    queue: "asyncio.Queue[object]",
-    loop: asyncio.AbstractEventLoop,
-) -> None:
-    try:
-        for chunk in pipeline.query_stage_6_stream(*staged):
-            asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
-    except Exception as e:
-        logger.error(f"Stage 6 thread error: {e}", exc_info=True)
-        asyncio.run_coroutine_threadsafe(
-            queue.put({"__error__": str(e)}), loop
-        ).result()
-    finally:
-        asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+# _stage6_to_queue and other thread-based helpers removed in favor of pure async
 
 
 async def chat_stream(
@@ -61,40 +50,14 @@ async def chat_stream(
     profile_summary: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
 
-    pipeline = await run_in_threadpool(get_pipeline)
+    pipeline = await get_pipeline()
 
-    context_prefix = ""
-    if profile_summary:
-        context_prefix += f"[User Profile: {profile_summary}]\n"
-    final_query = f"{context_prefix}{query}" if context_prefix else query
+    final_query = f"[User Profile: {profile_summary}]\n{query}" if profile_summary else query
     session_history = _map_history(history)
 
-    staged = await run_in_threadpool(
-        pipeline.query_stages_1_to_5, final_query, session_history
-    )
+    staged = await pipeline.query_stages_1_to_5(final_query, session_history)
 
-    loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
-
-    loop.run_in_executor(
-        None,
-        _stage6_to_queue,
-        pipeline,
-        staged,
-        queue,
-        loop,
-    )
-
-    while True:
-        chunk = await queue.get()
-
-        if chunk is None:
-            break
-
-        if isinstance(chunk, dict) and "__error__" in chunk:
-            yield {"type": "error", "message": chunk["__error__"]}
-            break
-
+    async for chunk in pipeline.query_stage_6_stream(*staged):
         if isinstance(chunk, str) and chunk.startswith("\n\n__META__"):
             try:
                 meta = json.loads(chunk.replace("\n\n__META__", ""))

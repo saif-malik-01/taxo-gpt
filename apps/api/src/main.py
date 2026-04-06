@@ -14,6 +14,7 @@ from apps.api.src.services.jobs.scheduler import start_scheduler, stop_scheduler
 from sqlalchemy import text
 from apps.api.src.db.session import engine, get_redis
 from apps.api.src.services.chat.engine import get_pipeline
+from apps.api.src.services.document.issue_replier import set_pipeline
 from starlette.concurrency import run_in_threadpool
 
 # Environment Settings for Transformers Cache (from main.py)
@@ -64,6 +65,14 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info(f"Starting {settings.PROJECT_NAME}...")
+
+    # Warm up pipeline at startup — never cold-init on a real request
+    try:
+        p = await get_pipeline()
+        set_pipeline(p) # Inject into issue_replier
+        logger.info("RAG pipeline ready")
+    except Exception as e:
+        logger.error(f"Pipeline warmup failed: {e}")
 
     try:
         start_scheduler()
@@ -119,8 +128,8 @@ async def deep_health_check():
 
     # 3. Check Qdrant (via Pipeline)
     try:
-        pipeline = await run_in_threadpool(get_pipeline)
-        pipeline._qdrant.get_collections()
+        pipeline = await get_pipeline()
+        await pipeline._qdrant.get_collections()
         health_status["qdrant"] = "connected"
     except Exception as e:
         health_status["qdrant"] = f"error: {str(e)}"

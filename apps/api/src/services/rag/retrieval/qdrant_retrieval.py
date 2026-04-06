@@ -32,10 +32,9 @@ Scroll bonuses (additive to cosine score):
 import math
 import re
 import time
-from concurrent.futures import as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 
 from apps.api.src.core.config import (
@@ -47,8 +46,9 @@ from apps.api.src.core.config import (
 from apps.api.src.services.llm.embedding import TitanEmbeddingGenerator
 from apps.api.src.services.rag.pipeline.bm25_vectorizer import BM25Vectorizer
 from apps.api.src.services.rag.models import IntentResult, ScoredChunk, Stage2BResult
-from apps.api.src.services.rag.executor import rag_executor
+from starlette.concurrency import run_in_threadpool
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +65,13 @@ _SCROLL2_BONUS = 0.10   # cross-reference match
 
 class QdrantRetrieval:
 
-    def __init__(self, qdrant: QdrantClient, bm25: BM25Vectorizer):
+    def __init__(self, qdrant: AsyncQdrantClient, bm25: BM25Vectorizer):
         self._qdrant   = qdrant
         self._bm25     = bm25
         self._col      = settings.QDRANT_COLLECTION
         self._embedder = TitanEmbeddingGenerator()
 
-    def retrieve(
+    async def retrieve(
         self,
         query: str,
         keyword_document: str,
@@ -91,7 +91,7 @@ class QdrantRetrieval:
         # -- Embed query -----------------------------------------------
         logger.info("Stage 4: embedding query...")
         t_start_embed = time.time()
-        query_vector = self._embedder.embed_text(query)
+        query_vector = await run_in_threadpool(self._embedder.embed_text, query)
         t_embed = (time.time() - t_start_embed) * 1000
         if query_vector is None:
             logger.error(f"Stage 4: query embedding failed ({t_embed:.1f}ms) - BM25 + payload only")
@@ -100,7 +100,9 @@ class QdrantRetrieval:
 
         # -- BM25 sparse vector ----------------------------------------
         t_start_bm25_v = time.time()
-        sparse_indices, sparse_values = self._bm25.compute_sparse_vector(keyword_document)
+        sparse_indices, sparse_values = await run_in_threadpool(
+            self._bm25.compute_sparse_vector, keyword_document
+        )
         t_bm25_v = (time.time() - t_start_bm25_v) * 1000
         logger.info(
             f"Stage 4: BM25 sparse vector - "
@@ -132,37 +134,37 @@ class QdrantRetrieval:
 
         # -- Launch all parallel calls ---------------------------------
         t_start_parallel = time.time()
-        futures_map: Dict[Any, str] = {}
+        tasks: Dict[str, Any] = {}
         
         if query_vector:
-            futures_map[rag_executor.submit(self._vector_search, query_vector)] = "vector"
-        futures_map[rag_executor.submit(self._bm25_search, sparse_indices, sparse_values)] = "bm25"
+            tasks["vector"] = self._vector_search(query_vector)
+        tasks["bm25"] = self._bm25_search(sparse_indices, sparse_values)
         if run_scroll1:
-            futures_map[rag_executor.submit(self._scroll1, stage2b)] = "scroll1"
+            tasks["scroll1"] = self._scroll1(stage2b)
         if run_scroll2:
-            futures_map[rag_executor.submit(self._scroll2, stage2b)] = "scroll2"
+            tasks["scroll2"] = self._scroll2(stage2b)
         if run_scroll3:
-            futures_map[rag_executor.submit(self._scroll3, stage2b)] = "scroll3"
+            tasks["scroll3"] = self._scroll3(stage2b)
         if run_name:
-            futures_map[rag_executor.submit(
-                self._name_search, stage2b.parties + stage2b.person_names
-            )] = "name_search"
+            tasks["name_search"] = self._name_search(
+                stage2b.parties + stage2b.person_names
+            )
         if run_case_num:
-            futures_map[rag_executor.submit(
-                self._case_number_search, stage2b.case_number
-            )] = "case_search"
+            tasks["case_search"] = self._case_number_search(stage2b.case_number)
 
+        # Execute as tasks and gather
+        keys = list(tasks.keys())
+        coros = [tasks[k] for k in keys]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        
         raw_results: Dict[str, Any] = {}
-        for fut in as_completed(futures_map):
-            source = futures_map[fut]
-            t_fut_start = time.time()
-            try:
-                raw_results[source] = fut.result()
-                t_fut = (time.time() - t_fut_start) * 1000
-                logger.debug(f"  [{source}] completed in {t_fut:.1f}ms")
-            except Exception as e:
-                logger.error(f"  [{source}] failed: {e}")
+        for i, source in enumerate(keys):
+            res = results[i]
+            if isinstance(res, Exception):
+                logger.error(f"  [{source}] failed: {res}")
                 raw_results[source] = []
+            else:
+                raw_results[source] = res
         
         t_parallel = (time.time() - t_start_parallel) * 1000
         logger.info(f"Parallel retrieval pool calls done in {t_parallel:.1f}ms")
@@ -309,7 +311,7 @@ class QdrantRetrieval:
             )
             t_start_step2 = time.time()
             try:
-                fetched = self._qdrant.retrieve(
+                fetched = await self._qdrant.retrieve(
                     collection_name=self._col,
                     ids=list(payload_not_in_vector),
                     with_payload=True,
@@ -555,11 +557,13 @@ class QdrantRetrieval:
 
     # -- Vector search -------------------------------------------------
 
-    def _vector_search(
+    # -- Vector search -------------------------------------------------
+
+    async def _vector_search(
         self, query_vector: List[float]
     ) -> List[Tuple[str, Dict, float]]:
         try:
-            resp = self._qdrant.query_points(
+            resp = await self._qdrant.query_points(
                 collection_name=self._col,
                 query=query_vector,
                 using=settings.QDRANT_TEXT_VECTOR,
@@ -573,14 +577,14 @@ class QdrantRetrieval:
 
     # -- BM25 search --------------------------------------------------------
 
-    def _bm25_search(
+    async def _bm25_search(
         self, indices: List[int], values: List[float]
     ) -> List[Tuple[str, Dict, float]]:
         if not indices:
             logger.warning("BM25: empty sparse vector  -  skipping")
             return []
         try:
-            resp = self._qdrant.query_points(
+            resp = await self._qdrant.query_points(
                 collection_name=self._col,
                 query=qmodels.SparseVector(indices=indices, values=values),
                 using=settings.QDRANT_SPARSE_VECTOR,
@@ -594,7 +598,7 @@ class QdrantRetrieval:
 
     # -- Scroll 1 - direct ext field match ----------------------------
 
-    def _scroll1(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
+    async def _scroll1(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
         results: List[Tuple[str, Dict]] = []
 
         for sec in stage2b.sections:
@@ -606,7 +610,7 @@ class QdrantRetrieval:
                 num, num_only if num_only != num else None
             ])))
             for sn in search_nums:
-                found = self._scroll(
+                found = await self._scroll(
                     [qmodels.FieldCondition(key="ext.section_number",
                                             match=qmodels.MatchValue(value=sn)),
                      qmodels.FieldCondition(key="chunk_type",
@@ -621,7 +625,7 @@ class QdrantRetrieval:
             num = _bare_number(rule)
             if num:
                 full = f"Rule {num}"
-                found = self._scroll(
+                found = await self._scroll(
                     [qmodels.FieldCondition(key="ext.rule_number_full",
                                             match=qmodels.MatchValue(value=full)),
                      qmodels.FieldCondition(key="chunk_type",
@@ -635,7 +639,7 @@ class QdrantRetrieval:
         for notif in stage2b.notifications:
             num = _normalise_notif_num(notif)
             if num:
-                results += self._scroll(
+                results += await self._scroll(
                     [qmodels.FieldCondition(key="ext.notification_number",
                                             match=qmodels.MatchValue(value=num)),
                      qmodels.FieldCondition(key="chunk_type",
@@ -646,7 +650,7 @@ class QdrantRetrieval:
         for circ in stage2b.circulars:
             num = _normalise_circ_num(circ)
             if num:
-                results += self._scroll(
+                results += await self._scroll(
                     [qmodels.FieldCondition(key="ext.circular_number",
                                             match=qmodels.MatchValue(value=num)),
                      qmodels.FieldCondition(key="chunk_type",
@@ -657,7 +661,7 @@ class QdrantRetrieval:
         if stage2b.form_name or stage2b.form_number:
             fn = stage2b.form_name
             if fn:
-                results += self._scroll(
+                results += await self._scroll(
                     [qmodels.FieldCondition(key="ext.form_name",
                                             match=qmodels.MatchValue(value=fn.upper())),
                      qmodels.FieldCondition(key="chunk_type",
@@ -666,7 +670,7 @@ class QdrantRetrieval:
                 )
             fnum = _normalise_form_num(stage2b.form_number) if stage2b.form_number else None
             if fnum and not results:
-                results += self._scroll(
+                results += await self._scroll(
                     [qmodels.FieldCondition(key="ext.form_number",
                                             match=qmodels.MatchValue(value=fnum)),
                      qmodels.FieldCondition(key="chunk_type",
@@ -676,7 +680,7 @@ class QdrantRetrieval:
 
         if stage2b.hsn_code:
             code = stage2b.hsn_code
-            results += self._scroll(
+            results += await self._scroll(
                 [qmodels.FieldCondition(key="ext.hsn_code",
                                         match=qmodels.MatchValue(value=code)),
                  qmodels.FieldCondition(key="chunk_type",
@@ -684,14 +688,14 @@ class QdrantRetrieval:
                 limit=10, label=f"s1_hsn_{code}"
             )
             if len(code) >= 2:
-                results += self._scroll(
+                results += await self._scroll(
                     [qmodels.FieldCondition(key="ext.chapter_code",
                                             match=qmodels.MatchValue(value=code[:2])),
                      qmodels.FieldCondition(key="chunk_type",
                                             match=qmodels.MatchValue(value="hsn_code"))],
                     limit=5, label=f"s1_hsn_ch_{code[:2]}"
                 )
-            results += self._scroll(
+            results += await self._scroll(
                 [qmodels.FieldCondition(key="chunk_type",
                                         match=qmodels.MatchAny(any=["notification", "circular"])),
                 qmodels.FieldCondition(key="cross_references.hsn_codes",
@@ -701,14 +705,14 @@ class QdrantRetrieval:
 
         if stage2b.sac_code:
             code = stage2b.sac_code
-            results += self._scroll(
+            results += await self._scroll(
                 [qmodels.FieldCondition(key="ext.sac_code",
                                         match=qmodels.MatchValue(value=code)),
                  qmodels.FieldCondition(key="chunk_type",
                                         match=qmodels.MatchValue(value="sac_code"))],
                 limit=10, label=f"s1_sac_{code}"
             )
-            results += self._scroll(
+            results += await self._scroll(
                 [qmodels.FieldCondition(key="chunk_type",
                                         match=qmodels.MatchAny(any=["notification", "circular"])),
                 qmodels.FieldCondition(key="cross_references.sac_codes",
@@ -720,7 +724,7 @@ class QdrantRetrieval:
 
     # -- Scroll 2 - cross-reference match -----------------------------
 
-    def _scroll2(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
+    async def _scroll2(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
         calls: List[Tuple[List, int, str]] = []
 
         for sec in stage2b.sections:
@@ -804,22 +808,18 @@ class QdrantRetrieval:
         if not calls:
             return []
 
-        results: List[Tuple[str, Dict]] = []
-        future_map = {
-            rag_executor.submit(self._scroll, conditions, limit, label): label
-            for conditions, limit, label in calls
-        }
-        for future in as_completed(future_map):
-            try:
-                results += future.result()
-            except Exception as e:
-                logger.debug(f"scroll2 parallel call failed: {e}")
-
-        return results
+        coros = [self._scroll(c[0], limit=c[1], label=c[2]) for c in calls]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        
+        flat_list = []
+        for r in results:
+            if not isinstance(r, Exception):
+                flat_list += r
+        return flat_list
 
     # -- Scroll 3 - keyword match --------------------------------------
 
-    def _scroll3(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
+    async def _scroll3(self, stage2b: Stage2BResult) -> List[Tuple[str, Dict]]:
         results: List[Tuple[str, Dict]] = []
 
         section_variants: List[str] = []
@@ -850,7 +850,7 @@ class QdrantRetrieval:
         all_exact = list(dict.fromkeys(section_variants + rule_variants + form_variants))
         if all_exact:
             try:
-                found = self._scroll(
+                found = await self._scroll(
                     [qmodels.FieldCondition(key="keywords",
                                             match=qmodels.MatchAny(any=all_exact))],
                     limit=20, label="s3_exact"
@@ -868,7 +868,7 @@ class QdrantRetrieval:
             if not term:
                 continue
             try:
-                results += self._scroll(
+                results += await self._scroll(
                     [qmodels.FieldCondition(key="keywords",
                                             match=qmodels.MatchText(text=term))],
                     limit=8, label=f"s3_text_{term[:20]}"
@@ -880,7 +880,7 @@ class QdrantRetrieval:
 
     # -- Name search (pinned) ------------------------------------------
 
-    def _name_search(self, names: List[str]) -> List[Tuple[str, Dict]]:
+    async def _name_search(self, names: List[str]) -> List[Tuple[str, Dict]]:
         words = _name_words(names)
         if not words:
             return []
@@ -893,34 +893,33 @@ class QdrantRetrieval:
         if not calls:
             return []
 
-        raw: List[Tuple[str, Dict]] = []
-        future_map = {
-            rag_executor.submit(
-                self._scroll,
+        coros = [
+            self._scroll(
                 [qmodels.FieldCondition(key="chunk_type",
                                         match=qmodels.MatchValue(value="judgment")),
                  qmodels.FieldCondition(key=key,
                                         match=qmodels.MatchText(text=word))],
                 10, f"name_{word[:12]}_{key.split('.')[-1]}"
-            ): (word, key)
+            )
             for word, key in calls
-        }
-        for future in as_completed(future_map):
-            try:
-                raw += future.result()
-            except Exception as e:
-                logger.debug(f"Name search failed: {e}")
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        
+        raw: List[Tuple[str, Dict]] = []
+        for r in results:
+            if not isinstance(r, Exception):
+                raw += r
 
         return _dedup_by_citation(raw, max_citations=5)
 
     # -- Case number search (pinned) -----------------------------------
 
-    def _case_number_search(self, case_number: str) -> List[Tuple[str, Dict]]:
+    async def _case_number_search(self, case_number: str) -> List[Tuple[str, Dict]]:
         primary = _primary_case_number(case_number)
         if not primary:
             return []
         try:
-            results = self._scroll(
+            results = await self._scroll(
                 [qmodels.FieldCondition(key="chunk_type",
                                         match=qmodels.MatchValue(value="judgment")),
                  qmodels.FieldCondition(key="ext.case_number",
@@ -939,21 +938,21 @@ class QdrantRetrieval:
 
     # -- Scroll helper -------------------------------------------------
 
-    def _scroll(
+    async def _scroll(
         self,
         conditions: List[Any],
         limit: int = 20,
         label: str = "",
     ) -> List[Tuple[str, Dict]]:
         try:
-            results, _ = self._qdrant.scroll(
+            resp, _ = await self._qdrant.scroll(
                 collection_name=self._col,
                 scroll_filter=qmodels.Filter(must=conditions),
                 limit=limit,
                 with_payload=True,
                 with_vectors=False,
             )
-            return [(str(r.id), r.payload or {}) for r in results]
+            return [(str(r.id), r.payload or {}) for r in resp]
         except Exception as e:
             logger.debug(f"Scroll [{label}] failed: {e}")
             return []
@@ -961,14 +960,14 @@ class QdrantRetrieval:
 
 # -- Text index setup ---------------------------------------------------------
 
-def ensure_text_indexes(qdrant: QdrantClient):
+async def ensure_text_indexes(qdrant: AsyncQdrantClient):
     fields = [
         "ext.case_name", "ext.petitioner", "ext.respondent",
         "ext.case_number", "ext.sections_in_dispute", "keywords",
     ]
     for field in fields:
         try:
-            qdrant.create_payload_index(
+            await qdrant.create_payload_index(
                 collection_name=settings.QDRANT_COLLECTION,
                 field_name=field,
                 field_schema=qmodels.TextIndexParams(
@@ -1009,7 +1008,7 @@ def ensure_text_indexes(qdrant: QdrantClient):
     ]
     for field in keyword_fields:
         try:
-            qdrant.create_payload_index(
+            await qdrant.create_payload_index(
                 collection_name=settings.QDRANT_COLLECTION,
                 field_name=field,
                 field_schema=qmodels.PayloadSchemaType.KEYWORD,

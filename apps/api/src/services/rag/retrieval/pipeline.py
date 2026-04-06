@@ -14,9 +14,9 @@ Flow:
 import os
 import logging
 from typing import List, Optional
-from apps.api.src.services.rag.executor import rag_executor
+from starlette.concurrency import run_in_threadpool
 
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 
 from apps.api.src.core.config import settings
 from apps.api.src.services.rag.pipeline.bm25_vectorizer import BM25Vectorizer
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 class RetrievalPipeline:
     def __init__(self):
-        self._qdrant = QdrantClient(
+        self._qdrant = AsyncQdrantClient(
             host    = settings.QDRANT_HOST,
             port    = settings.QDRANT_PORT,
             api_key = settings.QDRANT_API_KEY,
@@ -59,11 +59,12 @@ class RetrievalPipeline:
         self._enricher   = CrossRefEnricher(self._qdrant)
         self._responder  = LLMResponder(self._llm, self._qdrant)
 
-    def setup(self):
+    async def setup(self):
         logger.info("Pipeline setup starting...")
 
         try:
-            all_cols = [c.name for c in self._qdrant.get_collections().collections]
+            collections_list = await self._qdrant.get_collections()
+            all_cols = [c.name for c in collections_list.collections]
             logger.info(f"Qdrant collections: {all_cols}")
             if settings.QDRANT_COLLECTION not in all_cols:
                 logger.error(
@@ -71,7 +72,7 @@ class RetrievalPipeline:
                     f"Available: {all_cols}"
                 )
             else:
-                info  = self._qdrant.get_collection(settings.QDRANT_COLLECTION)
+                info  = await self._qdrant.get_collection(settings.QDRANT_COLLECTION)
                 count = getattr(info, "points_count", None) or getattr(info, "vectors_count", None)
                 logger.info(f"Collection ready  -  points: {count}")
         except Exception as e:
@@ -84,40 +85,44 @@ class RetrievalPipeline:
         )
 
         try:
-            ensure_text_indexes(self._qdrant)
+            await ensure_text_indexes(self._qdrant)
         except Exception as e:
             logger.warning(f"Text index setup failed (non-fatal): {e}")
 
         logger.info("Pipeline ready.")
 
-    def query_stages_1_to_5(
+    async def query_stages_1_to_5(
         self,
         user_query: str,
         session_history: Optional[List[SessionMessage]] = None,
     ):
         session_history = session_history or []
-        return self._run_stages_1_to_5(user_query, session_history)
+        return await self._run_stages_1_to_5(user_query, session_history)
 
-    def _run_stages_1_to_5(
+    async def _run_stages_1_to_5(
         self,
         user_query: str,
         session_history: List[SessionMessage],
     ):
         # -- Stage 1 ---------------------------------------------------
-        final_query = self._clarifier.clarify(user_query, session_history)
+        final_query = await run_in_threadpool(
+            self._clarifier.clarify, user_query, session_history
+        )
 
         # -- Stage 2 ---------------------------------------------------
-        stage2a, stage2b, intent = self._extractor.extract(final_query)
+        stage2a, stage2b, intent = await run_in_threadpool(
+            self._extractor.extract, final_query
+        )
         keyword_doc = build_bm25_keyword_document(stage2a, stage2b)
 
         # -- Stage 3: Citation (Sequential) ----------------------------
-        citation_result = self._citation.run(
+        citation_result = await self._citation.run(
             stage2a.citation, stage2b.citation, stage2b,
             intent.intent, intent.confidence,
         )
 
         # -- Stage 4: Retrieval (Parallel searches within) -------------
-        chunks = self._retrieval.retrieve(
+        chunks = await self._retrieval.retrieve(
             final_query, keyword_doc, stage2b, intent,
             None,
             stage2b.citation or stage2a.citation,
@@ -128,7 +133,7 @@ class RetrievalPipeline:
 
         return (final_query, session_history, chunks, citation_result, intent)
 
-    def query_stage_6_stream(
+    async def query_stage_6_stream(
         self,
         final_query: str,
         session_history: List[SessionMessage],
@@ -136,13 +141,14 @@ class RetrievalPipeline:
         citation_result,
         intent,
     ):
-        cross_refs = self._enricher.enrich(chunks) if chunks else []
-        yield from self._responder.generate_stream(
+        cross_refs = await self._enricher.enrich(chunks) if chunks else []
+        async for chunk in self._responder.generate_stream(
             final_query=final_query,
             session_history=session_history,
             top_chunks=chunks,
             cross_ref_chunks=cross_refs,
             citation_result=citation_result if citation_result and citation_result.found else None,
             intent=intent,
-        )
+        ):
+            yield chunk
     

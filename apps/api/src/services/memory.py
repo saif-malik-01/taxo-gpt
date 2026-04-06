@@ -56,7 +56,7 @@ async def get_session_history(session_id: str, limit: int = 50):
             }
             if m.source_ids:
                 # Hydrate sources for this message
-                pipeline = await run_in_threadpool(get_pipeline)
+                pipeline = await get_pipeline()
                 sources = await hydrate_sources(m.source_ids, pipeline._qdrant)
                 msg_dict["sources"] = sources
             

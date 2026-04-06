@@ -5,15 +5,14 @@ Stage 6 — Cross-reference enrichment + LLM response generation.
 
 import re
 import json as _json
-from concurrent.futures import as_completed
 from typing import Any, Dict, List, Optional
 
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 
+import asyncio
 from apps.api.src.core.config import settings
 from apps.api.src.services.llm.bedrock import BedrockLLMClient
-from apps.api.src.services.rag.executor import rag_executor
 from apps.api.src.services.rag.models import (
     CitationResult, FinalResponse, IntentResult,
     ScoredChunk, SessionMessage,
@@ -90,11 +89,11 @@ class CrossRefEnricher:
     Capped at _TOP_CHUNKS_FOR_ENRICH source chunks to keep latency bounded.
     """
 
-    def __init__(self, qdrant: QdrantClient):
+    def __init__(self, qdrant: AsyncQdrantClient):
         self._qdrant = qdrant
         self._col    = settings.QDRANT_COLLECTION
 
-    def enrich(self, top_chunks: List[ScoredChunk]) -> List[Dict[str, Any]]:
+    async def enrich(self, top_chunks: List[ScoredChunk]) -> List[Dict[str, Any]]:
         lookups: List[tuple] = []
         seen_cache_keys = set()
 
@@ -139,25 +138,19 @@ class CrossRefEnricher:
             return []
 
         results: Dict[str, Dict] = {}
-        # Submit to the shared global pool — avoids creating a new
-        # ThreadPoolExecutor per request (which caused thread explosion under load).
-        future_map = {
-            rag_executor.submit(self._scroll, key, value): cache_key
-            for key, value, cache_key in lookups
-        }
-        for future in as_completed(future_map):
-            cache_key = future_map[future]
-            try:
-                chunks_found = future.result()
-            except Exception as e:
-                logger.debug(f"Cross-ref fetch failed [{cache_key}]: {e}")
+        # Launch all scrolls in parallel using asyncio.gather
+        coros = [self._scroll(key, value) for key, value, _ in lookups]
+        fetched_results = await asyncio.gather(*coros, return_exceptions=True)
+
+        for i, chunks_found in enumerate(fetched_results):
+            if isinstance(chunks_found, Exception):
+                logger.debug(f"Cross-ref fetch failed [{lookups[i][2]}]: {chunks_found}")
                 continue
 
+            cache_key = lookups[i][2]
             if chunks_found and cache_key not in results:
                 results[cache_key] = chunks_found[0]
                 if len(results) >= _MAX_CROSS_REFS:
-                    for f in future_map:
-                        f.cancel()
                     break
 
         result_list = list(results.values())[:_MAX_CROSS_REFS]
@@ -165,9 +158,9 @@ class CrossRefEnricher:
                     f"(from {len(lookups)} parallel lookups)")
         return result_list
 
-    def _scroll(self, key: str, value: str) -> List[Dict]:
+    async def _scroll(self, key: str, value: str) -> List[Dict]:
         try:
-            results, _ = self._qdrant.scroll(
+            results, _ = await self._qdrant.scroll(
                 collection_name=self._col,
                 scroll_filter=qmodels.Filter(must=[
                     qmodels.FieldCondition(
@@ -194,11 +187,11 @@ class CrossRefEnricher:
 
 class LLMResponder:
 
-    def __init__(self, llm: BedrockLLMClient, qdrant: Optional[QdrantClient] = None):
+    def __init__(self, llm: BedrockLLMClient, qdrant: Optional[AsyncQdrantClient] = None):
         self._llm = llm
         self._qdrant = qdrant
 
-    def generate(
+    async def generate(
         self,
         final_query: str,
         session_history: List[SessionMessage],
@@ -231,7 +224,7 @@ class LLMResponder:
         )
         if not answer:
             answer = "Unable to generate a response at this time. Please try again."
-        retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
+        retrieved_docs = await _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
         return FinalResponse(
             answer=answer,
             retrieved_documents=retrieved_docs,
@@ -239,7 +232,7 @@ class LLMResponder:
             confidence=intent.confidence,
         )
 
-    def generate_stream(
+    async def generate_stream(
         self,
         final_query: str,
         session_history: List[SessionMessage],
@@ -250,8 +243,7 @@ class LLMResponder:
     ):
         """
         Streaming generation — yields text chunks as they arrive from Bedrock.
-        cross_ref_chunks are passed in pre-computed (done during stages 1-5 threadpool)
-        so this function can start streaming immediately without any Qdrant calls.
+        Uses a thread pool bridge to avoid blocking the event loop during sync Bedrock calls.
         """
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
@@ -266,18 +258,41 @@ class LLMResponder:
             f"(intent={intent.intent} conf={intent.confidence} "
             f"chunks={len(top_chunks)} cross_refs={len(cross_ref_chunks)})"
         )
-        retrieved_docs = _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
+        retrieved_docs = await _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
+
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue(maxsize=128)
+
+        def _stream_to_queue():
+            try:
+                for chunk in self._llm.call_stream(
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    max_tokens=_MAX_TOKENS_RESP,
+                    temperature=0.1,
+                    label="stage6_stream",
+                ):
+                    asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result(timeout=30)
+            except Exception as e:
+                logger.error(f"Bedrock stream bridge failed: {e}")
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({"__error__": str(e)}), loop
+                ).result(timeout=5)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
+
+        loop.run_in_executor(None, _stream_to_queue)
 
         usage_data: dict = {}
-        for chunk in self._llm.call_stream(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            max_tokens=_MAX_TOKENS_RESP,
-            temperature=0.1,
-            label="stage6_stream",
-        ):
-            # Intercept the __USAGE__ sentinel emitted by _stream_converse
-            if chunk.startswith("\n\n__USAGE__"):
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+
+            if isinstance(chunk, dict) and "__error__" in chunk:
+                break
+
+            if isinstance(chunk, str) and chunk.startswith("\n\n__USAGE__"):
                 try:
                     usage_data = _json.loads(chunk[len("\n\n__USAGE__"):])
                 except Exception:
@@ -286,11 +301,10 @@ class LLMResponder:
                 yield chunk
 
         meta = {
-            "__meta__": True,
-            "intent":      intent.intent,
-            "confidence":  intent.confidence,
+            "intent": intent.intent,
+            "confidence": intent.confidence,
             "retrieved_documents": retrieved_docs,
-            "usage":       usage_data,   # real inputTokens/outputTokens/totalTokens
+            "usage": usage_data,
         }
         yield "\n\n__META__" + _json.dumps(meta)
 
@@ -515,11 +529,11 @@ def _format_chunk(chunk: Dict, label: str = "", pinned: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _build_docs_list(
+async def _build_docs_list(
     top_chunks: List[ScoredChunk],
     cross_refs: List[Dict],
     citation_result: Optional[CitationResult],
-    qdrant: Optional[QdrantClient] = None
+    qdrant: Optional[AsyncQdrantClient] = None
 ) -> List[Dict]:
     """
     Build sources list for frontend. Deduplicated by identifier (citation).
@@ -566,26 +580,27 @@ def _build_docs_list(
         _add(chunk, "cross_reference", 0.0)
         
     if qdrant and judgments_to_fetch:
-        # Reuse global pool — no per-call ThreadPoolExecutor creation.
-        future_to_id = {
-            rag_executor.submit(_fetch_full_judgment, qdrant, payload): ident
+        tasks = [
+            _fetch_full_judgment(qdrant, payload)
             for ident, payload in judgments_to_fetch.items()
-        }
-        for future in as_completed(future_to_id):
-            ident = future_to_id[future]
-            try:
-                full_data = future.result()
-                if full_data:
-                    for d in docs:
-                        if d.get("identifier") == ident:
-                            d["full_judgment"] = full_data
-                            break
-            except Exception as e:
-                logger.error(f"Error fetching full judgment for {ident}: {e}")
+        ]
+        fetched_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for i, (ident, _) in enumerate(judgments_to_fetch.items()):
+            full_data = fetched_results[i]
+            if isinstance(full_data, Exception):
+                logger.error(f"Error fetching full judgment for {ident}: {full_data}")
+                continue
+                
+            if full_data:
+                for d in docs:
+                    if d.get("identifier") == ident:
+                        d["full_judgment"] = full_data
+                        break
 
     return docs
 
-def _fetch_full_judgment(qdrant: QdrantClient, payload: Dict) -> Dict:
+async def _fetch_full_judgment(qdrant: AsyncQdrantClient, payload: Dict) -> Dict:
     file_hash = payload.get("_file_hash")
     citation = payload.get("ext", {}).get("citation")
     
@@ -599,7 +614,7 @@ def _fetch_full_judgment(qdrant: QdrantClient, payload: Dict) -> Dict:
         ))
         
     try:
-        results, _ = qdrant.scroll(
+        results, _ = await qdrant.scroll(
             collection_name=settings.QDRANT_COLLECTION,
             scroll_filter=qmodels.Filter(must=must_cond),
             limit=1000,

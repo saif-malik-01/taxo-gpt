@@ -294,7 +294,7 @@ async def get_shared_content(shared_id: str, db: AsyncSession = Depends(get_db))
         for m in messages:
             msg_dict = {"id": m.id, "role": m.role, "content": m.content}
             if m.source_ids:
-                pipeline = await run_in_threadpool(get_pipeline)
+                pipeline = await get_pipeline()
                 msg_dict["sources"] = await hydrate_sources(m.source_ids, pipeline._qdrant)
             history.append(msg_dict)
             

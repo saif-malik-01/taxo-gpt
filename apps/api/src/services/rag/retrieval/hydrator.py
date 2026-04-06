@@ -7,17 +7,15 @@ import asyncio
 import json
 import logging
 from typing import List, Dict, Any, Optional
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 
 from apps.api.src.core.config import settings
 from apps.api.src.db.session import get_redis
 from apps.api.src.services.rag.retrieval.responder import _fetch_full_judgment, _doc_summary
-from apps.api.src.services.rag.executor import rag_executor
-from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
-async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[Dict[str, Any]]:
+async def hydrate_sources(source_ids: List[str], qdrant: AsyncQdrantClient) -> List[Dict[str, Any]]:
     """
     Fetches sources from Qdrant by ID and reconstructs full judgments if needed.
     """
@@ -30,8 +28,6 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
 
     # 1. Check Redis Cache first
     for sid in source_ids:
-        # Robust ID handling: Qdrant point IDs are either int or UUID string.
-        # If it's a numeric string, convert it back to int for Qdrant.
         resolved_id = sid
         is_valid = False
         
@@ -42,7 +38,6 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
                 resolved_id = int(sid)
                 is_valid = True
             else:
-                # Check if it's a valid UUID string
                 import re
                 uuid_regex = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
                 if uuid_regex.match(sid):
@@ -68,10 +63,7 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
 
     # 2. Fetch from Qdrant
     try:
-        # Qdrant client here is synchronous (blocking). Offload to a worker
-        # so concurrent requests don't stall the event loop.
-        results = await run_in_threadpool(
-            qdrant.retrieve,
+        results = await qdrant.retrieve(
             collection_name=settings.QDRANT_COLLECTION,
             ids=ids_to_fetch,
             with_payload=True,
@@ -79,20 +71,13 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
         )
         
         seen_identifiers = set()
-
-        # We may need to reconstruct full judgments (extra blocking Qdrant scrolls).
-        # Run those on the same bounded pool used across RAG.
-        judgment_futures: List[tuple[int, Any]] = []
+        judgment_tasks: List[tuple[int, Any]] = []
 
         for r in results:
             if not r.payload: continue
             payload = r.payload
             
-            # Use existing summary builder
-            # score is 0.0 for history as it's not a search result anymore
             summary = _doc_summary(payload, "history", 0.0)
-            
-            # Deduplicate ONLY judgments — other chunks preserve their individual texts
             identifier = summary.get("identifier")
             is_judgment = payload.get("chunk_type") == "judgment"
             
@@ -101,18 +86,13 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
                     continue
                 seen_identifiers.add(identifier)
             
-            # Ensure the Point ID is set correctly in the summary for the frontend
             summary["chunk_id"] = str(r.id)
             
-            # Handle full judgments (just like active stream).
-            # We defer the actual blocking Qdrant scroll into a bounded worker.
-            if payload.get("chunk_type") == "judgment":
+            if is_judgment:
                 idx = len(hydrated_sources)
-                full_future = rag_executor.submit(_fetch_full_judgment, qdrant, payload)
-                judgment_futures.append((idx, full_future))
+                judgment_tasks.append((idx, _fetch_full_judgment(qdrant, payload)))
             
-            # Cache after enrichment: judgments need full_judgment first (see gather below).
-            if payload.get("chunk_type") != "judgment":
+            if not is_judgment:
                 try:
                     await redis.setex(
                         f"hydrated_source:{r.id}", 86400, json.dumps(summary)
@@ -122,17 +102,14 @@ async def hydrate_sources(source_ids: List[str], qdrant: QdrantClient) -> List[D
 
             hydrated_sources.append(summary)
             
-        # Resolve all pending full-judgment futures.
-        # This prevents one judgment scroll from blocking other requests.
-        if judgment_futures:
-            idxs = [i for i, _ in judgment_futures]
-            futures = [f for _, f in judgment_futures]
-            full_judgments = await asyncio.gather(
-                *(asyncio.wrap_future(f) for f in futures),
-                return_exceptions=True,
-            )
+        if judgment_tasks:
+            idxs = [i for i, _ in judgment_tasks]
+            coros = [c for _, c in judgment_tasks]
+            full_judgments = await asyncio.gather(*coros, return_exceptions=True)
+            
             for idx, full_data in zip(idxs, full_judgments):
                 if isinstance(full_data, Exception):
+                    logger.error(f"Judgment task error: {full_data}")
                     full_data = None
                 if full_data:
                     hydrated_sources[idx]["full_judgment"] = full_data
