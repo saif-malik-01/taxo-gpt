@@ -32,7 +32,7 @@ logger = get_logger("bedrock_llm")
 MODEL_ID      = "qwen.qwen3-next-80b-a3b"
 _MAX_RETRIES  = 3
 _RETRY_DELAY  = 2.0
-_MAX_TOKENS   = 4096
+_MAX_TOKENS   = 8000
 _TEMPERATURE  = 0.1
 
 # ── Boto3 client config ────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ _TEMPERATURE  = 0.1
 #   decides whether and how long to retry.
 
 _BEDROCK_CONFIG = Config(
-    read_timeout=90,
+    read_timeout=180,
     retries={"max_attempts": 1, "mode": "standard"},
 )
 

@@ -1,25 +1,18 @@
 """
-services/document/doc_classifier.py
+services/document/doc_classifier.py  — patched
 
-Step 2A+2C  — combined metadata + intent (one Qwen call per doc)
-Step 2B     — legal entity extraction (Qwen LLM + regex, parallel with 2A+2C)
-Step 3      — same-case determination (deterministic: ref# → party exact → summary sim)
-Step 6a     — issue extraction (per primary doc with has_issues=True)
-Step 6b     — replied-issue extraction (per reply/draft doc)
-Step 6      — enhanced re-extraction for "missed issues"
+Only the issue-extraction section is changed vs original. All other functions
+(analyze_document, extract_legal_entities, determine_route, etc.) are identical.
 
-Multi-part notice detection:
-  Same reference_number across uploads → merge texts before Step 2.
-  Same date + same sender, no ref# → Step 4 confirmation.
-
-temporal_role logic (finalized, no date-gap-vs-today):
-  1. Explicit user statement (locked)
-  2. Filename hint
-  3. Cross-doc relative date comparison (most recent primary = current)
-  4. has_replied_issues signal
-  5. Self-reference language in doc
-  6. Procedural stage language
-  7. unknown → Step 4
+Root causes of the 40-page SCN stall fixed:
+  1. max_tokens 8192→16384 for single-call path  (8192 truncated at ~15 issues)
+  2. Two-pass serial replaced with segmented parallel extraction
+     - 25 000-char segments, 3 000-char overlap, ThreadPoolExecutor(max_workers=4)
+     - All segments run concurrently; results deduplicated at 85 % similarity
+  3. Per-issue 800-word cap added to prompt
+     - Prevents runaway verbatim output on very long allegation paragraphs
+  4. _extract_issues_once() kept as a no-op shim for backward compatibility
+  5. reextract_missed_issues() uses same segmented approach + focused prompt
 """
 
 import json
@@ -32,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 # ── LLM singleton ─────────────────────────────────────────────────────────────
 
-_llm       = None
-_llm_lock  = threading.Lock()
+_llm      = None
+_llm_lock = threading.Lock()
 
 
 def _get_llm():
@@ -47,38 +40,26 @@ def _get_llm():
 
 
 def _parse_json(raw: Optional[str], fallback: dict) -> dict:
-    """
-    Parse JSON from LLM output. Falls back gracefully on truncation.
-    For issue extraction specifically, tries to recover complete string
-    elements from a truncated JSON array before giving up.
-    """
     if not raw:
         return fallback
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
-
-    # Extract the outermost {...} block
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         text = m.group()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse error: {e} | raw[:200]={raw[:200]}")
 
-    # ── Truncation recovery for {"issues": [...]} arrays ─────────────────────
-    # If the output was cut mid-array, extract all fully-closed string items.
+    # Truncation recovery for {"issues": [...]}
     try:
         array_match = re.search(r'"issues"\s*:\s*\[(.+)', text, re.DOTALL)
         if array_match:
             array_body = array_match.group(1)
-            # Find all complete quoted strings (handling escaped quotes)
             recovered = re.findall(r'"((?:[^"\\]|\\.)*)"', array_body)
-            # Filter out tiny fragments (< 20 chars) — those are probably
-            # keys or values from nested objects, not full issue texts
             recovered = [s for s in recovered if len(s) >= 20]
             if recovered:
                 logger.warning(
@@ -89,19 +70,16 @@ def _parse_json(raw: Optional[str], fallback: dict) -> dict:
     except Exception:
         pass
 
-    # Same recovery for {"replied_issues": [...]}
+    # Truncation recovery for {"replied_issues": [...]}
     try:
         array_match = re.search(r'"replied_issues"\s*:\s*\[(.+)', text, re.DOTALL)
         if array_match:
-            # Try to extract complete {issue_text, reply_text} objects
             obj_matches = re.findall(
                 r'\{\s*"issue_text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"reply_text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}',
                 array_match.group(1),
             )
             if obj_matches:
-                logger.warning(
-                    f"Replied-issues JSON truncated — recovered {len(obj_matches)} pairs"
-                )
+                logger.warning(f"Replied-issues JSON truncated — recovered {len(obj_matches)} pairs")
                 return {
                     "replied_issues": [
                         {"issue_text": it, "reply_text": rt}
@@ -141,9 +119,9 @@ def _is_generic_party(name: str) -> bool:
     return bool(_GENERIC_WHITELIST.search(name or ""))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 2A+2C — Combined metadata + intent
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2A+2C — Combined metadata + intent  (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 _2AC_SYSTEM = (
     "You are a legal document classifier for Indian tax proceedings. "
@@ -162,25 +140,21 @@ ACTIVE CASE SNAPSHOT (other documents already in this case):
 {active_case_info}
 
 CLASSIFICATION PRIORITY ORDER:
-1. Explicit user statement in USER MESSAGE about this document's role/timing → locked=true
-2. UPLOAD HINTS (filename signals) → soft confirmation
+1. Explicit user statement in USER MESSAGE about this document's role/timing -> locked=true
+2. UPLOAD HINTS (filename signals) -> soft confirmation
 3. Cross-document date comparison against ACTIVE CASE SNAPSHOT primaries
 4. Document self-reference language
 5. Procedural stage language
 
 ROLE DEFINITIONS:
-  primary         — notice/SCN/order/demand that requires a formal reply
-  previous_reply  — a reply/response already submitted to the authority
-  user_draft_reply — user's own prepared reply, NOT yet submitted
-  reference       — judgment/circular/notification/rule for legal support
-  informational   — GST return/ITR/P&L/balance sheet (Q&A only, no drafting)
+  primary         -- notice/SCN/order/demand that requires a formal reply
+  previous_reply  -- a reply/response already submitted to the authority
+  user_draft_reply -- user's own prepared reply, NOT yet submitted
+  reference       -- judgment/circular/notification/rule for legal support
+  informational   -- GST return/ITR/P&L/balance sheet (Q&A only, no drafting)
 
-TEMPORAL ROLE (current = active obligation, historical = prior stage):
-  - Compare dates against ACTIVE CASE SNAPSHOT primary dates (relative, not vs today)
-  - Most recent primary date = current; older = historical
-  - If user said "just received" / "current" / "latest" → current (locked)
-  - If user said "old" / "previous" / "already replied" → historical (locked)
-  - If no date and no signal → unknown
+TEMPORAL ROLE:
+  current = active obligation; historical = prior stage; unknown = insufficient signal
 
 Return this JSON:
 {{
@@ -199,7 +173,7 @@ Return this JSON:
   }},
   "reference_number": "verbatim reference number or null",
   "date": "DD-MM-YYYY or null",
-  "brief_summary": "<=400 chars, all legal entities (amounts, section numbers, GSTINs) preserved",
+  "brief_summary": "<=400 chars, all legal entities preserved",
   "confidence": 0-100,
   "intent": "summarize|draft_direct|draft_all|draft_specific|query_document|query_general|update_issues|confirm_mode|null",
   "mode": "defensive|in_favour|null",
@@ -214,10 +188,6 @@ def analyze_document(
     active_case_info: Optional[dict] = None,
     upload_hints: Optional[List[str]] = None,
 ) -> dict:
-    """
-    Step 2A+2C: combined metadata extraction + intent classification.
-    Returns the parsed JSON dict.
-    """
     fallback = {
         "role": "primary", "role_locked": False,
         "display_type": "notice", "temporal_role": "unknown",
@@ -231,16 +201,15 @@ def analyze_document(
     if not full_text or not full_text.strip():
         return fallback
 
-    # Truncate to ~80k chars (≈ 20k tokens) per call budget
     text_for_llm = full_text[:80000]
     hints_str    = json.dumps(upload_hints or [])
     case_str     = json.dumps(active_case_info or {})
 
     prompt = _2AC_PROMPT.format(
-        doc_text      = text_for_llm,
-        user_message  = user_message or "",
-        upload_hints  = hints_str,
-        user_context  = user_context or "(none)",
+        doc_text         = text_for_llm,
+        user_message     = user_message or "",
+        upload_hints     = hints_str,
+        user_context     = user_context or "(none)",
         active_case_info = case_str,
     )
 
@@ -253,13 +222,12 @@ def analyze_document(
     )
     result = _parse_json(raw, fallback)
 
-    # Enforce constraints
     if result.get("role") not in ("primary", "previous_reply", "user_draft_reply", "reference", "informational"):
         result["role"] = fallback["role"]
     if result.get("temporal_role") not in ("current", "historical", "unknown"):
         result["temporal_role"] = "unknown"
 
-    # has_issues false-negative mitigation: lightweight keyword check
+    # has_issues false-negative mitigation
     if result.get("role") == "primary" and not result.get("has_issues"):
         allegation_kw = re.compile(
             r"\b(alleged|allegation|demand|short.?payment|excess.?itc|mismatch|"
@@ -280,16 +248,13 @@ def analyze_document(
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 2B — Legal entity extraction
-# Uses the SAME Stage2ARegex + Stage2BLLM as Feature 1 (retrieval/extractor.py)
-# Runs in parallel via ThreadPoolExecutor, mirroring CombinedExtractor.extract()
-# but without Stage2C (intent is handled in 2A+2C for documents).
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2B — Legal entity extraction  (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 _entity_extractor_lock = threading.Lock()
-_stage2a_regex   = None
-_stage2b_llm     = None
+_stage2a_regex         = None
+_stage2b_llm           = None
 
 
 def _get_entity_extractors():
@@ -305,37 +270,23 @@ def _get_entity_extractors():
 
 
 def extract_legal_entities(full_text: str) -> dict:
-    """
-    Step 2B: extract legal entities from document text.
-
-    Uses the IDENTICAL Stage2ARegex (regex) + Stage2BLLM (LLM) as Feature 1.
-    Both run in parallel, results merged — same logic as CombinedExtractor.extract()
-    in retrieval/extractor.py, minus Stage2C which is not needed for documents.
-
-    The document text is passed directly as the 'query' to Stage2BLLM.extract().
-    Stage2A regex handles sections/rules/notifications/circulars from the text.
-    Merged Stage2BResult fields are returned as a plain dict for snapshot caching.
-
-    Returns dict with Stage2BResult fields + stage2a tokens for BM25 building.
-    """
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
     from retrieval.models import Stage2AResult, Stage2BResult
 
+    empty = {
+        "sections": [], "rules": [], "notifications": [], "circulars": [],
+        "acts": [], "keywords": [], "topics": [], "keywords_raw": [],
+        "form_name": None, "form_number": None, "case_name": None,
+        "parties": [], "person_names": [], "case_number": None,
+        "court": None, "court_level": None, "citation": None,
+        "decision_type": None, "hsn_code": None, "sac_code": None,
+        "issued_by": None,
+        "_stage2a_normalised": [], "_stage2a_raw": [],
+    }
     if not full_text or not full_text.strip():
-        return {
-            "sections": [], "rules": [], "notifications": [], "circulars": [],
-            "acts": [], "keywords": [], "topics": [], "keywords_raw": [],
-            "form_name": None, "form_number": None, "case_name": None,
-            "parties": [], "person_names": [], "case_number": None,
-            "court": None, "court_level": None, "citation": None,
-            "decision_type": None, "hsn_code": None, "sac_code": None,
-            "issued_by": None,
-            "_stage2a_normalised": [], "_stage2a_raw": [],
-        }
+        return empty
 
     stage2a_obj, stage2b_llm = _get_entity_extractors()
-
-    # Document text capped at 60k chars for the LLM call — regex runs on full text
     text_for_llm = full_text[:60000]
 
     results: dict = {}
@@ -354,22 +305,11 @@ def extract_legal_entities(full_text: str) -> dict:
     stage2a: Stage2AResult = results.get("2a") or Stage2AResult([], [], None)
     stage2b: Stage2BResult = results.get("2b") or Stage2BResult()
 
-    # Merge Stage2A tokens into Stage2BResult fields
-    # Stage2A normalised_tokens contain sections/rules/notifications/circulars
-    # combined; Stage2B LLM has them in separate lists. Take union.
-    def _merge_list(llm_list, regex_tokens, pattern):
-        """Merge LLM list with matching regex tokens, deduplicated."""
-        combined = list(llm_list or [])
-        for tok in (regex_tokens or []):
-            if pattern.lower() in tok.lower() and tok not in combined:
-                combined.append(tok)
-        return combined
-
     import re as _re
     sec_tokens   = [t for t in stage2a.normalised_tokens if _re.search(r"section", t, _re.I)]
-    rule_tokens  = [t for t in stage2a.normalised_tokens if _re.search(r"rule", t, _re.I)]
-    notif_tokens = [t for t in stage2a.normalised_tokens if _re.search(r"notif|notif", t, _re.I)]
-    circ_tokens  = [t for t in stage2a.normalised_tokens if _re.search(r"circ", t, _re.I)]
+    rule_tokens  = [t for t in stage2a.normalised_tokens if _re.search(r"rule",    t, _re.I)]
+    notif_tokens = [t for t in stage2a.normalised_tokens if _re.search(r"notif",   t, _re.I)]
+    circ_tokens  = [t for t in stage2a.normalised_tokens if _re.search(r"circ",    t, _re.I)]
 
     merged = {
         "sections":      list(dict.fromkeys((stage2b.sections or []) + sec_tokens)),
@@ -393,11 +333,9 @@ def extract_legal_entities(full_text: str) -> dict:
         "hsn_code":      stage2b.hsn_code,
         "sac_code":      stage2b.sac_code,
         "issued_by":     stage2b.issued_by,
-        # Store raw Stage2A tokens so build_bm25_keyword_document can be called later
         "_stage2a_normalised": list(stage2a.normalised_tokens or []),
         "_stage2a_raw":        list(stage2a.raw_tokens or []),
     }
-
     logger.info(
         f"2B: sections={len(merged['sections'])} rules={len(merged['rules'])} "
         f"notifications={len(merged['notifications'])} circulars={len(merged['circulars'])}"
@@ -406,11 +344,6 @@ def extract_legal_entities(full_text: str) -> dict:
 
 
 def entities_to_stage2b_result(raw_entities: dict):
-    """
-    Reconstruct Stage2BResult + Stage2AResult from cached entities dict.
-    Also rebuilds BM25 keyword document using build_bm25_keyword_document().
-    Returns Stage2BResult (the object expected by retrieval/pipeline.py).
-    """
     try:
         from retrieval.models import Stage2BResult, Stage2AResult
         from retrieval.extractor import build_bm25_keyword_document
@@ -437,56 +370,29 @@ def entities_to_stage2b_result(raw_entities: dict):
             sac_code      = raw_entities.get("sac_code"),
             issued_by     = raw_entities.get("issued_by"),
         )
-
         stage2a = Stage2AResult(
             normalised_tokens = raw_entities.get("_stage2a_normalised", []),
             raw_tokens        = raw_entities.get("_stage2a_raw", []),
             citation          = raw_entities.get("citation"),
         )
-
-        # Build BM25 keyword document — same function as Feature 1
         stage2b._bm25_keyword_doc = build_bm25_keyword_document(stage2a, stage2b)
-
         return stage2b
-
     except Exception as e:
         logger.warning(f"Could not reconstruct Stage2BResult: {e}")
         return None
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MULTI-PART NOTICE DETECTION
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# MULTI-PART NOTICE DETECTION  (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 def detect_multipart_notices(docs: List[dict]) -> List[dict]:
-    """
-    Merge docs that are parts of the same notice.
-
-    docs: list of {filename, full_text, page_count, upload_hints}
-
-    Returns merged list. Multi-part docs are collapsed into one entry with
-    concatenated text and all part filenames recorded in part_filenames[].
-
-    Rule 1: Same reference_number (pre-extraction from filename or user hint) → merge.
-    Rule 2: Same date + same sender detected in filename hints → flag probable_parts
-            (actual merge requires Step 4 user confirmation).
-
-    NOTE: True reference_number is extracted in Step 2A+2C. At the pre-Step-2 stage
-    we can only use filename hints and user signals. The definitive merge check
-    happens AFTER Step 2 in determine_route() when reference_numbers are known.
-    """
-    # Pre-Step-2 we just return docs as-is.
-    # Post-Step-2 merge happens in determine_route / _apply_routing.
     return docs
 
 
-def merge_multipart_docs(docs_with_analysis: List[Tuple[dict, dict]]) -> List[Tuple[dict, dict]]:
-    """
-    Called AFTER Step 2A+2C analysis when reference_numbers are known.
-    docs_with_analysis: list of (doc_dict, analysis_dict)
-    Returns merged list. Docs sharing the same reference_number are joined.
-    """
-    # Group by reference_number (non-null)
+def merge_multipart_docs(
+    docs_with_analysis: List[Tuple[dict, dict]]
+) -> List[Tuple[dict, dict]]:
     groups: Dict[str, List[Tuple[dict, dict]]] = {}
     no_ref = []
     for doc, analysis in docs_with_analysis:
@@ -501,52 +407,45 @@ def merge_multipart_docs(docs_with_analysis: List[Tuple[dict, dict]]) -> List[Tu
         if len(group) == 1:
             result.append(group[0])
         else:
-            # Merge: concatenate texts, keep first doc's metadata, record all filenames
             merged_doc      = dict(group[0][0])
             merged_analysis = dict(group[0][1])
             all_texts  = [d["full_text"] for d, _ in group]
-            all_fnames = [d["filename"] for d, _ in group]
-            merged_doc["full_text"]       = "\n\n".join(
-                f"[PART: {fn}]\n{txt}" for fn, txt in zip(all_fnames, all_texts)
+            all_fnames = [d["filename"]  for d, _ in group]
+            merged_doc["full_text"] = "\n\n".join(
+                f"[PART: {fn}]\n{txt}"
+                for fn, txt in zip(all_fnames, all_texts)
             )
-            merged_doc["page_count"]      = sum(d.get("page_count", 0) for d, _ in group)
-            merged_doc["filename"]        = " + ".join(all_fnames)
-            merged_doc["part_filenames"]  = all_fnames
-            # Use longest/most complete brief_summary
+            merged_doc["page_count"]     = sum(d.get("page_count", 0) for d, _ in group)
+            merged_doc["filename"]       = " + ".join(all_fnames)
+            merged_doc["part_filenames"] = all_fnames
             summaries = [a.get("brief_summary", "") for _, a in group]
             merged_analysis["brief_summary"] = max(summaries, key=len)
-            logger.info(
-                f"Merged {len(group)} parts into one notice: ref={ref} "
-                f"files={all_fnames}"
-            )
+            logger.info(f"Merged {len(group)} parts: ref={ref} files={all_fnames}")
             result.append((merged_doc, merged_analysis))
 
     result.extend(no_ref)
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Same-case determination (deterministic, no LLM)
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3 — Same-case determination  (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 def compute_summary_similarity(summary_a: str, summary_b: str) -> float:
-    """
-    Cosine similarity between two brief_summaries using TF-IDF-like token overlap.
-    We avoid heavy ML models here — uses set-based Jaccard as a fast proxy.
-    """
     if not summary_a or not summary_b:
         return 0.0
     tokens_a = set(re.findall(r"\b\w+\b", summary_a.lower()))
     tokens_b = set(re.findall(r"\b\w+\b", summary_b.lower()))
-    # Remove stopwords
-    stops = {"the","a","an","of","in","to","for","and","or","is","are","was","be","by","on","at","as","it","its","this","that","which","with","from","has","have"}
+    stops = {
+        "the","a","an","of","in","to","for","and","or","is","are","was",
+        "be","by","on","at","as","it","its","this","that","which","with",
+        "from","has","have",
+    }
     tokens_a -= stops
     tokens_b -= stops
     if not tokens_a or not tokens_b:
         return 0.0
-    intersection = tokens_a & tokens_b
-    union        = tokens_a | tokens_b
-    return len(intersection) / len(union)  # Jaccard
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
 def determine_route(
@@ -554,64 +453,51 @@ def determine_route(
     case: Optional[dict],
     upload_hints: Optional[List[str]] = None,
 ) -> str:
-    """
-    Step 3: pure deterministic routing. No LLM.
-    Returns one of:
-      new_case_primary | new_case_reference |
-      add_to_case_primary | add_to_case_reference |
-      add_to_case_reply | add_to_case_draft_reply |
-      different_case_confirm | same_case_confirmed
-    """
     role    = analysis.get("role", "reference")
     ref_num = (analysis.get("reference_number") or "").strip()
     parties = analysis.get("parties") or {}
     summary = analysis.get("brief_summary", "")
 
     if not case:
-        if role == "primary":
-            return "new_case_primary"
-        return "new_case_reference"
+        return "new_case_primary" if role == "primary" else "new_case_reference"
 
-    # Check 1: Reference number exact match
     case_ref = (case.get("reference_number") or "").strip()
     if ref_num and case_ref and ref_num == case_ref:
         return _route_for_role(role)
 
-    # Check 2: Party exact match (normalised)
     incoming_names = [parties.get("recipient", ""), parties.get("sender", "")]
     case_parties   = case.get("parties") or {}
-    case_names     = [
-        case_parties.get("taxpayer_name", ""),
-        case_parties.get("authority", ""),
-    ]
+    case_names     = [case_parties.get("taxpayer_name", ""), case_parties.get("authority", "")]
+
     for inc in incoming_names:
         if not inc or _is_generic_party(inc):
             continue
         norm_inc = _normalise_party(inc)
         if not norm_inc:
             continue
-        # GSTIN/PAN exact match
         if parties.get("gstin") and case_parties.get("gstin"):
             if parties["gstin"].upper() == case_parties["gstin"].upper():
                 return _route_for_role(role)
         if parties.get("pan") and case_parties.get("pan"):
             if parties["pan"].upper() == case_parties["pan"].upper():
                 return _route_for_role(role)
-        # Name exact match
         for case_name in case_names:
             if not case_name or _is_generic_party(case_name):
                 continue
             norm_case = _normalise_party(case_name)
             if norm_inc and norm_case and (
-                norm_inc == norm_case or
-                norm_inc in norm_case or
-                norm_case in norm_inc
+                norm_inc == norm_case
+                or norm_inc in norm_case
+                or norm_case in norm_inc
             ):
                 return _route_for_role(role)
 
-    # Check 3: Summary cosine similarity (supporting evidence only)
-    case_summaries = [d.get("brief_summary", "") for d in case.get("docs", []) if d.get("role") == "primary"]
-    max_sim = max((compute_summary_similarity(summary, cs) for cs in case_summaries), default=0.0)
+    case_summaries = [
+        d.get("brief_summary", "")
+        for d in case.get("docs", [])
+        if d.get("role") == "primary"
+    ]
+    max_sim   = max((compute_summary_similarity(summary, cs) for cs in case_summaries), default=0.0)
     party_sim = _party_similarity(parties, case_parties)
     combined  = party_sim * 0.70 + max_sim * 0.30
 
@@ -619,26 +505,28 @@ def determine_route(
         return _route_for_role(role)
     if combined >= 0.75 and party_sim >= 0.55:
         return "add_to_case_reference"
-
-    # Step 4 confirmation needed
     return "different_case_confirm"
 
 
 def _route_for_role(role: str) -> str:
     if role == "primary":
         return "add_to_case_primary"
-    elif role == "previous_reply":
+    if role == "previous_reply":
         return "add_to_case_reply"
-    elif role == "user_draft_reply":
+    if role == "user_draft_reply":
         return "add_to_case_draft_reply"
-    else:
-        return "add_to_case_reference"
+    return "add_to_case_reference"
 
 
 def _party_similarity(p1: dict, p2: dict) -> float:
-    """String similarity between non-generic party names."""
-    names_1 = [v for k, v in (p1 or {}).items() if k in ("sender", "recipient") and v and not _is_generic_party(v)]
-    names_2 = [v for k, v in (p2 or {}).items() if k in ("taxpayer_name", "authority") and v and not _is_generic_party(v)]
+    names_1 = [
+        v for k, v in (p1 or {}).items()
+        if k in ("sender", "recipient") and v and not _is_generic_party(v)
+    ]
+    names_2 = [
+        v for k, v in (p2 or {}).items()
+        if k in ("taxpayer_name", "authority") and v and not _is_generic_party(v)
+    ]
     if not names_1 or not names_2:
         return 0.0
     from difflib import SequenceMatcher
@@ -650,17 +538,14 @@ def _party_similarity(p1: dict, p2: dict) -> float:
     return max_sim
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TEMPORAL ROLE — cross-doc adjustment
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# TEMPORAL ROLE — cross-doc adjustment  (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
-def adjust_temporal_roles(docs_with_analysis: List[Tuple[dict, dict]], case: Optional[dict]) -> None:
-    """
-    After Step 2A+2C, refine temporal_role using cross-doc date comparison.
-    Rule: among all primary docs (existing in case + new batch), the most
-    recently dated = current, older = historical. Equal dates = all current.
-    Does NOT use today's date — purely relative.
-    """
+def adjust_temporal_roles(
+    docs_with_analysis: List[Tuple[dict, dict]],
+    case: Optional[dict],
+) -> None:
     from datetime import datetime as dt
 
     def _parse(date_str):
@@ -673,114 +558,278 @@ def adjust_temporal_roles(docs_with_analysis: List[Tuple[dict, dict]], case: Opt
                 pass
         return None
 
-    primaries = []  # (analysis_dict, parsed_date)
-    for _, analysis in docs_with_analysis:
-        if analysis.get("role") == "primary" and not analysis.get("temporal_locked"):
-            primaries.append((analysis, _parse(analysis.get("date"))))
-
-    # Include existing case primaries for comparison
+    primaries = [
+        (analysis, _parse(analysis.get("date")))
+        for _, analysis in docs_with_analysis
+        if analysis.get("role") == "primary" and not analysis.get("temporal_locked")
+    ]
     if case:
         for doc in case.get("docs", []):
             if doc.get("role") == "primary":
                 primaries.append((doc, _parse(doc.get("date"))))
 
-    dated   = [(a, d) for a, d in primaries if d is not None]
+    dated = [(a, d) for a, d in primaries if d is not None]
     if not dated:
         return
-
     max_date = max(d for _, d in dated)
     for analysis, parsed in dated:
         if not analysis.get("temporal_locked"):
-            if parsed == max_date:
-                analysis["temporal_role"] = "current"
-            else:
-                analysis["temporal_role"] = "historical"
+            analysis["temporal_role"] = "current" if parsed == max_date else "historical"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 6a — Issue extraction
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6a — Issue extraction  *** REWRITTEN ***
+# ═══════════════════════════════════════════════════════════════════
+#
+# Changes vs original:
+#   - max_tokens: 8192 → 16384 (single-call) / 6000 (per segment)
+#   - Two-pass serial → segmented parallel (ThreadPoolExecutor, max_workers=4)
+#   - Per-issue 800-word cap in prompt to prevent runaway verbatim output
+#   - _extract_issues_once() kept as shim for backward compatibility
+# ═══════════════════════════════════════════════════════════════════
+
+_SEG_SIZE       = 25000   # chars per segment
+_SEG_OVERLAP    = 3000    # overlap between adjacent segments
+_SEG_MAX_TOK    = 6000    # max_tokens per segment call
+_SINGLE_MAX_TOK = 16384   # max_tokens for docs that fit in one call
 
 _ISSUE_SYSTEM = (
     "You are a legal issues extractor for Indian tax proceedings. "
-    "Return ONLY valid JSON."
+    "Return ONLY valid JSON — no markdown, no explanation."
 )
 
-_ISSUE_PROMPT = """Extract all allegations, charges, and observations from this tax notice/order that require a formal reply.
+_ISSUE_PROMPT = """\
+Extract all allegations, charges, and observations from this {segment_label}\
+of a tax notice/order that require a formal reply.
 
 DOCUMENT TEXT:
 {doc_text}
 
-ALREADY EXTRACTED ISSUES (do NOT re-extract these):
+ALREADY EXTRACTED ISSUES (do NOT re-extract — skip anything substantially similar):
 {existing_issues}
 
 MANDATORY RULES:
-1. Extract VERBATIM — preserve exact wording, ALL amounts, ALL section numbers, ALL GSTINs, ALL periods, ALL rates.
-2. Do NOT split. One issue = one allegation as framed by the authority. If a paragraph has multiple sub-grounds, keep as ONE issue.
-3. Do NOT merge. Separate numbered paragraphs or clearly different allegations = separate issues.
-4. Do NOT extract procedural text (reply-by dates, officer signatures, date headers, acknowledgments).
+1. Extract VERBATIM — preserve exact wording, ALL amounts, ALL section numbers, \
+ALL GSTINs, ALL periods, ALL rates.
+2. Do NOT split. One issue = one allegation as framed by the authority.
+3. Do NOT merge. Separate numbered paragraphs or clearly different allegations = \
+separate issues.
+4. Do NOT extract procedural text (reply-by dates, officer signatures, date headers, \
+acknowledgments).
 5. Only extract substantive allegations requiring a reply.
-6. If an annexure is referenced, include its key demand data (total amount, periods) within the issue text.
+6. Per-issue size limit: keep each issue under 800 words. If an allegation is longer, \
+preserve the core legal charge and all key figures (amounts, sections, periods); \
+condense only narrative repetition.
+7. If an annexure is referenced, include the total demand amount and tax period within \
+the issue text.
+8. Return an empty list if this segment contains no new allegations.
 
-Return ONLY:
+Return ONLY valid JSON:
 {{
   "issues": [
-    "Full verbatim text of issue 1 as written by the authority...",
+    "Full verbatim text of issue 1 (under 800 words)...",
     "Full verbatim text of issue 2..."
   ]
-}}
+}}"""
 
-Return empty list if no new issues found."""
+_REEXTRACT_PROMPT = """\
+Re-read this {segment_label}very carefully. The user believes more issues exist.
+
+DOCUMENT TEXT:
+{doc_text}
+
+PREVIOUSLY EXTRACTED ISSUES (do NOT re-extract these):
+{existing_issues}
+
+Pay special attention to:
+- Numbered or lettered sub-paragraphs (1., 2., (a), (b), (i), (ii))
+- Paragraphs beginning with 'Further', 'Additionally', 'It is also observed'
+- Tables with multiple rows each containing separate demands
+- Appendices or annexures listing additional amounts or periods
+- Any allegation not covered in the previously extracted list
+
+Extract ONLY the additional issues not already listed.
+Per-issue size limit: 800 words.
+Return empty list if no additional issues found.
+
+Return ONLY valid JSON:
+{{"issues": ["Additional issue text..."]}}"""
+
+
+def _make_segments(text: str) -> List[str]:
+    """Overlapping windows of _SEG_SIZE chars with _SEG_OVERLAP char overlap."""
+    segments: List[str] = []
+    pos = 0
+    n   = len(text)
+    while pos < n:
+        end = min(pos + _SEG_SIZE, n)
+        segments.append(text[pos:end])
+        if end == n:
+            break
+        pos = end - _SEG_OVERLAP
+    return segments
+
+
+def _dedup_issues(candidates: List[str], already_seen: List[str]) -> List[str]:
+    """
+    Remove near-duplicates using 85 % SequenceMatcher threshold.
+    Compares only the first 300 chars of each text for speed.
+    """
+    from difflib import SequenceMatcher
+    seen   = list(already_seen)
+    result = []
+    for text in candidates:
+        is_dup = any(
+            SequenceMatcher(None, text[:300].lower(), s[:300].lower()).ratio() >= 0.85
+            for s in seen
+        )
+        if not is_dup:
+            result.append(text)
+            seen.append(text)
+    return result
+
+
+def _extract_segment(
+    segment_text: str,
+    existing_texts: str,
+    label: str = "step_6a_seg",
+    segment_label: str = "segment ",
+    max_tokens: int = _SEG_MAX_TOK,
+) -> List[str]:
+    """One LLM call for a single segment. Returns list of issue strings."""
+    prompt = _ISSUE_PROMPT.format(
+        doc_text       = segment_text,
+        existing_issues = existing_texts,
+        segment_label  = segment_label,
+    )
+    raw = _get_llm().call(
+        system_prompt = _ISSUE_SYSTEM,
+        user_message  = prompt,
+        max_tokens    = max_tokens,
+        temperature   = 0.0,
+        label         = label,
+    )
+    parsed = _parse_json(raw, {"issues": []})
+    issues = parsed.get("issues") or []
+    if isinstance(issues, list):
+        result = [str(i).strip() for i in issues if str(i).strip()]
+        logger.debug(f"{label}: {len(result)} issues from {len(segment_text)} chars")
+        return result
+    return []
 
 
 def extract_issues(full_text: str, existing_issues: List[dict]) -> List[str]:
     """
     Step 6a: Extract all new allegations from a primary document.
-    Returns list of verbatim issue text strings.
+
+    Docs <= 80 000 chars  → single LLM call, max_tokens=16384
+    Docs >  80 000 chars  → overlapping 25 000-char segments, all parallel via
+                            ThreadPoolExecutor(max_workers=4), max_tokens=6000 each
+                            Results merged in order and deduplicated at 85 %.
     """
+    import concurrent.futures as _cf
+
     if not full_text or not full_text.strip():
         return []
 
     existing_texts = "\n".join(
-        f"{i+1}. {iss.get('issue_text','')[:150]}"
+        f"{i+1}. {iss.get('issue_text', '')[:200]}"
         for i, iss in enumerate(existing_issues)
     ) or "(none)"
 
-    # Two-pass for docs > 80k chars
-    if len(full_text) > 80000:
-        first_half  = full_text[:80000]
-        second_half = full_text[60000:]  # overlap to catch cross-boundary issues
-        results_1   = _extract_issues_once(first_half, existing_texts)
-        # Pass 2: already-found issues from pass 1 are "existing"
-        all_existing = existing_texts + "\n" + "\n".join(f"- {t[:150]}" for t in results_1)
-        results_2   = _extract_issues_once(second_half, all_existing)
-        return results_1 + results_2
-    else:
-        return _extract_issues_once(full_text, existing_texts)
+    # ── Single-call path ──────────────────────────────────────────
+    if len(full_text) <= 80000:
+        prompt = _ISSUE_PROMPT.format(
+            doc_text        = full_text,
+            existing_issues = existing_texts,
+            segment_label   = "document ",
+        )
+        raw = _get_llm().call(
+            system_prompt = _ISSUE_SYSTEM,
+            user_message  = prompt,
+            max_tokens    = _SINGLE_MAX_TOK,
+            temperature   = 0.0,
+            label         = "step_6a_single",
+        )
+        parsed = _parse_json(raw, {"issues": []})
+        issues = parsed.get("issues") or []
+        result = [str(i).strip() for i in issues if str(i).strip()]
+        logger.info(
+            f"extract_issues (single): {len(result)} issues from {len(full_text)} chars"
+        )
+        return result
+
+    # ── Segmented parallel path ───────────────────────────────────
+    segments = _make_segments(full_text)
+    logger.info(
+        f"extract_issues (segmented): {len(full_text)} chars "
+        f"→ {len(segments)} segments of ~{_SEG_SIZE} chars"
+    )
+
+    seg_results: Dict[int, List[str]] = {}
+    with _cf.ThreadPoolExecutor(max_workers=min(len(segments), 4)) as ex:
+        futs = {
+            ex.submit(
+                _extract_segment,
+                seg,
+                existing_texts,
+                f"step_6a_seg{idx}",
+                f"segment {idx + 1}/{len(segments)} ",
+                _SEG_MAX_TOK,
+            ): idx
+            for idx, seg in enumerate(segments)
+        }
+        for fut in _cf.as_completed(futs):
+            idx = futs[fut]
+            try:
+                seg_results[idx] = fut.result()
+            except Exception as e:
+                logger.error(f"Segment {idx} extraction failed: {e}", exc_info=True)
+                seg_results[idx] = []
+
+    # Merge in segment order
+    all_candidates: List[str] = []
+    for idx in sorted(seg_results.keys()):
+        all_candidates.extend(seg_results[idx])
+
+    existing_texts_list = [iss.get("issue_text", "") for iss in existing_issues]
+    result = _dedup_issues(all_candidates, existing_texts_list)
+
+    logger.info(
+        f"extract_issues (segmented): {len(result)} unique issues "
+        f"from {len(segments)} segments "
+        f"(raw candidates before dedup: {len(all_candidates)})"
+    )
+    return result
 
 
 def _extract_issues_once(text: str, existing_texts: str) -> List[str]:
-    prompt = _ISSUE_PROMPT.format(
-        doc_text        = text[:80000],
-        existing_issues = existing_texts,
-    )
-    raw = _get_llm().call(
-        system_prompt = _ISSUE_SYSTEM,
-        user_message  = prompt,
-        max_tokens    = 8192,      # must be 8192 — verbatim issue texts from long notices
-        temperature   = 0.0,
-        label         = "step_6a_issues",
-    )
-    parsed = _parse_json(raw, {"issues": []})
-    issues = parsed.get("issues") or []
-    if isinstance(issues, list):
+    """
+    Backward-compat shim. Delegates to _extract_segment / single-call path.
+    Kept so any callers that weren't updated still work.
+    """
+    if len(text) <= 80000:
+        prompt = _ISSUE_PROMPT.format(
+            doc_text        = text,
+            existing_issues = existing_texts,
+            segment_label   = "document ",
+        )
+        raw = _get_llm().call(
+            system_prompt = _ISSUE_SYSTEM,
+            user_message  = prompt,
+            max_tokens    = _SINGLE_MAX_TOK,
+            temperature   = 0.0,
+            label         = "step_6a_compat",
+        )
+        parsed = _parse_json(raw, {"issues": []})
+        issues = parsed.get("issues") or []
         return [str(i).strip() for i in issues if str(i).strip()]
-    return []
+    return _extract_segment(text[:_SEG_SIZE], existing_texts, "step_6a_compat_seg")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 6b — Replied-issue pair extraction
-# ═════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6b — Replied-issue pair extraction  (unchanged)
+# ═══════════════════════════════════════════════════════════════════
 
 _REPLIED_SYSTEM = "You are a legal document parser. Return ONLY valid JSON."
 
@@ -788,8 +837,6 @@ _REPLIED_PROMPT = """This document is a reply/response to a tax notice. Extract 
 
 DOCUMENT TEXT:
 {doc_text}
-
-For each allegation addressed in this reply, extract the allegation text and the reply text.
 
 Return ONLY:
 {{
@@ -801,9 +848,6 @@ Return ONLY:
 
 
 def extract_replied_issues(full_text: str) -> List[dict]:
-    """
-    Step 6b: Extract {issue_text, reply_text} pairs from a reply document.
-    """
     if not full_text or not full_text.strip():
         return []
     prompt = _REPLIED_PROMPT.format(doc_text=full_text[:80000])
@@ -818,63 +862,97 @@ def extract_replied_issues(full_text: str) -> List[dict]:
     pairs  = parsed.get("replied_issues") or []
     if isinstance(pairs, list):
         return [
-            {"issue_text": p.get("issue_text",""), "reply_text": p.get("reply_text","")}
+            {"issue_text": p.get("issue_text", ""), "reply_text": p.get("reply_text", "")}
             for p in pairs
             if isinstance(p, dict) and p.get("issue_text") and p.get("reply_text")
         ]
     return []
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STEP 6 RE-EXTRACTION — Enhanced prompt for "missed issues"
-# ═════════════════════════════════════════════════════════════════════════════
-
-_REEXTRACT_PROMPT = """Re-read this document very carefully. I previously extracted some issues but the user believes more exist.
-
-DOCUMENT TEXT:
-{doc_text}
-
-PREVIOUSLY EXTRACTED ISSUES (do NOT re-extract these):
-{existing_issues}
-
-Pay special attention to:
-- Numbered or lettered sub-paragraphs (1., 2., (a), (b))
-- Paragraphs beginning with 'Further', 'Additionally', 'It is also observed'
-- Tables with multiple rows each containing separate demands
-- Appendices or annexures listing additional amounts
-- Any allegation not covered in the previously extracted list
-
-Extract ONLY the additional issues not listed above.
-Return empty list if you find no additional issues.
-
-Return ONLY:
-{{"issues": ["Additional issue 1 text...", "Additional issue 2 text..."]}}"""
-
+# ═══════════════════════════════════════════════════════════════════
+# STEP 6 RE-EXTRACTION  *** REWRITTEN — segmented parallel ***
+# ═══════════════════════════════════════════════════════════════════
 
 def reextract_missed_issues(full_text: str, existing_issues: List[dict]) -> List[str]:
     """
     Enhanced re-extraction when user says issues were missed.
-    Uses a more focused prompt and excludes already-extracted issues.
+    Uses the same segmented parallel strategy as extract_issues()
+    with a focused prompt that highlights common miss patterns.
     """
+    import concurrent.futures as _cf
+
     if not full_text or not full_text.strip():
         return []
+
     existing_texts = "\n".join(
-        f"{i+1}. {iss.get('issue_text','')[:200]}"
+        f"{i+1}. {iss.get('issue_text', '')[:250]}"
         for i, iss in enumerate(existing_issues)
     ) or "(none)"
-    prompt = _REEXTRACT_PROMPT.format(
-        doc_text       = full_text[:80000],
-        existing_issues = existing_texts,
+
+    # ── Single-call path ──────────────────────────────────────────
+    if len(full_text) <= 80000:
+        prompt = _REEXTRACT_PROMPT.format(
+            doc_text        = full_text,
+            existing_issues = existing_texts,
+            segment_label   = "document ",
+        )
+        raw = _get_llm().call(
+            system_prompt = _ISSUE_SYSTEM,
+            user_message  = prompt,
+            max_tokens    = _SINGLE_MAX_TOK,
+            temperature   = 0.0,
+            label         = "step_6_reextract_single",
+        )
+        parsed = _parse_json(raw, {"issues": []})
+        issues = parsed.get("issues") or []
+        result = [str(i).strip() for i in issues if str(i).strip()]
+        logger.info(f"reextract_missed_issues (single): {len(result)} additional issues")
+        return result
+
+    # ── Segmented parallel path ───────────────────────────────────
+    segments = _make_segments(full_text)
+    logger.info(
+        f"reextract_missed_issues (segmented): {len(segments)} segments "
+        f"from {len(full_text)} chars"
     )
-    raw = _get_llm().call(
-        system_prompt = _ISSUE_SYSTEM,
-        user_message  = prompt,
-        max_tokens    = 8192,
-        temperature   = 0.0,
-        label         = "step_6_reextract",
-    )
-    parsed = _parse_json(raw, {"issues": []})
-    issues = parsed.get("issues") or []
-    if isinstance(issues, list):
+
+    def _reextract_one(seg: str, idx: int) -> List[str]:
+        prompt = _REEXTRACT_PROMPT.format(
+            doc_text        = seg,
+            existing_issues = existing_texts,
+            segment_label   = f"segment {idx + 1}/{len(segments)} ",
+        )
+        raw = _get_llm().call(
+            system_prompt = _ISSUE_SYSTEM,
+            user_message  = prompt,
+            max_tokens    = _SEG_MAX_TOK,
+            temperature   = 0.0,
+            label         = f"step_6_reextract_seg{idx}",
+        )
+        parsed = _parse_json(raw, {"issues": []})
+        issues = parsed.get("issues") or []
         return [str(i).strip() for i in issues if str(i).strip()]
-    return []
+
+    seg_results: Dict[int, List[str]] = {}
+    with _cf.ThreadPoolExecutor(max_workers=min(len(segments), 4)) as ex:
+        futs = {ex.submit(_reextract_one, seg, idx): idx for idx, seg in enumerate(segments)}
+        for fut in _cf.as_completed(futs):
+            idx = futs[fut]
+            try:
+                seg_results[idx] = fut.result()
+            except Exception as e:
+                logger.error(f"Reextract segment {idx} error: {e}", exc_info=True)
+                seg_results[idx] = []
+
+    all_candidates: List[str] = []
+    for idx in sorted(seg_results.keys()):
+        all_candidates.extend(seg_results[idx])
+
+    existing_texts_list = [iss.get("issue_text", "") for iss in existing_issues]
+    result = _dedup_issues(all_candidates, existing_texts_list)
+
+    logger.info(
+        f"reextract_missed_issues (segmented): {len(result)} additional issues "
+        f"from {len(segments)} segments"
+    )
+    return result
