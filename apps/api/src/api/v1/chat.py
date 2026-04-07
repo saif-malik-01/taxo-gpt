@@ -193,7 +193,7 @@ async def ask_gst_stream_simple(
 async def ask_gst_stream_draft(
     background_tasks: BackgroundTasks,
     question:    str              = Form(""),
-    session_id:  str              = Form(...),
+    session_id:  Optional[str]     = Form(None),
     files:       List[UploadFile] = File([]),
     user                          = Depends(auth_guard)
 ):
@@ -397,9 +397,6 @@ async def get_document_view_url(
     """
     user_id = user.get("id")
     
-    # ── Security Check ───────────────────────────────────────────────────────────
-    # Bucket path is docs/{user_id}/{session_id}/{filename}
-    # We must ensure the s3_key matches this user's ID
     if f"docs/{user_id}/" not in s3_key:
         raise HTTPException(status_code=403, detail="Unauthorized access to document")
     

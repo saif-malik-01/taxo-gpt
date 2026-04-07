@@ -5,6 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from apps.api.src.core.config import settings
@@ -32,7 +33,8 @@ app = FastAPI(
 )
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request: Request, exc: Exception):
     """
     Safely handle validation errors that might contain binary data (bytes) 
     that cause UnicodeDecodeErrors in the default FastAPI encoder.
@@ -40,19 +42,31 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     def _scrub(item):
         if isinstance(item, bytes):
             try:
+                # Try to decode, or return placeholder if it's true binary
                 return item.decode("utf-8")
             except:
-                return "<binary data>"
+                return f"<binary data: {len(item)} bytes>"
         if isinstance(item, list):
             return [_scrub(x) for x in item]
         if isinstance(item, dict):
             return {k: _scrub(v) for k, v in item.items()}
+        if isinstance(item, tuple):
+            return tuple(_scrub(x) for x in item)
         return item
 
-    # exc.errors() returns a list of dictionaries with error details.
-    # We scrub these to remove raw bytes.
-    safe_errors = jsonable_encoder(_scrub(exc.errors()))
-    return JSONResponse(status_code=422, content={"detail": safe_errors})
+    # Get errors list from either RequestValidationError or pydantic.ValidationError
+    errors = getattr(exc, "errors", lambda: [])()
+    if callable(errors):
+        errors = errors()
+        
+    logger.error(f"Validation error occurred: {type(exc).__name__}")
+    
+    # We scrub these to remove raw bytes before encoding
+    safe_errors = jsonable_encoder(_scrub(errors))
+    return JSONResponse(
+        status_code=422, 
+        content={"detail": safe_errors, "error_type": "validation_error"}
+    )
 
 # Logging Setup
 os.makedirs(os.path.dirname(settings.LOG_FILE), exist_ok=True)
