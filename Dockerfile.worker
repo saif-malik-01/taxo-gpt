@@ -1,5 +1,5 @@
 # --- Stage 1: Base System with Legal Dependencies (Poppler) ---
-FROM python:3.11-slim-bullseye as base
+FROM python:3.11-slim-bullseye AS base
 
 # 1. Install Poppler-utils (CRITICAL for File -> Image conversion)
 RUN apt-get update && apt-get install -y \
@@ -10,8 +10,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Set environment & workdir
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # 3. Install Python dependencies

@@ -34,7 +34,7 @@ def _get_llm():
     if _llm is None:
         with _llm_lock:
             if _llm is None:
-                from apps.api.src.services.rag.retrieval.bedrock_llm import BedrockLLMClient
+                from apps.api.src.services.llm.bedrock import BedrockLLMClient
                 _llm = BedrockLLMClient()
     return _llm
 
@@ -271,7 +271,7 @@ def _get_entity_extractors():
 
 def extract_legal_entities(full_text: str) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-    from apps.api.src.services.rag.retrieval.models import Stage2AResult, Stage2BResult
+    from apps.api.src.services.rag.models import Stage2AResult, Stage2BResult
 
     empty = {
         "sections": [], "rules": [], "notifications": [], "circulars": [],
@@ -345,7 +345,7 @@ def extract_legal_entities(full_text: str) -> dict:
 
 def entities_to_stage2b_result(raw_entities: dict):
     try:
-        from apps.api.src.services.rag.retrieval.models import Stage2BResult, Stage2AResult
+        from apps.api.src.services.rag.models import Stage2BResult, Stage2AResult
         from apps.api.src.services.rag.retrieval.extractor import build_bm25_keyword_document
 
         stage2b = Stage2BResult(

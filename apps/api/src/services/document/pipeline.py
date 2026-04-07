@@ -87,7 +87,7 @@ from apps.api.src.services.document.session_doc_store import (
     save_document_text,
 )
 from apps.api.src.services.memory import add_message, check_credits, get_session_history, track_usage
-from apps.api.src.services.models import User
+from apps.api.src.db.models.base import User
 
 logger = logging.getLogger(__name__)
 
@@ -543,7 +543,7 @@ async def _handle_update_issues(active_case: dict, question: str, session_id: st
     yield _retrieval_event(session_id, getattr(asst, "id", None))
 
 async def _handle_query_fallback(question: str, session_id: str, user_id: int, history: list, background_tasks: BackgroundTasks, active_case: Optional[dict] = None, snapshot: Optional[dict] = None) -> AsyncGenerator[str, None]:
-    from apps.api.src.services.rag.retrieval.models import SessionMessage
+    from apps.api.src.services.rag.models import SessionMessage
     from apps.api.src.services.document.issue_replier import _get_pipeline
     pipeline = _get_pipeline()
     if not pipeline:

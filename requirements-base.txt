@@ -1,4 +1,8 @@
 # --- Shared Legal Core ---
+fastapi
+pydantic
+python-jose[cryptography]
+python-multipart
 boto3
 python-dotenv
 sqlalchemy
