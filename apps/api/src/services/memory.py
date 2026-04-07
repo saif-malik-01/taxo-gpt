@@ -60,6 +60,9 @@ async def get_session_history(session_id: str, limit: int = 50):
                 sources = await hydrate_sources(m.source_ids, pipeline._qdrant)
                 msg_dict["sources"] = sources
             
+            if m.attachments:
+                msg_dict["attachments"] = m.attachments
+            
             history.append(msg_dict)
 
         if history:
