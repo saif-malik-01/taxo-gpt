@@ -253,7 +253,7 @@ async def ask_gst_stream_draft(
 
             # --- Step 1: Handling Worker Completion (Phase 2 Wait Loop) ---
             if has_files:
-                yield _event_msg("Analyzing your documents in the cloud...")
+                yield _event_msg("Analyzing your documents")
                 
                 # 10 minute safety cap for large/scanned documents
                 max_wait_s = 600 
@@ -280,7 +280,7 @@ async def ask_gst_stream_draft(
                 # Update local snap ref for Step 2
                 active_case = get_active_case(snapshot)
                 logger.info(f"Worker complete for session {session_id}. Active case ID: {snapshot.get('active_case_id')}, Docs: {len(active_case.get('docs', []) if active_case else [])}, Issues: {len(active_case.get('issues', []) if active_case else [])}")
-                yield _event_msg("Extraction complete. Proceeding with drafting...")
+                yield _event_msg("Drafting")
 
             # --- Step 2: Determine & Execute Intent ---
             if not active_case:

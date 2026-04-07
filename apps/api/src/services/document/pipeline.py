@@ -528,6 +528,11 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
             yield _content(reply[i:i+100])
         full += reply
         all_src.extend(src)
+        # Update the actual issue state in the context
+        if 0 <= i_num - 1 < len(issues_to_draft):
+            target_issue = issues_to_draft[i_num-1]
+            target_issue["reply"] = reply
+            target_issue["status"] = "replied"
     full += _build_assumptions_note(active_case, mode)
     active_case["state"] = "complete"
     push_qa_pair(snapshot, question, full[:1200])
@@ -543,7 +548,7 @@ async def _handle_update_issues(active_case: dict, question: str, session_id: st
     msg = "\n\nIssues updated successfully."
     yield _content(msg)
     asst = await add_message(session_id, "assistant", _build_summary_and_issues_header(active_case) + msg, user_id)
-    yield _retrieval_event()
+    yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
     yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
 async def _handle_query_fallback(question: str, session_id: str, user_id: int, history: list, background_tasks: BackgroundTasks, active_case: Optional[dict] = None, snapshot: Optional[dict] = None) -> AsyncGenerator[str, None]:
