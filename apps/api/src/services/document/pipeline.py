@@ -508,7 +508,7 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
     mode = active_case.get("mode", MODE_DEFENSIVE)
     async for chunk in _stream_header(active_case):
         yield chunk
-    if not skip_confirmation and active_case.get("state") != "issue_confirmation_sent":
+    if not skip_confirmation and active_case.get("state") not in ("issue_confirmation_sent", "awaiting_issue_confirmation"):
         msg = f"I'll draft {len(issues_to_draft)} issue(s). Say **'go ahead'** to start."
         yield _content(msg)
         active_case["state"] = "awaiting_issue_confirmation"
