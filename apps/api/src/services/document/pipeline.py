@@ -502,6 +502,7 @@ async def _handle_show_summary(active_case: dict, session_id: str, user_id: int)
     active_case["state"] = "awaiting_decision"
     asst = await add_message(session_id, "assistant", full, user_id)
     yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
+    yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
 async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], session_id: str, user_id: int, question: str, background_tasks: BackgroundTasks, snapshot: dict, skip_confirmation: bool = False) -> AsyncGenerator[str, None]:
     mode = active_case.get("mode", MODE_DEFENSIVE)
@@ -532,6 +533,7 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
     push_qa_pair(snapshot, question, full[:1200])
     asst = await add_message(session_id, "assistant", full, user_id)
     yield _retrieval_event(sources=all_src, document_analysis=snapshot_for_display(active_case))
+    yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
 async def _handle_update_issues(active_case: dict, question: str, session_id: str, user_id: int) -> AsyncGenerator[str, None]:
     update = await run_in_threadpool(parse_issue_update, question, active_case.get("issues", []))
@@ -542,6 +544,7 @@ async def _handle_update_issues(active_case: dict, question: str, session_id: st
     yield _content(msg)
     asst = await add_message(session_id, "assistant", _build_summary_and_issues_header(active_case) + msg, user_id)
     yield _retrieval_event()
+    yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
 async def _handle_query_fallback(question: str, session_id: str, user_id: int, history: list, background_tasks: BackgroundTasks, active_case: Optional[dict] = None, snapshot: Optional[dict] = None) -> AsyncGenerator[str, None]:
     from apps.api.src.services.rag.models import SessionMessage
@@ -560,8 +563,9 @@ async def _handle_query_fallback(question: str, session_id: str, user_id: int, h
         async for chunk in pipeline.query_stage_6_stream(*staged):
             if chunk.startswith("\n\n__META__"):
                 m = "".join(answer_parts)
-                await add_message(session_id, "assistant", m, user_id)
-                yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
+                asst = await add_message(session_id, "assistant", m, user_id)
+                yield _retrieval_event(document_analysis=snapshot_for_display(active_case) if active_case else None)
+                yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
             else:
                 answer_parts.append(chunk)
                 yield _content(chunk)

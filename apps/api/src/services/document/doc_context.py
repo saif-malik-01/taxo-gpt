@@ -662,8 +662,10 @@ def build_classification_summary(case: dict) -> str:
     return "\n".join(lines)
 
 
-def snapshot_for_display(case: dict) -> dict:
+def snapshot_for_display(case: Optional[dict]) -> dict:
     """Minimal dict for document_analysis field in retrieval event."""
+    if not case:
+        return {}
     return {
         "summary": case.get("summary"),
         "issues": [
@@ -681,6 +683,7 @@ def snapshot_for_display(case: dict) -> dict:
                 "temporal_role":    d.get("temporal_role"),
                 "date":             d.get("date"),
                 "reference_number": d.get("reference_number"),
+                "brief_summary":    d.get("brief_summary", ""),
             }
             for d in case.get("docs", [])
         ],
