@@ -31,6 +31,7 @@ from apps.api.src.services.document.pipeline import (
     _handle_update_issues,
     _handle_query_fallback,
     _content,
+    _event_msg,
     _retrieval_event
 )
 from apps.api.src.services.document.doc_classifier import determine_route
@@ -252,7 +253,7 @@ async def ask_gst_stream_draft(
 
             # --- Step 1: Handling Worker Completion (Phase 2 Wait Loop) ---
             if has_files:
-                yield _retrieval_event(session_id, None, "Analyzing your documents in the cloud...")
+                yield _event_msg("Analyzing your documents in the cloud...")
                 
                 # Wait for Distributed Worker to finish Poppler/OCR conversion
                 max_wait_s = 300 # 5 minute safety cap
@@ -275,7 +276,8 @@ async def ask_gst_stream_draft(
                 
                 # Update local snap ref for Step 2
                 active_case = get_active_case(snapshot)
-                yield _retrieval_event(session_id, None, "Extraction complete. Proceeding with drafting...")
+                logger.info(f"Worker complete for session {session_id}. Active case ID: {snapshot.get('active_case_id')}, Docs: {len(active_case.get('docs', []) if active_case else [])}, Issues: {len(active_case.get('issues', []) if active_case else [])}")
+                yield _event_msg("Extraction complete. Proceeding with drafting...")
 
             # --- Step 2: Determine & Execute Intent ---
             if not active_case:
@@ -286,6 +288,7 @@ async def ask_gst_stream_draft(
             intent_res = await run_in_threadpool(classify_intent_no_docs, res_q, snapshot)
             intent = intent_res.get("intent", "summarize")
             mode = intent_res.get("mode")
+            logger.info(f"Intent classified: {intent} for session {session_id}")
 
             if intent == "summarize" or has_files:
                 async for chunk in _handle_show_summary(active_case, session_id, user_id):

@@ -108,15 +108,16 @@ def _emit(data: dict) -> str:
 def _content(text: str) -> str:
     return _emit({"type": "content", "delta": text})
 
-def _retrieval_event(session_id: str, message_id=None, sources=None, document_analysis=None) -> str:
-    return _emit({
-        "type": "retrieval",
-        "sources": sources or [],
-        "message_id": message_id,
-        "session_id": session_id,
-        "id": message_id,
-        "document_analysis": document_analysis,
-    })
+def _event_msg(message: str) -> str:
+    return _emit({"type": "event", "message": message})
+
+def _retrieval_event(document_analysis=None, sources=None) -> str:
+    data = {"type": "retrieval"}
+    if document_analysis is not None:
+        data["document_analysis"] = document_analysis
+    if sources is not None:
+        data["sources"] = sources
+    return _emit(data)
 
 def _should_update_profile(q: str) -> bool:
     return len(q.strip().split()) >= _MIN_WORDS_FOR_PROFILE
@@ -500,7 +501,7 @@ async def _handle_show_summary(active_case: dict, session_id: str, user_id: int)
     full = _build_summary_and_issues_header(active_case) + body
     active_case["state"] = "awaiting_decision"
     asst = await add_message(session_id, "assistant", full, user_id)
-    yield _retrieval_event(session_id, getattr(asst, "id", None), document_analysis=snapshot_for_display(active_case))
+    yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
 
 async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], session_id: str, user_id: int, question: str, background_tasks: BackgroundTasks, snapshot: dict, skip_confirmation: bool = False) -> AsyncGenerator[str, None]:
     mode = active_case.get("mode", MODE_DEFENSIVE)
@@ -512,7 +513,7 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
         active_case["state"] = "awaiting_issue_confirmation"
         active_case["_pending_draft_ids"] = [i.get("id") for i in issues_to_draft]
         asst = await add_message(session_id, "assistant", _build_summary_and_issues_header(active_case) + msg, user_id)
-        yield _retrieval_event(session_id, getattr(asst, "id", None), document_analysis=snapshot_for_display(active_case))
+        yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
         return
     hdr = f"## Drafting {len(issues_to_draft)} Issues...\n\n"
     yield _content(hdr)
@@ -530,7 +531,7 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
     active_case["state"] = "complete"
     push_qa_pair(snapshot, question, full[:1200])
     asst = await add_message(session_id, "assistant", full, user_id)
-    yield _retrieval_event(session_id, getattr(asst, "id", None), sources=all_src, document_analysis=snapshot_for_display(active_case))
+    yield _retrieval_event(sources=all_src, document_analysis=snapshot_for_display(active_case))
 
 async def _handle_update_issues(active_case: dict, question: str, session_id: str, user_id: int) -> AsyncGenerator[str, None]:
     update = await run_in_threadpool(parse_issue_update, question, active_case.get("issues", []))
@@ -540,7 +541,7 @@ async def _handle_update_issues(active_case: dict, question: str, session_id: st
     msg = "\n\nIssues updated successfully."
     yield _content(msg)
     asst = await add_message(session_id, "assistant", _build_summary_and_issues_header(active_case) + msg, user_id)
-    yield _retrieval_event(session_id, getattr(asst, "id", None))
+    yield _retrieval_event()
 
 async def _handle_query_fallback(question: str, session_id: str, user_id: int, history: list, background_tasks: BackgroundTasks, active_case: Optional[dict] = None, snapshot: Optional[dict] = None) -> AsyncGenerator[str, None]:
     from apps.api.src.services.rag.models import SessionMessage
@@ -560,7 +561,7 @@ async def _handle_query_fallback(question: str, session_id: str, user_id: int, h
             if chunk.startswith("\n\n__META__"):
                 m = "".join(answer_parts)
                 await add_message(session_id, "assistant", m, user_id)
-                yield _emit({"type":"retrieval", "session_id":session_id, "document_analysis":snapshot_for_display(active_case)})
+                yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
             else:
                 answer_parts.append(chunk)
                 yield _content(chunk)
