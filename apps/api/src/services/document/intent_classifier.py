@@ -111,7 +111,7 @@ def classify_intent_no_docs(question: str, snapshot: dict) -> dict:
     Intent classification for Type 3 requests (no files, active case exists).
     Uses only the last 3 QA pairs + issues list + current mode/state.
     """
-    from services.document.doc_context import get_active_case, get_user_context_text
+    from apps.api.src.services.document.doc_context import get_active_case, get_user_context_text
 
     fallback = {"intent": "query_general", "mode": None, "issue_numbers": [], "case_id": None}
     if not question or not question.strip():
@@ -255,7 +255,7 @@ def rewrite_query_if_needed(question: str, history: list, snapshot: dict) -> str
     )
 
     # Case context for resolution
-    from services.document.doc_context import get_active_case
+    from apps.api.src.services.document.doc_context import get_active_case
     active_case = get_active_case(snapshot)
     case_ctx = ""
     if active_case:

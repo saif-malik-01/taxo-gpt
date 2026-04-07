@@ -100,7 +100,7 @@ def _get_llm():
     if _llm is None:
         with _llm_lock:
             if _llm is None:
-                from retrieval.bedrock_llm import BedrockLLMClient
+                from apps.api.src.services.llm.bedrock import BedrockLLMClient
                 _llm = BedrockLLMClient()
     return _llm
 
