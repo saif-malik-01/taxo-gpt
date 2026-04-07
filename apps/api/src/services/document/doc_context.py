@@ -669,7 +669,7 @@ def snapshot_for_display(case: Optional[dict]) -> dict:
     return {
         "summary": case.get("summary"),
         "issues": [
-            {"id": i.get("id"), "issue_text": i.get("issue_text","")[:200],
+            {"id": i.get("id"), "issue_text": i.get("issue_text",""),
              "status": i.get("status"), "has_reply": bool(i.get("reply"))}
             for i in case.get("issues", [])
         ],

@@ -255,24 +255,27 @@ async def ask_gst_stream_draft(
             if has_files:
                 yield _event_msg("Analyzing your documents in the cloud...")
                 
-                # Wait for Distributed Worker to finish Poppler/OCR conversion
-                max_wait_s = 300 # 5 minute safety cap
+                # 10 minute safety cap for large/scanned documents
+                max_wait_s = 600 
                 start_t = time.time()
-                while True:
-                    await asyncio.sleep(1.5) # Poll Redis Context every 1.5s
-                    snapshot = await get_doc_context(session_id) or snapshot
-                    snap_ref[0] = snapshot
-                    active_case = get_active_case(snapshot)
-                    
-                    if not active_case:
-                        continue
+                try:
+                    while True:
+                        await asyncio.sleep(1.5) # Poll Redis Context every 1.5s
+                        snapshot = await get_doc_context(session_id) or snapshot
+                        snap_ref[0] = snapshot
+                        active_case = get_active_case(snapshot)
                         
-                    # If any new document is still "pending", wait
-                    if snapshot.get("worker_status") == "completed":
-                        break
-                        
-                    if time.time() - start_t > max_wait_s:
-                        raise TimeoutError("Document extraction task timed out on the worker pool.")
+                        # If any new document is still "pending", wait
+                        if snapshot.get("worker_status") == "completed":
+                            break
+                            
+                        if time.time() - start_t > max_wait_s:
+                            yield _event_msg("Analyzing documents is taking longer than expected. Please check back in a few moments or try again if the status doesn't change.")
+                            break 
+                except Exception as e:
+                    logger.error(f"Polling error for session {session_id}: {e}")
+                    yield _event_msg("An error occurred while tracking document analysis. Please try again.")
+                    return
                 
                 # Update local snap ref for Step 2
                 active_case = get_active_case(snapshot)
