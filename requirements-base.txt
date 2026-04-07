@@ -1,6 +1,4 @@
-fastapi
-uvicorn
-python-jose[cryptography]
+# --- Shared Legal Core ---
 boto3
 python-dotenv
 sqlalchemy
@@ -9,14 +7,10 @@ redis
 alembic
 pydantic-settings
 passlib[bcrypt]
-multipart
-pillow
-python-multipart
+bcrypt
+greenlet
 apscheduler
 google-auth
 requests
-razorpay
-fpdf2
-bcrypt
-greenlet
 qdrant-client
+fpdf2

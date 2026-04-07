@@ -1,0 +1,7 @@
+-r requirements-base.txt
+
+# --- OCR & Extraction Specific (High CPU/Memory) ---
+pdf2image
+python-docx
+Pillow
+docx

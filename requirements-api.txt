@@ -1,0 +1,9 @@
+-r requirements-base.txt
+
+# --- API Server Specific ---
+fastapi
+uvicorn
+python-jose[cryptography]
+python-multipart
+multipart
+razorpay
