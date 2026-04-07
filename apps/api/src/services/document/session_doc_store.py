@@ -17,6 +17,8 @@ from sqlalchemy import func as sa_func
 from apps.api.src.db.session import AsyncSessionLocal
 from apps.api.src.db.models.base import SessionDocumentText
 
+logger = logging.getLogger(__name__)
+
 
 # ─── Write ────────────────────────────────────────────────────────────────────
 
