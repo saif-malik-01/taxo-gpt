@@ -53,6 +53,7 @@ class ChatSession(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=True)
     session_type = Column(String, default="simple") # 'simple' or 'draft'
+    metadata_snapshot = Column(JSON, nullable=True) # Permanent store for legal context
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="sessions")
@@ -161,6 +162,7 @@ class ChatMessage(Base):
     response_tokens = Column(Integer, default=0)
     
     source_ids = Column(JSON, nullable=True)
+    attachments = Column(JSON, nullable=True) # [{"filename": "...", "s3_key": "..."}]
     
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 

@@ -16,6 +16,8 @@ from apps.api.src.core.config import settings
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "qwen.qwen3-next-80b-a3b"
+_MAX_TOKENS   = 8000
+_TEMPERATURE  = 0.1
 
 
 class BedrockLLMClient:
@@ -26,6 +28,7 @@ class BedrockLLMClient:
             aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
             config=Config(
+                read_timeout=180,
                 max_pool_connections=50,  # Prevent connection queuing under concurrent load
                 retries={'max_attempts': settings.PIPELINE_MAX_RETRIES}
             )
@@ -36,8 +39,8 @@ class BedrockLLMClient:
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 4096,
-        temperature: float = 0.1,
+        max_tokens: int = _MAX_TOKENS,
+        temperature: float = _TEMPERATURE,
         label: str = "llm",
     ) -> Optional[str]:
 
@@ -101,8 +104,8 @@ class BedrockLLMClient:
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 4096,
-        temperature: float = 0.1,
+        max_tokens: int = _MAX_TOKENS,
+        temperature: float = _TEMPERATURE,
         label: str = "llm_stream",
     ) -> Iterator[str]:
 
@@ -189,7 +192,7 @@ class BedrockLLMClient:
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 1024,
+        max_tokens: int = _MAX_TOKENS,
         label: str = "llm_json",
     ) -> Optional[Dict[str, Any]]:
 

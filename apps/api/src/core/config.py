@@ -43,6 +43,11 @@ class Settings(BaseSettings):
 
     # --- Path for BM25 Stats ---
     CORPUS_STATS_FILE: str = "corpus_stats.json"
+
+    # --- Legal Draft Settings ---
+    MAX_CONCURRENT_PAGES: int = 25      # How many pages to process at once across all users
+    PAGE_SEMAPHORE_BACKEND: str = "redis" # Use 'redis' for production, 'asyncio' for local dev
+    NOVA_LITE_DPI: int = 150            # Optimized DPI for speed/cost balance (keep at 150)
     
     # AWS Configuration
     AWS_ACCESS_KEY_ID: str = ""

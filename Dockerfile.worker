@@ -1,0 +1,28 @@
+# --- Stage 1: Base System with Legal Dependencies (Poppler) ---
+FROM python:3.11-slim-bullseye as base
+
+# 1. Install Poppler-utils (CRITICAL for File -> Image conversion)
+RUN apt-get update && apt-get install -y \
+    poppler-utils \
+    libpoppler-cpp-dev \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Set environment & workdir
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+WORKDIR /app
+
+# 3. Install Python dependencies
+COPY requirements-base.txt .
+COPY requirements-worker.txt .
+RUN pip install --no-cache-dir -r requirements-worker.txt
+
+# 4. Copy the application source
+COPY . .
+
+# --- Stage 2: Final Image Configuration ---
+# By default, we run the Worker logic. 
+# You can override this command in AWS ECS for the API service.
+CMD ["python", "-m", "apps.api.src.services.document.worker"]

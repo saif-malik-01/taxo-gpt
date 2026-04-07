@@ -78,7 +78,8 @@ async def add_message(
     chat_mode: str = None, 
     prompt_tokens: int = 0, 
     response_tokens: int = 0,
-    source_ids: list = None # New field
+    source_ids: list = None,
+    attachments: list = None # New field: [{"filename": "...", "s3_key": "..."}]
 ):
     async with AsyncSessionLocal() as db:
         if user_id:
@@ -94,7 +95,8 @@ async def add_message(
             content=content, 
             prompt_tokens=prompt_tokens, 
             response_tokens=response_tokens,
-            source_ids=source_ids # Save IDs
+            source_ids=source_ids, # Save IDs
+            attachments=attachments # Save attachments
         )
         db.add(new_msg)
         await db.commit()
@@ -115,10 +117,10 @@ async def get_user_profile(user_id: int):
         res = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
         return res.scalar_one_or_none()
 
-async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, usage: dict = None, force_deduct: bool = False):
+async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, usage: dict = None, force_deduct: bool = False, chat_mode: str = "simple"):
     if db is None:
         async with AsyncSessionLocal() as session:
-            return await track_usage(user_id, session_id, session, usage, force_deduct)
+            return await track_usage(user_id, session_id, session, usage, force_deduct, chat_mode)
 
     res = await db.execute(
         select(UserUsage)
@@ -145,8 +147,14 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
 
     # --- Per-query balance deduction ---
     if force_deduct:
-        user_usage.simple_query_used    = (user_usage.simple_query_used    or 0) + 1
-        user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 1_000_000) - 1)
+        if chat_mode == "draft":
+            user_usage.draft_reply_used = (user_usage.draft_reply_used or 0) + 1
+            user_usage.draft_reply_balance = max(0, (user_usage.draft_reply_balance or 0) - 1)
+            logger.info(f"Deducted 1 DRAFT credit for user {user_id}. Remaining: {user_usage.draft_reply_balance}")
+        else:
+            user_usage.simple_query_used = (user_usage.simple_query_used or 0) + 1
+            user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 0) - 1)
+            logger.info(f"Deducted 1 SIMPLE credit for user {user_id}. Remaining: {user_usage.simple_query_balance}")
         
         # --- Low credit notification (Target: specifically 1 credit left) ---
         if user_usage.simple_query_balance == 1 and user_usage.user:
@@ -165,10 +173,10 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
 
     await db.commit()
 
-async def check_credits(user_id: int, session_id: str, has_files: bool, db: AsyncSession = None, chat_mode: str = None, extra_tokens: int = 0):
+async def check_credits(user_id: int, session_id: str, db: AsyncSession = None, chat_mode: str = "simple", extra_tokens: int = 0):
     if db is None:
         async with AsyncSessionLocal() as session:
-            return await check_credits(user_id, session_id, has_files, session, chat_mode, extra_tokens)
+            return await check_credits(user_id, session_id, session, chat_mode, extra_tokens)
 
     res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
     usage = res.scalars().first()
@@ -193,8 +201,12 @@ async def check_credits(user_id: int, session_id: str, has_files: bool, db: Asyn
             return False, "Your credits have expired on {}. Please purchase a new package to continue.".format(expire_at.strftime("%Y-%m-%d"))
 
     # --- Guard 1: Balance check ---
-    if (usage.simple_query_balance or 0) <= 0:
-        return False, "Insufficient balance. Please upgrade your plan."
+    if chat_mode == "draft":
+        if (usage.draft_reply_balance or 0) <= 0:
+            return False, "Insufficient Draft Reply balance. Please upgrade your plan."
+    else:
+        if (usage.simple_query_balance or 0) <= 0:
+            return False, "Insufficient Simple Query balance. Please upgrade your plan."
 
     # --- Guard 2: Monthly token abuse guard (lazy 30-day rolling window reset) ---
     now = datetime.now(timezone.utc)
