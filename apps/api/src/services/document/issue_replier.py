@@ -148,21 +148,14 @@ def _rerank_for_mode(chunks: list, mode: str) -> list:
     return chunks
 
 
-def _retrieve_for_issue_sync(issue_text: str, mode: str) -> list:
+async def _retrieve_for_issue_async(issue_text: str, mode: str) -> list:
     """
-    Synchronous retrieval for one issue.
-    Runs inside run_in_threadpool — never call from async context directly.
+    Asynchronous retrieval for one issue.
 
     Query = issue text verbatim (no summary, no sender, no case context).
     This is the exact signal the spec mandates for Step 8A.
 
-    Pipeline stages 1-5 run internally (extraction, retrieval, filter, cross-ref).
-    The cached Stage2BResult from Step 2B cannot be injected into the existing
-    pipeline without modifying pipeline.py — the pipeline re-extracts internally.
-    The spec notes this as a future optimisation (pre_built_stage2b parameter).
-    For now, the pipeline runs its own lightweight extraction on the issue text
-    which is fast (< 1s for regex, 15-25s for LLM — but BM25 index is already warm).
-
+    Pipeline stages 1-5 run internally (extraction, retrieval, filter).
     Returns top 20 reranked chunks, all chunk types (spec §7).
     """
     pipeline = _get_pipeline()
@@ -172,12 +165,12 @@ def _retrieve_for_issue_sync(issue_text: str, mode: str) -> list:
 
     try:
         # Stage 1-5: no history for issue retrieval (stateless per-issue)
-        staged = pipeline.query_stages_1_to_5(
+        staged = await pipeline.query_stages_1_to_5(
             user_query      = issue_text,   # issue text only — spec §8A
             session_history = [],           # no history — each issue is independent
         )
-        # staged = (final_query, session_history, chunks, citation_result, intent, cross_refs)
-        _, _, chunks, _, _, _ = staged
+        # staged = (final_query, session_history, chunks, citation_result, intent)
+        _, _, chunks, _, _ = staged
 
         if not chunks:
             logger.info(f"8A: no chunks for issue (len={len(issue_text)})")
@@ -526,9 +519,7 @@ async def process_issues_streaming(
                 f"8A: starting retrieval for issue {issue_id} "
                 f"(idx={idx}, len={len(issue_text)})"
             )
-            top_chunks = await run_in_threadpool(
-                _retrieve_for_issue_sync, issue_text, mode
-            )
+            top_chunks = await _retrieve_for_issue_async(issue_text, mode)
             logger.info(
                 f"8A: done issue {issue_id} → {len(top_chunks)} chunks"
             )

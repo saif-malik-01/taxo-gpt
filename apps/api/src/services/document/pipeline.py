@@ -556,8 +556,8 @@ async def _handle_query_fallback(question: str, session_id: str, user_id: int, h
     aug = f"[CASE CONTEXT]\n{active_case['summary'][:1500]}\n\n[USER]\n{question}" if active_case else question
     answer_parts = []
     try:
-        staged = await run_in_threadpool(pipeline.query_stages_1_to_5, aug, [])
-        for chunk in pipeline.query_stage_6_stream(*staged):
+        staged = await pipeline.query_stages_1_to_5(aug, [])
+        async for chunk in pipeline.query_stage_6_stream(*staged):
             if chunk.startswith("\n\n__META__"):
                 m = "".join(answer_parts)
                 await add_message(session_id, "assistant", m, user_id)
