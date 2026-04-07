@@ -33,6 +33,8 @@ def _get_s3_client():
     return _s3_client
 
 
+import uuid
+
 async def upload_document_to_s3(
     file_obj, 
     user_id: int, 
@@ -42,9 +44,11 @@ async def upload_document_to_s3(
     """
     Streams a file directly to the permanent AWS S3 storage.
     Returns the 's3_key' (path) to be stored in the session context.
+    Each file is given a unique prefix to prevent overwrites within a session.
     """
     s3 = _get_s3_client()
-    s3_key = f"docs/{user_id}/{session_id}/{filename}"
+    unique_prefix = uuid.uuid4().hex[:8]
+    s3_key = f"docs/{user_id}/{session_id}/{unique_prefix}_{filename}"
     
     try:
         # We use upload_fileobj for efficient streaming

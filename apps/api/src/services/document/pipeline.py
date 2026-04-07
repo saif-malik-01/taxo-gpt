@@ -553,9 +553,7 @@ async def _handle_query_fallback(question: str, session_id: str, user_id: int, h
     if not pipeline:
         yield _content("System warming up...")
         return
-    if active_case:
-        async for chunk in _stream_header(active_case):
-            yield chunk
+
     aug = f"[CASE CONTEXT]\n{active_case['summary'][:1500]}\n\n[USER]\n{question}" if active_case else question
     answer_parts = []
     try:
