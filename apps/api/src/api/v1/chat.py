@@ -228,7 +228,12 @@ async def ask_gst_stream_draft(
             history  = await get_session_history(session_id)
             profile  = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
-            snapshot = await get_doc_context(session_id) or create_empty_context()
+            context_exists = await get_doc_context(session_id)
+            if not context_exists:
+                snapshot = create_empty_context()
+                await set_doc_context(session_id, snapshot)
+            else:
+                snapshot = context_exists
             snap_ref[0] = snapshot
             
             await add_message(session_id, "user", question, user_id, chat_mode="draft", attachments=attachments)
@@ -253,6 +258,9 @@ async def ask_gst_stream_draft(
                     snapshot = await get_doc_context(session_id) or snapshot
                     active_case = get_active_case(snapshot)
                     
+                    if not active_case:
+                        continue
+                        
                     # If any new document is still "pending", wait
                     pending = [d for d in active_case.get("docs", []) if d.get("pipeline_status") == "pending"]
                     if not pending and active_case.get("docs"):
@@ -266,6 +274,11 @@ async def ask_gst_stream_draft(
                 yield _retrieval_event(session_id, None, "Extraction complete. Proceeding with drafting...")
 
             # --- Step 2: Determine & Execute Intent ---
+            if not active_case:
+                async for chunk in _handle_query_fallback(res_q, session_id, user_id, history, background_tasks, active_case, snapshot):
+                    yield chunk
+                return
+
             intent_res = await run_in_threadpool(classify_intent_no_docs, res_q, snapshot)
             intent = intent_res.get("intent", "summarize")
             mode = intent_res.get("mode")
