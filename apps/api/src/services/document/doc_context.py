@@ -168,7 +168,10 @@ def get_active_case(ctx: dict) -> Optional[dict]:
     cid = ctx.get("active_case_id")
     if not cid:
         return None
-    return ctx.get("cases", {}).get(cid)
+    cases = ctx.get("cases", {})
+    # JSON serialisation converts dict keys to strings.
+    # active_case_id might be int (from code) or str (from JSON).
+    return cases.get(cid) or cases.get(str(cid))
 
 
 def add_case_to_context(ctx: dict, case: dict) -> None:
@@ -179,19 +182,28 @@ def add_case_to_context(ctx: dict, case: dict) -> None:
 
 def switch_active_case(ctx: dict, case_id: str) -> None:
     old_id = ctx.get("active_case_id")
-    if old_id and old_id in ctx.get("cases", {}):
-        ctx["cases"][old_id]["session_status"] = "archived"
+    cases = ctx.setdefault("cases", {})
+    
+    if old_id:
+        old_case = cases.get(old_id) or cases.get(str(old_id))
+        if old_case:
+            old_case["session_status"] = "archived"
+            
     ctx["active_case_id"] = case_id
-    if case_id in ctx.get("cases", {}):
-        ctx["cases"][case_id]["session_status"] = "active"
+    new_case = cases.get(case_id) or cases.get(str(case_id))
+    if new_case:
+        new_case["session_status"] = "active"
     _append_event(ctx, "CASE_SWITCHED", {"from": old_id, "to": case_id})
 
 
 def archive_active_case(ctx: dict) -> None:
     cid = ctx.get("active_case_id")
-    if cid and cid in ctx.get("cases", {}):
-        ctx["cases"][cid]["session_status"] = "archived"
-        _append_event(ctx, "CASE_ARCHIVED", {"case_id": cid})
+    if cid:
+        cases = ctx.get("cases", {})
+        case = cases.get(cid) or cases.get(str(cid))
+        if case:
+            case["session_status"] = "archived"
+            _append_event(ctx, "CASE_ARCHIVED", {"case_id": cid})
     # Reset session-level state for new case
     ctx["last_3_qa_pairs"] = []
 

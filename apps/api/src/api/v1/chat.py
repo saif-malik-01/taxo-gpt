@@ -256,6 +256,7 @@ async def ask_gst_stream_draft(
                 while True:
                     await asyncio.sleep(1.5) # Poll Redis Context every 1.5s
                     snapshot = await get_doc_context(session_id) or snapshot
+                    snap_ref[0] = snapshot
                     active_case = get_active_case(snapshot)
                     
                     if not active_case:
