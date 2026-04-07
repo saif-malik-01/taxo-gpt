@@ -4,8 +4,10 @@ import logging
 import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from apps.api.src.core.config import settings
-from apps.api.src.db.session import engine, Base
 from apps.api.src.api.v1.auth import router as auth_router
 from apps.api.src.api.v1.chat import router as chat_router
 from apps.api.src.api.v1.payments import router as payments_router
@@ -28,6 +30,29 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Safely handle validation errors that might contain binary data (bytes) 
+    that cause UnicodeDecodeErrors in the default FastAPI encoder.
+    """
+    def _scrub(item):
+        if isinstance(item, bytes):
+            try:
+                return item.decode("utf-8")
+            except:
+                return "<binary data>"
+        if isinstance(item, list):
+            return [_scrub(x) for x in item]
+        if isinstance(item, dict):
+            return {k: _scrub(v) for k, v in item.items()}
+        return item
+
+    # exc.errors() returns a list of dictionaries with error details.
+    # We scrub these to remove raw bytes.
+    safe_errors = jsonable_encoder(_scrub(exc.errors()))
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 # Logging Setup
 os.makedirs(os.path.dirname(settings.LOG_FILE), exist_ok=True)

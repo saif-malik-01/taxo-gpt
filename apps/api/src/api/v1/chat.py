@@ -192,10 +192,10 @@ async def ask_gst_stream_simple(
 @router.post("/chat/ask/stream/draft")
 async def ask_gst_stream_draft(
     background_tasks: BackgroundTasks,
-    question:    str            = Form(default=""),
-    session_id:  Optional[str]  = Form(default=None),
-    files:       List[UploadFile] = File(default=[]),
-    user         = Depends(auth_guard)
+    question:    str              = Form(""),
+    session_id:  str              = Form(...),
+    files:       List[UploadFile] = File([]),
+    user                          = Depends(auth_guard)
 ):
     """
     Unified Draft Reply endpoint. 
