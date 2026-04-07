@@ -65,13 +65,24 @@ async def _process_task(payload: dict):
         try:
             # 2. Extract Text (Poppler + Bedrock Nova Lite)
             # This is the CPU-heavy part
-            pages = await extract_document_pages(tmp_path)
-            full_text = "\n\n".join(pages)
+            full_text, page_count, error = await extract_document_pages(tmp_path, filename)
             
+            if error:
+                logger.error(f"Extraction error for {filename}: {error}")
+                # We still append so the pipeline knows this file failed
+                extracted_docs.append({
+                    "filename": filename,
+                    "full_text": f"Error: {error}",
+                    "page_count": 0,
+                    "s3_key": s3_key,
+                    "error": error
+                })
+                continue
+
             extracted_docs.append({
                 "filename": filename,
                 "full_text": full_text,
-                "page_texts": pages,
+                "page_count": page_count,
                 "s3_key": s3_key
             })
         finally:
