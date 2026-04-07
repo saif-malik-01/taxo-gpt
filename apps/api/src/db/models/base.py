@@ -209,3 +209,15 @@ class CreditLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="credit_logs")
+
+
+class SessionDocumentText(Base):
+    __tablename__ = "session_document_texts"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    session_id    = Column(String, index=True, nullable=False)
+    case_id       = Column(Integer, nullable=False)
+    filename      = Column(String, nullable=False)
+    doc_type      = Column(String, nullable=False)   # "primary" | "reference" | "reply_reference"
+    extracted_text = Column(Text, nullable=False)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())

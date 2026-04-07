@@ -14,23 +14,8 @@ from sqlalchemy import Column, Integer, String, Text, DateTime, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func as sa_func
 
-from apps.api.src.db.session import Base, AsyncSessionLocal
-
-logger = logging.getLogger(__name__)
-
-
-# ─── Model ────────────────────────────────────────────────────────────────────
-
-class SessionDocumentText(Base):
-    __tablename__ = "session_document_texts"
-
-    id            = Column(Integer, primary_key=True, index=True)
-    session_id    = Column(String, index=True, nullable=False)
-    case_id       = Column(Integer, nullable=False)
-    filename      = Column(String, nullable=False)
-    doc_type      = Column(String, nullable=False)   # "primary" | "reference"
-    extracted_text = Column(Text, nullable=False)
-    created_at    = Column(DateTime(timezone=True), server_default=sa_func.now())
+from apps.api.src.db.session import AsyncSessionLocal
+from apps.api.src.db.models.base import SessionDocumentText
 
 
 # ─── Write ────────────────────────────────────────────────────────────────────
