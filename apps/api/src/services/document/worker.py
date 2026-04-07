@@ -106,6 +106,7 @@ async def _process_task(payload: dict):
     
     # ── Finalize & Commit ────────────────────────────────────────────────────────
     # Updates BOTH Redis and Postgres Snapshot
+    snapshot["worker_status"] = "completed"
     await set_doc_context(session_id, snapshot)
     logger.info(f"Successfully committed extraction for session {session_id}.")
 

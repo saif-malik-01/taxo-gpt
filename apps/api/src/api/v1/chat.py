@@ -220,6 +220,10 @@ async def ask_gst_stream_draft(
             attachments.append({"filename": f.filename, "s3_key": s3_key, "ext": ext})
         
         # Offload to ECS Worker Pool via SQS
+        snapshot = await get_doc_context(session_id) or create_empty_context()
+        snapshot["worker_status"] = "pending"
+        await set_doc_context(session_id, snapshot)
+        
         await dispatch_extraction_task(user_id, session_id, attachments)
 
     async def _gen():
@@ -263,8 +267,7 @@ async def ask_gst_stream_draft(
                         continue
                         
                     # If any new document is still "pending", wait
-                    pending = [d for d in active_case.get("docs", []) if d.get("pipeline_status") == "pending"]
-                    if not pending and active_case.get("docs"):
+                    if snapshot.get("worker_status") == "completed":
                         break
                         
                     if time.time() - start_t > max_wait_s:
