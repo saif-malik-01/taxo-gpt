@@ -43,7 +43,9 @@ from apps.api.src.services.document.doc_context import (
     get_active_case,
     set_doc_context,
     get_draftable_issues,
-    snapshot_for_display
+    snapshot_for_display,
+    append_user_context,
+    bump_version
 )
 from apps.api.src.services.document.intent_classifier import (
     classify_intent_no_docs,
@@ -296,9 +298,21 @@ async def ask_gst_stream_draft(
             if intent == "summarize" or has_files:
                 async for chunk in _handle_show_summary(active_case, session_id, user_id):
                     yield chunk
-            elif intent in ("draft_all", "draft_direct"):
+            elif intent in ("draft_all", "draft_direct", "draft_specific", "update_reply"):
                 if mode: active_case["mode"] = mode
-                issues_to_draft = get_draftable_issues(active_case)
+                
+                issue_ids = intent_res.get("issue_numbers") if intent in ("draft_specific", "update_reply") else None
+                issues_to_draft = get_draftable_issues(active_case, issue_ids=issue_ids)
+                
+                if not issues_to_draft and intent in ("draft_specific", "update_reply"):
+                    async for chunk in _handle_query_fallback(res_q, session_id, user_id, history, background_tasks, active_case, snapshot):
+                        yield chunk
+                    return
+
+                if intent == "update_reply":
+                    append_user_context(active_case, res_q)
+                    bump_version(snapshot)
+                    
                 async for chunk in _handle_draft_issues(active_case, issues_to_draft, session_id, user_id, res_q, background_tasks, snapshot):
                     yield chunk
             elif intent == "update_issues":

@@ -443,8 +443,8 @@ def _build_summary_and_issues_header(active_case: dict) -> str:
         for iss in issues:
             icon = " ✅" if iss.get("reply") else (" 📄" if iss.get("status") == "has_reply_doc" else "")
             text = iss.get("issue_text", "")
-            if len(text) > 180:
-                text = text[:177] + "..."
+            if len(text) > 2000:
+                text = text[:1997] + "..."
             lines.append(f"**{iss.get('id', '?')}.** {text}{icon}")
             lines.append("")
         pending = sum(1 for i in issues if not i.get("reply") and i.get("status") not in ("replied", "has_reply_doc"))
@@ -521,7 +521,13 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
     full = _build_summary_and_issues_header(active_case) + hdr
     all_src = []
     async for i_num, reply, src in process_issues_streaming(issues=issues_to_draft, mode=mode, case_summary=active_case.get("summary",""), recipient_name="", prior_replied_pairs=[], reference_doc_full_text="", max_parallel=3):
-        header = f"\n\n### Issue {i_num}\n\n"
+        target_issue = None
+        if 0 <= i_num - 1 < len(issues_to_draft):
+            target_issue = issues_to_draft[i_num-1]
+        
+        display_num = target_issue.get("id", i_num) if target_issue else i_num
+        
+        header = f"\n\n### Issue {display_num}\n\n"
         yield _content(header)
         full += header
         for i in range(0, len(reply), 100):
@@ -529,8 +535,7 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
         full += reply
         all_src.extend(src)
         # Update the actual issue state in the context
-        if 0 <= i_num - 1 < len(issues_to_draft):
-            target_issue = issues_to_draft[i_num-1]
+        if target_issue:
             target_issue["reply"] = reply
             target_issue["status"] = "replied"
     full += _build_assumptions_note(active_case, mode)
