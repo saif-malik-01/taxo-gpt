@@ -298,10 +298,16 @@ async def ask_gst_stream_draft(
             if intent == "summarize" or has_files:
                 async for chunk in _handle_show_summary(active_case, session_id, user_id):
                     yield chunk
-            elif intent in ("draft_all", "draft_direct", "draft_specific", "update_reply"):
+            elif intent in ("draft_all", "draft_direct", "draft_specific", "update_reply", "confirm_mode"):
                 if mode: active_case["mode"] = mode
                 
                 issue_ids = intent_res.get("issue_numbers") if intent in ("draft_specific", "update_reply") else None
+                
+                if intent == "confirm_mode" and active_case.get("state") == "awaiting_issue_confirmation":
+                    stored_ids = active_case.get("_pending_draft_ids")
+                    if stored_ids:
+                        issue_ids = stored_ids
+                        
                 issues_to_draft = get_draftable_issues(active_case, issue_ids=issue_ids)
                 
                 if not issues_to_draft and intent in ("draft_specific", "update_reply"):

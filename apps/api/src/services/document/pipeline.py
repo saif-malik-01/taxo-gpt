@@ -506,19 +506,17 @@ async def _handle_show_summary(active_case: dict, session_id: str, user_id: int)
 
 async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], session_id: str, user_id: int, question: str, background_tasks: BackgroundTasks, snapshot: dict, skip_confirmation: bool = False) -> AsyncGenerator[str, None]:
     mode = active_case.get("mode", MODE_DEFENSIVE)
-    async for chunk in _stream_header(active_case):
-        yield chunk
     if not skip_confirmation and active_case.get("state") not in ("issue_confirmation_sent", "awaiting_issue_confirmation"):
         msg = f"I'll draft {len(issues_to_draft)} issue(s). Say **'go ahead'** to start."
         yield _content(msg)
         active_case["state"] = "awaiting_issue_confirmation"
         active_case["_pending_draft_ids"] = [i.get("id") for i in issues_to_draft]
-        asst = await add_message(session_id, "assistant", _build_summary_and_issues_header(active_case) + msg, user_id)
+        asst = await add_message(session_id, "assistant", msg, user_id)
         yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
         return
-    hdr = f"## Drafting {len(issues_to_draft)} Issues...\n\n"
+    hdr = f"Drafting {len(issues_to_draft)} Issue(s)...\n\n"
     yield _content(hdr)
-    full = _build_summary_and_issues_header(active_case) + hdr
+    full = hdr
     all_src = []
     async for i_num, reply, src in process_issues_streaming(issues=issues_to_draft, mode=mode, case_summary=active_case.get("summary",""), recipient_name="", prior_replied_pairs=[], reference_doc_full_text="", max_parallel=3):
         target_issue = None
@@ -548,11 +546,9 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
 async def _handle_update_issues(active_case: dict, question: str, session_id: str, user_id: int) -> AsyncGenerator[str, None]:
     update = await run_in_threadpool(parse_issue_update, question, active_case.get("issues", []))
     apply_issue_update(active_case, update)
-    async for chunk in _stream_header(active_case):
-        yield chunk
-    msg = "\n\nIssues updated successfully."
+    msg = "Issues updated successfully."
     yield _content(msg)
-    asst = await add_message(session_id, "assistant", _build_summary_and_issues_header(active_case) + msg, user_id)
+    asst = await add_message(session_id, "assistant", msg, user_id)
     yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
     yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
