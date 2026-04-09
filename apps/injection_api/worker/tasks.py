@@ -117,7 +117,7 @@ def ingest_chunk_task(
     chunk_id = chunk.get("id") or str(uuid.uuid4())
     chunk["id"] = chunk_id
 
-    logger.info(f"[{chunk_id}] Starting ingestion — type={chunk_type} by={submitted_by}")
+    logger.info(f"[{chunk_id}] Starting ingestion - type={chunk_type} by={submitted_by}")
 
     # Store task metadata so /jobs/{id} can display it
     self.update_state(
@@ -134,106 +134,115 @@ def ingest_chunk_task(
     try:
         spec = get_spec(chunk_type)
 
-        # ── Step 1-4: Build keyword document ─────────────────────────────────
-        self.update_state(state="STARTED", meta={
-            "chunk_id": chunk_id, "chunk_type": chunk_type,
-            "submitted_by": submitted_by, "submitted_at": submitted_at,
-            "progress": 15,
-        })
+        original_text = chunk.get("text", "")
+        # Large judgment splitting: Titan-optimized hierarchical chunking
+        if chunk_type == "judgment" and len(original_text) > 1400:
+            import copy
+            from utils.chunking import split_order_text
+            order_parts = split_order_text(original_text)
+            
+            sub_chunks = []
+            
+            # 1. Overview Chunk (Uses the original submitted UUID)
+            ov_chunk = copy.deepcopy(chunk)
+            ov_chunk["id"] = chunk_id
+            ov_chunk["chunk_index"] = 1
+            ov_chunk["total_chunks"] = len(order_parts) + 1
+            if "ext" not in ov_chunk: ov_chunk["ext"] = {}
+            ov_chunk["ext"]["chunk_subtype"] = "judgment_overview"
+            
+            title = ov_chunk["ext"].get("title", "")
+            citation = ov_chunk["ext"].get("citation", "")
+            c_num = ov_chunk["ext"].get("case_number", "")
+            court = ov_chunk["ext"].get("court", "")
+            state = ov_chunk["ext"].get("state", "")
+            judge = ov_chunk["ext"].get("judge", "")
+            year = ov_chunk["ext"].get("judgment_date", "")
+            decision = ov_chunk["ext"].get("decision", "")
+            case_note = ov_chunk["ext"].get("case_note", "")
+            
+            ov_text = f"JUDGMENT: {title}\nCitation: {citation}\nCase Number: {c_num}\nCourt: {court}, {state}\nJudge: {judge}\nYear: {year}\nDecision: {decision}\n\nSUMMARY:\n{case_note}"
+            ov_chunk["text"] = ov_text
+            sub_chunks.append(ov_chunk)
+            
+            # 2. Order Part Chunks (Deterministic child-UUIDs)
+            for idx, part in enumerate(order_parts, start=2):
+                ord_chunk = copy.deepcopy(chunk)
+                
+                # Use uuid5 to generate a stable, pure UUID for each part
+                part_uuid = str(uuid.uuid5(uuid.UUID(chunk_id), f"order-part-{idx}"))
+                ord_chunk["id"] = part_uuid
+                
+                ord_chunk["chunk_index"] = idx
+                ord_chunk["total_chunks"] = len(order_parts) + 1
+                if "ext" not in ord_chunk: ord_chunk["ext"] = {}
+                ord_chunk["ext"]["chunk_subtype"] = "judgment_order_part"
+                ord_chunk["text"] = f"FULL ORDER: {title}\nCitation: {citation}  |  Court: {court}, {state}  |  Decision: {decision}\n\n{part}"
+                
+                if "cross_references" not in ord_chunk:
+                    ord_chunk["cross_references"] = {}
+                ord_chunk["cross_references"]["parent_chunk_id"] = ov_chunk["id"]
+                sub_chunks.append(ord_chunk)
+                
+            logger.info(f"[{chunk_id}] Judgment split into {len(sub_chunks)} UUID-based chunks.")
+        else:
+            sub_chunks = [chunk]
 
-        # These are now imported at top-level for robustness
-
-        l1       = Layer1Extractor()
-        l3       = Layer3Qwen()
-        merger   = KeywordMerger()
-
-        l1_tokens    = l1.extract(chunk)
-        l3_data      = l3.extract(chunk.get("text", ""))
-        merge_result = merger.merge(
-            l1_tokens     = l1_tokens,
-            l3_data       = l3_data,
-            chunk_text    = chunk.get("text", ""),
-            chunk_summary = chunk.get("summary", ""),
-        )
-        kw_doc = merge_result.keyword_document
-
-        logger.debug(
-            f"[{chunk_id}] Keyword doc: L1={merge_result.l1_count} "
-            f"L3={merge_result.l3_count} discarded={merge_result.discarded_count}"
-        )
-
-        # ── Step 5: Compute sparse vector ─────────────────────────────────────
-        self.update_state(state="STARTED", meta={
-            "chunk_id": chunk_id, "chunk_type": chunk_type,
-            "submitted_by": submitted_by, "submitted_at": submitted_at,
-            "progress": 30,
-        })
-
-        bm25 = self.bm25_base   # fresh load from corpus_stats.json
-        sparse_indices, sparse_values = bm25.compute_sparse_vector(kw_doc)
-
-        # ── Step 6: Update corpus stats (serialised write) ────────────────────
-        _update_corpus_stats_safe(kw_doc)
-
-        # ── Step 7: Embed ─────────────────────────────────────────────────────
-        self.update_state(state="STARTED", meta={
-            "chunk_id": chunk_id, "chunk_type": chunk_type,
-            "submitted_by": submitted_by, "submitted_at": submitted_at,
-            "progress": 50,
-        })
-
-        # TitanEmbeddingGenerator and QdrantManager are now top-level
-        embedder = TitanEmbeddingGenerator()
-        text_vec, summary_vec = embedder.embed_both(
-            chunk.get("text", ""),
-            chunk.get("summary", ""),
-        )
-
-        if text_vec is None:
-            raise ValueError(f"Titan text embedding returned None for chunk {chunk_id}")
-        if summary_vec is None:
-            logger.warning(f"[{chunk_id}] Summary vector failed — falling back to text vector")
-            summary_vec = text_vec
-
-        logger.debug(f"[{chunk_id}] Embedded — text_vec dim={len(text_vec)}")
-
-        # ── Step 8: Supersession engine ───────────────────────────────────────
-        self.update_state(state="STARTED", meta={
-            "chunk_id": chunk_id, "chunk_type": chunk_type,
-            "submitted_by": submitted_by, "submitted_at": submitted_at,
-            "progress": 70,
-        })
-
+        # ── Supersession engine (runs once on the base logically) ──
+        self.update_state(state="STARTED", meta={"progress": 15})
         engine = SupersessionEngine(self.qdrant)
         supersession_log = engine.check_and_apply(chunk, spec)
-
         if supersession_log:
-            logger.info(
-                f"[{chunk_id}] Supersession applied — "
-                f"{len(supersession_log)} chunk(s) updated"
-            )
+            logger.info(f"[{chunk_id}] Supersession applied - {len(supersession_log)} chunk(s) updated")
 
-        # ── Step 9-10: Build point and upsert ─────────────────────────────────
-        self.update_state(state="STARTED", meta={
-            "chunk_id": chunk_id, "chunk_type": chunk_type,
-            "submitted_by": submitted_by, "submitted_at": submitted_at,
-            "progress": 85,
-        })
-
+        # ── Process all chunks ──
+        l1 = Layer1Extractor()
+        l3 = Layer3Qwen()
+        merger = KeywordMerger()
+        bm25 = self.bm25_base
+        embedder = TitanEmbeddingGenerator()
         file_hash = f"manual:{submitted_by}:{submitted_at}"
-        point = self.qdrant.build_point(
-            chunk_id       = chunk_id,
-            text_vector    = text_vec,
-            summary_vector = summary_vec,
-            sparse_indices = sparse_indices,
-            sparse_values  = sparse_values,
-            payload        = chunk,
-            file_hash      = file_hash,
-        )
+        
+        points = []
+        for i, sc in enumerate(sub_chunks):
+            prog = int(15 + 75 * ((i + 1) / len(sub_chunks)))
+            self.update_state(state="STARTED", meta={"progress": prog})
+            
+            l1_tokens = l1.extract(sc)
+            l3_data = l3.extract(sc.get("text", ""))
+            merge_result = merger.merge(
+                l1_tokens=l1_tokens,
+                l3_data=l3_data,
+                chunk_text=sc.get("text", ""),
+                chunk_summary=sc.get("summary", ""),
+            )
+            kw_doc = merge_result.keyword_document
+            
+            sparse_indices, sparse_values = bm25.compute_sparse_vector(kw_doc)
+            _update_corpus_stats_safe(kw_doc)
+            
+            text_vec, summary_vec = embedder.embed_both(sc.get("text", ""), sc.get("summary", ""))
+            if text_vec is None:
+                raise ValueError(f"Titan text embedding returned None for chunk {sc['id']}")
+            if summary_vec is None:
+                summary_vec = text_vec
 
-        results = self.qdrant.upsert_batch([point])
-        if not any(results):
-            raise RuntimeError(f"Qdrant upsert returned failure for chunk {chunk_id}")
+            point = self.qdrant.build_point(
+                chunk_id=sc["id"],
+                text_vector=text_vec,
+                summary_vector=summary_vec,
+                sparse_indices=sparse_indices,
+                sparse_values=sparse_values,
+                payload=sc,
+                file_hash=file_hash,
+            )
+            points.append(point)
+
+        # ── Upsert batch ──
+        self.update_state(state="STARTED", meta={"progress": 95})
+        results = self.qdrant.upsert_batch(points)
+        if not all(results):
+            raise RuntimeError(f"Qdrant batch upsert had failures out of {len(points)} chunks")
 
         logger.info(f"[{chunk_id}] Ingestion complete.")
 

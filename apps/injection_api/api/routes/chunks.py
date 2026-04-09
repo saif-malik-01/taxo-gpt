@@ -32,6 +32,7 @@ from schemas.chunk_type_spec import (
     get_spec,
     inject_system_fields,
     get_nested,
+    ensure_schema_defaults,
 )
 from worker.tasks import ingest_chunk_task
 
@@ -142,7 +143,11 @@ def dedup_check(
                 {
                     "key":   dedup_key,
                     "match": {"value": key_value},
-                }
+                },
+                {
+                    "key":   "chunk_type",
+                    "match": {"value": chunk_type},
+                },
             ]
         },
         limit=1,
@@ -154,20 +159,38 @@ def dedup_check(
     existing_chunk = existing[0]
     sup = spec["supersession_check"]
 
+    # Build a safe format context — covers all placeholder names used across
+    # any chunk type's warning_text (section_number, citation, circular_number, etc.)
+    fmt_ctx = {
+        "section_number":   key_value,
+        "citation":         key_value,
+        "circular_number":  key_value,
+        "notification_number": key_value,
+        "rule_number":      key_value,
+        "key_value":        key_value,
+        "overrules_citation": key_value,
+    }
+
     return DedupCheckResponse(
         duplicate_found=True,
         existing_chunk_id=existing_chunk.get("id"),
         existing_summary=existing_chunk.get("summary", ""),
-        warning_text=sup.get("warning_text", "").format(
-            section_number=key_value,
-        ) if sup.get("enabled") else (
-            f"A chunk with {dedup_key}='{key_value}' already exists. "
-            "Submitting will create a duplicate."
+        warning_text=(
+            sup.get("warning_text", "").format_map(fmt_ctx)
+            if sup.get("enabled") and sup.get("warning_text")
+            else (
+                f"A chunk with {dedup_key}='{key_value}' already exists. "
+                "Submitting will create a duplicate."
+            )
         ),
         supersession_info={
-            "action":        sup.get("action"),
-            "existing_id":   existing_chunk.get("id"),
-            "existing_title": existing_chunk.get("ext", {}).get("section_title", ""),
+            "action":         sup.get("action"),
+            "existing_id":    existing_chunk.get("id"),
+            # Try citation first (judgments), fall back to section_title (CGST sections)
+            "existing_title": (
+                existing_chunk.get("ext", {}).get("citation")
+                or existing_chunk.get("ext", {}).get("section_title", "")
+            ),
         } if sup.get("enabled") else None,
     )
 
@@ -273,8 +296,9 @@ def submit_chunk(
         chunk["id"] = str(uuid.uuid4())
     chunk_id = chunk["id"]
 
-    # ── 4. Inject system fields ───────────────────────────────────────────────
+    # ── 4. Inject system fields & missing schema fields ────────────────────────
     inject_system_fields(chunk, body.chunk_type)
+    ensure_schema_defaults(chunk, body.chunk_type)
 
     # ── 5. Add provenance ─────────────────────────────────────────────────────
     prov = chunk.setdefault("provenance", {})
@@ -318,6 +342,9 @@ def _validate_anchor_fields(chunk: dict, spec: dict) -> list[str]:
 def _run_dedup_check(chunk: dict, spec: dict) -> dict | None:
     """
     Check Qdrant for an existing chunk with the same dedup_key value.
+    The search is scoped to the same chunk_type to avoid false positives
+    — e.g. a judgment citation should not match a cgst_section that happens
+    to store the same string in a cross_references field.
     Returns the existing chunk payload if found, None otherwise.
     """
     dedup_key = spec.get("dedup_key")
@@ -328,11 +355,16 @@ def _run_dedup_check(chunk: dict, spec: dict) -> dict | None:
     if not key_value:
         return None
 
+    chunk_type = spec.get("chunk_type", "")
+
     from core_models.qdrant_manager import QdrantManager
     qdrant = QdrantManager()
     existing = qdrant.search_by_payload(
         filters={
-            "must": [{"key": dedup_key, "match": {"value": str(key_value)}}]
+            "must": [
+                {"key": dedup_key,    "match": {"value": str(key_value)}},
+                {"key": "chunk_type", "match": {"value": chunk_type}},
+            ]
         },
         limit=1,
     )

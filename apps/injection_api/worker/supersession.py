@@ -260,7 +260,7 @@ class SupersessionEngine:
 
         return log
 
-    # ── Judgment overruling (stub — implement when building judgment type) ─────
+    # ── Judgment overruling ────────────────────────────────────────────────
 
     def _handle_judgment(
         self,
@@ -269,10 +269,132 @@ class SupersessionEngine:
         sup_config: dict,
     ) -> list[dict]:
         """
-        Stub. Implement when building judgment type.
+        Judgment overrule logic.
+
+        Triggered when the user fills ext.overrules_citation on the new chunk.
+
+        Steps:
+          1. Read ext.overrules_citation from the new chunk.
+          2. Search Qdrant for ALL chunks with ext.citation == that value
+             AND chunk_type == 'judgment' (catches both overview & order parts).
+          3. Patch each found chunk:
+               - temporal.is_current        = False
+               - temporal.superseded_date   = <now>
+               - legal_status.current_status = 'overruled'
+               - ext.overruled_by           = new chunk's citation
+               - ext.current_status         = 'overruled'
+          4. Also sync the new chunk's own legal_status if user set
+             ext.current_status to 'overruled' (i.e. the chunk being ingested
+             is ITSELF an already-overruled judgment).
         """
-        logger.debug("Judgment overrule check — not yet implemented.")
-        return []
+        log = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+        new_citation = _get_nested(new_chunk, "ext.citation", "")
+
+        # ── Part A: This judgment overrules an older one ──────────────────────
+        overrules_citation = _get_nested(new_chunk, "ext.overrules_citation")
+
+        if overrules_citation:
+            logger.info(
+                f"Judgment supersession: '{new_citation}' overrules '{overrules_citation}'"
+            )
+
+            # Find every chunk belonging to the overruled case
+            old_chunks = self.qdrant.search_by_payload(
+                filters={
+                    "must": [
+                        {
+                            "key":   "ext.citation",
+                            "match": {"value": str(overrules_citation)},
+                        },
+                        {
+                            "key":   "chunk_type",
+                            "match": {"value": "judgment"},
+                        },
+                    ]
+                },
+                limit=50,  # a case can have many chunks (order parts etc.)
+            )
+
+            if not old_chunks:
+                logger.warning(
+                    f"Supersession: no existing judgment found for "
+                    f"citation='{overrules_citation}' — stored as metadata only."
+                )
+            else:
+                for old in old_chunks:
+                    old_id = old.get("id")          # payload's own id field
+                    qdrant_id = old.get("_qdrant_id") or old_id  # actual Qdrant point UUID
+                    if not old_id:
+                        continue
+
+                    patch = {
+                        "temporal": {
+                            "is_current":      False,
+                            "superseded_date": now_iso,
+                        },
+                        "legal_status": {
+                            "current_status": "overruled",
+                            "is_disputed":    True,
+                            "dispute_note":   (
+                                f"Overruled by {new_citation} "
+                                f"on {now_iso[:10]}"
+                            ),
+                        },
+                        "ext": {
+                            "overruled_by":   new_citation,
+                            "current_status": "overruled",
+                        },
+                        "_superseded_by_chunk_id": new_chunk.get("id"),
+                    }
+
+                    success = self.qdrant.update_payload(
+                        chunk_id=qdrant_id,   # already the Qdrant point UUID
+                        payload_patch=patch,
+                        use_raw_id=True,      # skip _to_uuid hashing
+                    )
+
+                    if success:
+                        logger.info(
+                            f"  Overruled: chunk '{old_id}' "
+                            f"(citation='{overrules_citation}') marked overruled "
+                            f"by '{new_citation}'"
+                        )
+                        log.append({
+                            "action":            "judgment_overruled",
+                            "affected_chunk_id": old_id,
+                            "affected_type":     "judgment",
+                            "field_updated":     "legal_status.current_status",
+                            "old_value":         old.get("legal_status", {}).get("current_status", "active"),
+                            "new_value":         "overruled",
+                            "reason": (
+                                f"Judgment '{overrules_citation}' overruled by "
+                                f"new judgment '{new_citation}'."
+                            ),
+                        })
+                    else:
+                        logger.error(
+                            f"  Supersession FAILED for chunk '{old_id}'"
+                        )
+
+        # ── Part B: The new chunk itself is already overruled ─────────────────
+        # If user set ext.current_status = 'overruled' on submit, we sync the
+        # standard legal_status fields so Qdrant filters work correctly.
+        new_ext_status = _get_nested(new_chunk, "ext.current_status", "active")
+        if new_ext_status == "overruled":
+            # Patch the new chunk's own legal_status (it will be upserted right
+            # after this method returns, so we mutate the dict in-place).
+            new_chunk.setdefault("legal_status", {})
+            new_chunk["legal_status"]["current_status"] = "overruled"
+            new_chunk["legal_status"]["is_disputed"]    = True
+            new_chunk.setdefault("temporal", {})
+            new_chunk["temporal"]["is_current"] = False
+            logger.info(
+                f"New chunk '{new_chunk.get('id')}' self-marked as overruled "
+                f"(overruled_by='{_get_nested(new_chunk, 'ext.overruled_by', '')}')."
+            )
+
+        return log
 
     # ── Circular supersession (Replacement + Corrigenda) ──────────────────────
 

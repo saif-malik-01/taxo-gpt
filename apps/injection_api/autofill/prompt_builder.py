@@ -39,6 +39,7 @@ def build_prompt(chunk_type: str, anchor_data: dict[str, Any], split: bool = Tru
         "notification": _notification_prompt,
         "igst_rule":    _igst_rule_prompt,
         "cgst_rule":    _cgst_rule_prompt,
+        "judgment":     _judgment_prompt,
     }
     builder = builders.get(chunk_type)
     if builder is None:
@@ -539,4 +540,194 @@ Return a SINGLE JSON object matching this structure:
 
 FULL TEXT:
 {text}
+"""
+
+
+def _judgment_prompt(anchor: dict[str, Any], split: bool = False) -> str:
+    """
+    Autofill prompt for judgment chunk type.
+    split is not used for judgments — a single case maps to a single chunk.
+    Boost score is calibrated by court:
+      Supreme Court  -> 0.95
+      High Court     -> 0.88
+      CESTAT / GSTAT -> 0.80
+      AAR / AAAR     -> 0.72
+    """
+    # ── Extract anchor values (supports both nested and dot-key formats) ──────
+    def _get(key: str, sub: str = ""):
+        if sub:
+            return (
+                anchor.get("ext", {}).get(sub)
+                or anchor.get(f"ext.{sub}", "")
+                or ""
+            )
+        return anchor.get(key, "")
+
+    case_id       = _get("", "case_id")
+    citation      = _get("", "citation")
+    case_number   = _get("", "case_number")
+    petitioner    = _get("", "petitioner")
+    respondent    = _get("", "respondent")
+    court         = _get("", "court")
+    state         = _get("", "state")
+    judgment_date = _get("", "judgment_date")
+    judge         = _get("", "judge")
+    decision      = _get("", "decision")
+    law           = _get("", "law")
+    act_name      = _get("", "act_name")
+    rule_name     = _get("", "rule_name")
+    notification  = _get("", "notification_number")
+    case_note     = _get("", "case_note")
+    text          = anchor.get("text", "")
+
+    # Cross-refs supplied by user
+    sections = (
+        anchor.get("cross_references", {}).get("sections")
+        or anchor.get("cross_references.sections", [])
+        or []
+    )
+    rules = (
+        anchor.get("cross_references", {}).get("rules")
+        or anchor.get("cross_references.rules", [])
+        or []
+    )
+
+    # Boost calibration
+    boost_map = {
+        "Supreme Court": 0.95,
+        "High Court": 0.88,
+        "CESTAT": 0.80,
+        "GSTAT": 0.80,
+        "AAR": 0.72,
+        "AAAR": 0.72,
+        "Authority for Advance Ruling": 0.72,
+    }
+    boost_score  = boost_map.get(court, 0.80)
+    court_label  = f"{court}, {state}" if state else court
+    case_name    = f"{petitioner} vs. {respondent}" if petitioner and respondent else petitioner
+
+    example_structure = {
+        "id": f"judg-{case_id}-overview" if case_id else "judg-unknown-overview",
+        "chunk_type": "judgment",
+        "parent_doc": "GST Judgments",
+        "chunk_index": 1,
+        "total_chunks": 1,
+        "text": "...full judgment text...",
+        "summary": "2-3 plain-English sentences summarising the legal issue, holding, and impact",
+        "keywords": [
+            "ITC refund", "inverted duty", "Section 54",
+            f"{petitioner}", court_label, decision
+        ],
+        "authority": {
+            "level": 5,
+            "label": "Judicial Interpretations",
+            "is_statutory": False,
+            "is_binding": True,
+            "can_be_cited": True,
+        },
+        "temporal": {
+            "effective_date": judgment_date,
+            "superseded_date": None,
+            "is_current": True,
+            "financial_year": None,
+        },
+        "legal_status": {
+            "is_disputed": False,
+            "dispute_note": None,
+            "current_status": "active",
+            "overruled_by": None,
+        },
+        "cross_references": {
+            "sections": sections,
+            "rules": rules,
+            "notifications": [],
+            "circulars": [],
+            "forms": [],
+            "hsn_codes": [],
+            "sac_codes": [],
+            "judgment_ids": [],
+            "parent_chunk_id": None,
+        },
+        "retrieval": {
+            "primary_topics": ["ITC refund", "inverted duty structure"],
+            "tax_type": "CGST",
+            "applicable_to": "both",
+            "query_categories": ["itc_eligibility", "notice_defence"],
+            "boost_score": boost_score,
+        },
+        "provenance": {
+            "source_file": "judgments.csv",
+            "page_range": None,
+            "ingestion_date": "2026-04-09",
+            "version": "1.0",
+        },
+        "ext": {
+            "case_id": case_id,
+            "case_name": case_name,
+            "court": court,
+            "court_level": "HC",  # AI should keep this as-is
+            "state": state,
+            "judgment_date": judgment_date,
+            "citation": citation,
+            "petitioner": petitioner,
+            "respondent": respondent,
+            "decision": decision,
+            "law": law,
+            "act_name": act_name,
+            "judge": judge,
+            "case_number": case_number,
+            "rule_name": rule_name,
+            "notification_number": notification,
+            "title": anchor.get("ext", {}).get("title", ""),
+            "case_note": case_note,
+            # AI fills the fields below:
+            "principle": "1-sentence ratio decidendi extracted from the judgment",
+            "sections_in_dispute": ["54"],
+            "rules_in_dispute": [],
+            "current_status": "active",
+            "overruled_by": None,
+            "followed_in": [],
+        },
+    }
+
+    return f"""You are a senior GST law expert. Analyse the following court judgment and fill in ALL metadata fields.
+
+CASE CONTEXT (provided by user — do NOT change these values):
+  Case ID      : {case_id}
+  Citation     : {citation}
+  Case Number  : {case_number}
+  Court        : {court_label}
+  Judge        : {judge}
+  Petitioner   : {petitioner}
+  Respondent   : {respondent}
+  Date         : {judgment_date}
+  Decision     : {decision}
+  Law / Act    : {law} / {act_name}
+  Sections     : {', '.join(sections) if sections else 'see text'}
+  Rules        : {', '.join(rules) if rules else 'see text'}
+
+CASE NOTE (headnote from source):
+{case_note}
+
+FULL JUDGMENT TEXT (for deep analysis):
+{text}
+
+Return a SINGLE JSON object matching this EXACT structure. For the fields marked '# AI fills':
+1. summary       — write 2-3 plain-English sentences covering: legal issue, holding, and practical impact.
+2. keywords      — 8-15 specific retrieval terms (section names, tax concepts, court, outcome).
+3. retrieval.*   — infer tax_type, applicable_to, query_categories, primary_topics from text.
+4. ext.principle — extract the 1-sentence ratio decidendi (the core legal rule laid down).
+5. ext.sections_in_dispute — sections explicitly argued/contested (not just mentioned).
+6. ext.rules_in_dispute — rules explicitly contested.
+7. ext.overruled_by — if text mentions this judgment IS overruled by another, extract that citation. Otherwise null.
+8. ext.followed_in — citations of cases that explicitly followed THIS judgment (if mentioned). Otherwise [].
+9. cross_references.judgment_ids — ALL case citations mentioned anywhere in the text.
+10. cross_references.notifications — notification numbers cited.
+11. cross_references.circulars — circular numbers cited.
+12. retrieval.boost_score — use exactly {boost_score} (pre-calibrated for {court}).
+
+Do NOT change: id, chunk_type, parent_doc, authority, temporal, legal_status, provenance, or any ext fields already filled from context above.
+
+FULL STRUCTURE TO RETURN:
+{json.dumps(example_structure, indent=2)}
 """

@@ -55,7 +55,7 @@ class BedrockAutofillConfig:
     # "us.meta.llama3-3-70b-instruct-v1:0" or the Qwen3 ARN you use in chunking
     max_tokens: int = int(os.getenv("AUTOFILL_MAX_TOKENS", "4096"))
     temperature: float = float(os.getenv("AUTOFILL_TEMPERATURE", "0.1"))
-    region:     str = os.getenv("AWS_REGION") or os.getenv("AWS_REGION_NAME", "us-east-1")
+    region:     str = os.getenv("AWS_REGION", "us-east-1")
 
 
 @dataclass

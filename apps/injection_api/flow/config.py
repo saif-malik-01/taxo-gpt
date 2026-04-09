@@ -13,7 +13,7 @@ load_dotenv()
 
 @dataclass
 class BedrockConfig:
-    region_name:       str   = os.getenv("AWS_REGION") or os.getenv("AWS_REGION_NAME", "us-east-1")
+    region_name:       str   = os.getenv("AWS_REGION", "us-east-1")
     titan_model_id:    str   = os.getenv("AWS_MODEL_ID") or os.getenv("TITAN_MODEL_ID", "amazon.titan-embed-text-v2:0")
     titan_dimensions:  int   = int(os.getenv("TITAN_DIMENSIONS", "1024"))
     titan_normalize:   bool  = os.getenv("TITAN_NORMALIZE", "True").lower() == "true"

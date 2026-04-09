@@ -67,7 +67,7 @@ class QdrantManager:
         if self._client is None:
             self._client = _make_client()
             logger.info(
-                f"Qdrant connected → "
+                f"Qdrant connected -> "
                 f"{CONFIG.qdrant.host}:{CONFIG.qdrant.port}"
             )
         return self._client
@@ -209,7 +209,12 @@ class QdrantManager:
                 with_vectors=False,
             )
 
-            return [point.payload for point in results]
+            return [
+                # Include the payload's own 'id' field AND the Qdrant point UUID
+                # so supersession can call update_payload with the correct chunk_id.
+                {**point.payload, "_qdrant_id": str(point.id)}
+                for point in results
+            ]
 
         except Exception as e:
             logger.error(f"search_by_payload FAILED: {e}")
@@ -220,40 +225,28 @@ class QdrantManager:
         chunk_id:      str,
         payload_patch: dict,
         collection:    str | None = None,
+        use_raw_id:    bool = False,
     ) -> bool:
         """
         Partial payload update — does NOT re-embed or re-index the vectors.
 
-        Use this for:
-        - Flipping temporal.is_current = False (supersession)
-        - Setting legal_status.current_status = "overruled"
-        - Adding _superseded_by_chunk_id reference
-        - Any metadata update that doesn't change the semantic content
-
-        payload_patch is a flat or nested dict merged INTO the existing payload.
-        Qdrant's set_payload merges at the top level — nested keys are overwritten.
-
-        Example:
-            manager.update_payload(
-                chunk_id="abc-123",
-                payload_patch={
-                    "temporal": {"is_current": False, "superseded_date": "2024-01-01"},
-                    "legal_status": {"current_status": "modified"},
-                }
-            )
+        chunk_id: the payload 'id' string (will be hashed via _to_uuid).
+        use_raw_id=True: chunk_id is already a Qdrant point UUID (e.g. from
+                         search_by_payload's _qdrant_id field) — skip hashing.
         """
         col = collection or CONFIG.qdrant.collection_name
+        qdrant_point_id = chunk_id if use_raw_id else self._to_uuid(chunk_id)
         try:
             self._get_client().set_payload(
                 collection_name=col,
                 payload=payload_patch,
-                points=[chunk_id],
+                points=[qdrant_point_id],
                 wait=True,
             )
-            logger.debug(f"update_payload OK: chunk_id={chunk_id}")
+            logger.debug(f"update_payload OK: chunk_id={chunk_id} qdrant_id={qdrant_point_id}")
             return True
         except Exception as e:
-            logger.error(f"update_payload FAILED for {chunk_id}: {e}")
+            logger.error(f"update_payload FAILED for {chunk_id} (qdrant_id={qdrant_point_id}): {e}")
             return False
 
 
