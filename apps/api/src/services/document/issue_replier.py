@@ -453,12 +453,18 @@ def _draft_issue_sync(
     for chunk in top_chunks:
         payload = getattr(chunk, "payload", {}) or {}
         ext     = payload.get("ext") or {}
+        identifier = (
+            ext.get("citation") or ext.get("section_number") or
+            ext.get("rule_number_full") or ext.get("notification_number") or
+            ext.get("circular_number") or ext.get("form_name") or
+            ext.get("hsn_code") or ext.get("sac_code") or ""
+        )
         sources.append({
-            "chunk_type": payload.get("chunk_type"),
-            "case_name":  ext.get("case_name") or payload.get("summary", "")[:80],
-            "court":      ext.get("court"),
-            "citation":   ext.get("citation"),
-            "score":      round(getattr(chunk, "score", 0), 4),
+            "chunk_id":   getattr(chunk, "chunk_id", None) or payload.get("_point_id") or payload.get("chunk_id") or payload.get("id"),
+            "chunk_type": payload.get("chunk_type", ""),
+            "text":       payload.get("text", ""),
+            "identifier": identifier,
+            "summary":    str(payload.get("summary") or ""),
         })
 
     return issue_num, reply, sources

@@ -539,7 +539,8 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
     full += _build_assumptions_note(active_case, mode)
     active_case["state"] = "complete"
     push_qa_pair(snapshot, question, full[:1200])
-    asst = await add_message(session_id, "assistant", full, user_id)
+    source_ids = [s["chunk_id"] for s in all_src if "chunk_id" in s]
+    asst = await add_message(session_id, "assistant", full, user_id, source_ids=source_ids)
     yield _retrieval_event(sources=all_src, document_analysis=snapshot_for_display(active_case))
     yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
@@ -567,8 +568,15 @@ async def _handle_query_fallback(question: str, session_id: str, user_id: int, h
         async for chunk in pipeline.query_stage_6_stream(*staged):
             if chunk.startswith("\n\n__META__"):
                 m = "".join(answer_parts)
-                asst = await add_message(session_id, "assistant", m, user_id)
-                yield _retrieval_event(document_analysis=snapshot_for_display(active_case) if active_case else None)
+                try:
+                    meta = json.loads(chunk.replace("\n\n__META__", ""))
+                    sources = meta.get("retrieved_documents", [])
+                    source_ids = [s["chunk_id"] for s in sources if s.get("chunk_id")]
+                except Exception:
+                    sources = []
+                    source_ids = []
+                asst = await add_message(session_id, "assistant", m, user_id, source_ids=source_ids)
+                yield _retrieval_event(sources=sources, document_analysis=snapshot_for_display(active_case) if active_case else None)
                 yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
             else:
                 answer_parts.append(chunk)
