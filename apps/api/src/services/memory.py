@@ -132,9 +132,8 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
     )
     user_usage = res.scalars().first()
     if not user_usage:
-        user_usage = UserUsage(user_id=user_id)
-        db.add(user_usage)
-        await db.flush()
+        from apps.api.src.services.payments import initialize_user_credits
+        user_usage = await initialize_user_credits(user_id, db)
 
     # --- Token tracking (lifetime analytics + monthly window) ---
     if usage:
@@ -184,8 +183,8 @@ async def check_credits(user_id: int, session_id: str, db: AsyncSession = None, 
     res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
     usage = res.scalars().first()
     if not usage:
-        usage = UserUsage(user_id=user_id)
-        db.add(usage)
+        from apps.api.src.services.payments import initialize_user_credits
+        usage = await initialize_user_credits(user_id, db)
         await db.commit()
 
     # --- Guard 0: Expiry check ---

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, cast, Date
+from sqlalchemy import func, cast, Date, update
 from pydantic import BaseModel
 
 from apps.api.src.services.auth.deps import admin_guard
@@ -16,6 +16,7 @@ from sqlalchemy.orm import joinedload
 from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
 from apps.api.src.services.auth.utils import get_password_hash
 from apps.api.src.db.models.base import UserProfile, UserUsage, User, ChatSession, ChatMessage, CreditPackage, PaymentTransaction, Coupon
+from apps.api.src.services.payments import initialize_user_credits
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -63,9 +64,9 @@ async def create_user_admin(payload: UserCreateAdmin, admin_user=Depends(admin_g
     await db.commit()
     await db.refresh(new_user)
 
-    # Initialize profile and usage
+    # Initialize profile and credits using Welcome Package logic
     db.add(UserProfile(user_id=new_user.id))
-    db.add(UserUsage(user_id=new_user.id))
+    await initialize_user_credits(new_user.id, db)
     await db.commit()
     
     return new_user
@@ -185,6 +186,11 @@ async def delete_user(user_id: int, admin_user=Depends(admin_guard), db: AsyncSe
 @router.post("/payments/packages", response_model=PackageResponse)
 async def create_package(payload: PackageCreate, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
     payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    
+    # If this package is being set as default, unset others
+    if payload_dict.get("is_default"):
+        await db.execute(update(CreditPackage).values(is_default=False).where(CreditPackage.is_default == True))
+        
     new_pkg = CreditPackage(**payload_dict)
     db.add(new_pkg)
     await db.commit()
@@ -361,6 +367,11 @@ async def update_package(package_id: int, payload: PackageUpdate, admin_user=Dep
         raise HTTPException(status_code=404, detail="Package not found")
     
     update_data = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") else payload.dict(exclude_unset=True)
+    
+    # If this package is being set as default, unset others
+    if update_data.get("is_default"):
+        await db.execute(update(CreditPackage).values(is_default=False).where(CreditPackage.id != package_id, CreditPackage.is_default == True))
+        
     for k, v in update_data.items():
         setattr(pkg, k, v)
     

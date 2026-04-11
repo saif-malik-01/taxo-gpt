@@ -16,14 +16,20 @@ class PackageCreate(BaseModel):
     title: str
     description: str
     amount: int
-    credits_added: int
+    draft_credits: int
+    simple_credits: Optional[int] = 0
+    validity_days: Optional[int] = 365
+    is_default: Optional[bool] = False
     is_active: Optional[bool] = True
 
 class PackageUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     amount: Optional[int] = None
-    credits_added: Optional[int] = None
+    draft_credits: Optional[int] = None
+    simple_credits: Optional[int] = None
+    validity_days: Optional[int] = None
+    is_default: Optional[bool] = None
     is_active: Optional[bool] = None
 
 class CouponCreate(BaseModel):
@@ -51,7 +57,10 @@ class PackageResponse(BaseModel):
     description: Optional[str] = None
     amount: int
     currency: str
-    credits_added: int
+    draft_credits: int
+    simple_credits: int
+    validity_days: int
+    is_default: bool
     is_active: bool
     created_at: datetime
 
@@ -91,7 +100,7 @@ class TransactionResponse(BaseModel):
     payment_id: Optional[str] = None
     amount: Optional[int] = 0
     currency: Optional[str] = "INR"
-    credits_added: Optional[int] = 0
+    draft_credits_added: Optional[int] = 0
     discount_amount: Optional[int] = 0
     status: Optional[str] = "pending"
     created_at: Optional[datetime] = None

@@ -101,7 +101,10 @@ class CreditPackage(Base):
     description = Column(Text, nullable=True)
     amount = Column(Integer) # In paise
     currency = Column(String, default="INR")
-    credits_added = Column(Integer)
+    draft_credits = Column(Integer) # This is used for Draft Replies
+    simple_credits = Column(Integer, default=0) # New field for Tax Intelligence
+    validity_days = Column(Integer, default=365)
+    is_default = Column(Boolean, default=False) # Only one package can be default
     is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -120,7 +123,7 @@ class PaymentTransaction(Base):
     currency = Column(String, default="INR")
     
     package_id = Column(Integer, ForeignKey("credit_packages.id"), nullable=True)
-    credits_added = Column(Integer)
+    draft_credits_added = Column(Integer)
     
     coupon_id = Column(Integer, ForeignKey("coupons.id"), nullable=True)
     discount_amount = Column(Integer, default=0) # In paise

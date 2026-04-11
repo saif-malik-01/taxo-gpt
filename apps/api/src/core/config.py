@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     SESSION_TOKEN_LIMIT_DRAFT: int = 60000   
     SESSION_TOKEN_LIMIT_SIMPLE: int = 100000
 
+    # Trial / Welcome Package Defaults (Fallbacks)
+    DEFAULT_SIMPLE_CREDITS: int = 1000000
+    DEFAULT_DRAFT_CREDITS: int = 3
+    DEFAULT_VALIDITY_DAYS: int = 365
+
     # Logging Configuration
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "logs/app.log"

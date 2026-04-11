@@ -27,6 +27,7 @@ from apps.api.src.schemas.auth import (
 )
 from apps.api.src.schemas.user import ProfileUpdate
 from apps.api.src.services.email import EmailService
+from apps.api.src.services.payments import initialize_user_credits
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request, db: AsyncS
                 await db.refresh(user)
 
                 db.add(UserProfile(user_id=user.id))
-                db.add(UserUsage(user_id=user.id))
+                await initialize_user_credits(user.id, db)
                 await db.commit()
 
         # Always verify if social login was successful
@@ -180,7 +181,7 @@ async def facebook_login(payload: FacebookLoginRequest, request: Request, db: As
                 await db.commit()
                 await db.refresh(user)
                 db.add(UserProfile(user_id=user.id))
-                db.add(UserUsage(user_id=user.id))
+                await initialize_user_credits(user.id, db)
                 await db.commit()
 
         # Always verify if social login was successful
@@ -233,10 +234,7 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     await db.refresh(new_user)
 
     db.add(UserProfile(user_id=new_user.id))
-    db.add(UserUsage(
-        user_id=new_user.id,
-        credits_expire_at=datetime.now(timezone.utc) + timedelta(days=365)
-    ))
+    await initialize_user_credits(new_user.id, db)
     await db.commit()
 
     EmailService.send_verification_email(email=email, token=verification_token, full_name=payload.full_name)
@@ -407,11 +405,7 @@ async def get_credits(user=Depends(auth_guard)):
         )
         usage = res.scalars().first()
         if not usage:
-            usage = UserUsage(
-                user_id=user_id,
-                credits_expire_at=datetime.now(timezone.utc) + timedelta(days=365)
-            )
-            db.add(usage)
+            usage = await initialize_user_credits(user_id, db)
             await db.commit()
         
         return {

@@ -17,6 +17,47 @@ logger = logging.getLogger(__name__)
 # Initialize Razorpay client
 client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
+async def get_welcome_package_settings(db: AsyncSession):
+    """
+    Retrieves the credits and validity settings from the default package.
+    Falls back to hardcoded config settings if no default package is found.
+    """
+    res = await db.execute(select(CreditPackage).where(CreditPackage.is_default == True, CreditPackage.is_active == True))
+    default_pkg = res.scalars().first()
+    
+    if default_pkg:
+        return {
+            "simple_credits": default_pkg.simple_credits,
+            "draft_credits": default_pkg.draft_credits,
+            "validity_days": default_pkg.validity_days
+        }
+    
+    return {
+        "simple_credits": settings.DEFAULT_SIMPLE_CREDITS,
+        "draft_credits": settings.DEFAULT_DRAFT_CREDITS,
+        "validity_days": settings.DEFAULT_VALIDITY_DAYS
+    }
+
+async def initialize_user_credits(user_id: int, db: AsyncSession):
+    """
+    Creates or updates UserUsage for a new user using the Welcome Package settings.
+    """
+    data = await get_welcome_package_settings(db)
+    
+    res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
+    usage = res.scalars().first()
+    
+    if not usage:
+        usage = UserUsage(user_id=user_id)
+        db.add(usage)
+        await db.flush()
+        
+    usage.simple_query_balance = data["simple_credits"]
+    usage.draft_reply_balance = data["draft_credits"]
+    usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=data["validity_days"])
+    
+    return usage
+
 async def assign_invoice_number(db: AsyncSession, transaction: PaymentTransaction):
     """
     Generates and assigns an invoice number following the TB/YY-YY/NNN pattern.
@@ -82,7 +123,7 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         order_id = f"free_{uuid.uuid4().hex}"
         transaction = PaymentTransaction(
             user_id=user_id, order_id=order_id, payment_id="free_activation",
-            amount=final_amount, package_id=package.id, credits_added=package.credits_added,
+            amount=final_amount, package_id=package.id, draft_credits_added=package.draft_credits,
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="completed"
         )
         db.add(transaction)
@@ -94,13 +135,14 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         if not usage:
             usage = UserUsage(user_id=user_id); db.add(usage); await db.flush()
             
-        usage.draft_reply_balance += package.credits_added
+        usage.draft_reply_balance += package.draft_credits
         
-        # Reset expiration to 1 year from now on purchase
-        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=365)
+        # Calculate expiration based on package validity (default 365)
+        days = package.validity_days or 365
+        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=days)
         
         db.add(CreditLog(
-            user_id=user_id, amount=package.credits_added, credit_type="draft",
+            user_id=user_id, amount=package.draft_credits, credit_type="draft",
             transaction_type="purchase", reference_id=order_id
         ))
         
@@ -114,7 +156,7 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         razorpay_order = client.order.create(data=order_data)
         transaction = PaymentTransaction(
             user_id=user_id, order_id=razorpay_order['id'], amount=final_amount,
-            package_id=package.id, credits_added=package.credits_added,
+            package_id=package.id, draft_credits_added=package.draft_credits,
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="pending"
         )
         db.add(transaction); await db.commit()
@@ -129,7 +171,11 @@ async def verify_payment(order_id: str, payment_id: str, signature: str, db: Asy
             'razorpay_order_id': order_id, 'razorpay_payment_id': payment_id, 'razorpay_signature': signature
         })
         
-        res = await db.execute(select(PaymentTransaction).where(PaymentTransaction.order_id == order_id))
+        res = await db.execute(
+            select(PaymentTransaction)
+            .options(joinedload(PaymentTransaction.package))
+            .where(PaymentTransaction.order_id == order_id)
+        )
         transaction = res.scalars().first()
         if not transaction or transaction.status == "completed": return False
         
@@ -141,12 +187,16 @@ async def verify_payment(order_id: str, payment_id: str, signature: str, db: Asy
         if not usage:
             usage = UserUsage(user_id=transaction.user_id); db.add(usage); await db.flush()
             
-        usage.draft_reply_balance += transaction.credits_added
+        usage.draft_reply_balance += transaction.draft_credits_added
         
-        # Reset expiration to 1 year from now on purchase
-        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=365)
+        # Calculate expiration based on package validity (default 365)
+        days = 365
+        if transaction.package:
+            days = transaction.package.validity_days or 365
+            
+        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=days)
         db.add(CreditLog(
-            user_id=transaction.user_id, amount=transaction.credits_added, credit_type="draft",
+            user_id=transaction.user_id, amount=transaction.draft_credits_added, credit_type="draft",
             transaction_type="purchase", reference_id=transaction.order_id
         ))
         
@@ -187,7 +237,7 @@ async def send_invoice_background(order_id: str):
                     "package_name": full_tx.package.title if full_tx.package else "Credit Pack",
                     "amount": full_tx.amount or 0,
                     "discount": full_tx.discount_amount or 0,
-                    "credits": full_tx.credits_added or 0
+                    "credits": full_tx.draft_credits_added or 0
                 }
                 
                 pdf_bytes = InvoiceGenerator.generate_invoice_pdf(transaction_info)
