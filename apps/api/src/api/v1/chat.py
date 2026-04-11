@@ -131,12 +131,13 @@ async def ask_gst_stream_simple(
     async def stream_generator():
         try:
             # ── Handle Message (New vs Edit) ──────────────────────────────
+            history = await get_session_history(session_id)
+            is_first_message = len(history) == 0
+
             if payload.message_id:
                 await edit_message_and_truncate(session_id, payload.message_id, question)
             else:
                 await add_message(session_id, "user", question, user_id)
-
-            history = await get_session_history(session_id)
 
             profile = await get_user_profile(user_id)
             profile_summary = profile.dynamic_summary if profile else None
@@ -176,9 +177,8 @@ async def ask_gst_stream_simple(
                     "message_id": bot_msg.id
                 }) + "\n"
 
-            # ── Track usage: deduct 1 credit, log tokens ────────────────────
-            # force_deduct=True: every question deducts 1 from simple_query_balance
-            await track_usage(user_id, session_id, usage=llm_usage, force_deduct=True)
+            # ── Track usage: deduct 1 credit if first message, log tokens ────────────────────
+            await track_usage(user_id, session_id, usage=llm_usage, force_deduct=is_first_message, chat_mode="simple")
 
             # ── Auto-update Profile (Background) ───────────────────────────────
             is_new_session = len(history) <= 1

@@ -202,13 +202,17 @@ async def check_credits(user_id: int, session_id: str, db: AsyncSession = None, 
             await db.commit()
             return False, "Your credits have expired on {}. Please purchase a new package to continue.".format(expire_at.strftime("%Y-%m-%d"))
 
-    # --- Guard 1: Balance check ---
-    if chat_mode == "draft":
-        if (usage.draft_reply_balance or 0) <= 0:
-            return False, "Insufficient Draft Reply balance. Please upgrade your plan."
-    else:
-        if (usage.simple_query_balance or 0) <= 0:
-            return False, "Insufficient Simple Query balance. Please upgrade your plan."
+    # --- Guard 1: Balance check (Only for NEW sessions) ---
+    session_exists = await db.execute(select(ChatSession.id).where(ChatSession.id == session_id, ChatSession.user_id == user_id))
+    is_new_session = session_exists.scalar() is None
+
+    if is_new_session:
+        if chat_mode == "draft":
+            if (usage.draft_reply_balance or 0) <= 0:
+                return False, "Insufficient Draft Reply balance. Please upgrade your plan."
+        else:
+            if (usage.simple_query_balance or 0) <= 0:
+                return False, "Insufficient Tax Intelligence balance. Please upgrade your plan."
 
     # --- Guard 2: Monthly token abuse guard (lazy 30-day rolling window reset) ---
     now = datetime.now(timezone.utc)
