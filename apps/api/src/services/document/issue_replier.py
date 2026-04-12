@@ -212,7 +212,8 @@ You will be given:
 === OUTPUT FORMAT ===
 Use professional Markdown formatting:
   1. Use **bold** for section numbers, act names, notification numbers, and case citations.
-  2. Use `### Issue X` headers (if not provided by the system).
+  2. Use `## Issue X` headers (if not provided by the system).
+  3. Use horizontal rules `---` between issues if outputting multiple.
   3. Use double newlines `\n\n` between every paragraph to ensure proper rendering.
   4. You MAY use bullet points for lists of conditions or specific requirements to improve readability.
   5. Write in formal legal prose. Cite sections as: '**Section X of the CGST Act, 2017**' or '**Rule X of the CGST Rules, 2017**'.

@@ -445,7 +445,7 @@ def _build_summary_and_issues_header(active_case: dict) -> str:
             text = iss.get("issue_text", "")
             if len(text) > 2000:
                 text = text[:1997] + "..."
-            lines.append(f"**{iss.get('id', '?')}.** {text}{icon}")
+            lines.append(f"**Issue {iss.get('id', '?')}:**\n{text}{icon}")
             lines.append("")
         pending = sum(1 for i in issues if not i.get("reply") and i.get("status") not in ("replied", "has_reply_doc"))
         replied = sum(1 for i in issues if i.get("reply"))
@@ -506,14 +506,8 @@ async def _handle_show_summary(active_case: dict, session_id: str, user_id: int)
 
 async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], session_id: str, user_id: int, question: str, background_tasks: BackgroundTasks, snapshot: dict, skip_confirmation: bool = False) -> AsyncGenerator[str, None]:
     mode = active_case.get("mode", MODE_DEFENSIVE)
-    if not skip_confirmation and active_case.get("state") not in ("issue_confirmation_sent", "awaiting_issue_confirmation"):
-        msg = f"I'll draft {len(issues_to_draft)} issue(s). Say **'go ahead'** to start."
-        yield _content(msg)
-        active_case["state"] = "awaiting_issue_confirmation"
-        active_case["_pending_draft_ids"] = [i.get("id") for i in issues_to_draft]
-        asst = await add_message(session_id, "assistant", msg, user_id)
-        yield _retrieval_event(document_analysis=snapshot_for_display(active_case))
-        return
+    # Direct drafting — no confirmation gate
+    active_case["state"] = "drafting"
     hdr = f"Drafting {len(issues_to_draft)} Issue(s)...\n\n"
     yield _content(hdr)
     full = hdr
@@ -525,7 +519,7 @@ async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], s
         
         display_num = target_issue.get("id", i_num) if target_issue else i_num
         
-        header = f"\n\n### Issue {display_num}\n\n"
+        header = f"\n\n---\n\n## Reply {display_num}\n\n"
         yield _content(header)
         full += header
         for i in range(0, len(reply), 100):

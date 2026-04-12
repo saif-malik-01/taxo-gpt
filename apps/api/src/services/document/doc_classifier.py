@@ -173,7 +173,7 @@ Return this JSON:
   }},
   "reference_number": "verbatim reference number or null",
   "date": "DD-MM-YYYY or null",
-  "brief_summary": "<=400 chars, all legal entities preserved",
+  "brief_summary": "Concise high-density summary (<=400 chars). Use **bold** for amounts, section numbers, and key dates.",
   "confidence": 0-100,
   "intent": "summarize|draft_direct|draft_all|draft_specific|query_document|query_general|update_issues|confirm_mode|null",
   "mode": "defensive|in_favour|null",
@@ -609,14 +609,12 @@ ALREADY EXTRACTED ISSUES (do NOT re-extract — skip anything substantially simi
 {existing_issues}
 
 MANDATORY RULES:
-1. Extract VERBATIM — preserve exact wording, ALL amounts, ALL section numbers, \
-ALL GSTINs, ALL periods, ALL rates.
-2. Do NOT split. One issue = one allegation as framed by the authority.
-3. Do NOT merge. Separate numbered paragraphs or clearly different allegations = \
-separate issues.
-4. Do NOT extract procedural text (reply-by dates, officer signatures, date headers, \
-acknowledgments).
-5. Only extract substantive allegations requiring a reply.
+1. Extract VERBATIM — preserve exact wording, ALL amounts, ALL section numbers, ALL GSTINs, ALL periods, ALL rates.
+2. For readability in the chat interface, use **bold** for all section numbers, amounts (with currency), and dates within the extracted text.
+3. Do NOT split. One issue = one allegation as framed by the authority.
+4. Do NOT merge. Separate numbered paragraphs or clearly different allegations = separate issues.
+5. Do NOT extract procedural text (reply-by dates, officer signatures, date headers, acknowledgments).
+6. Only extract substantive allegations requiring a reply.
 6. Per-issue size limit: keep each issue under 800 words. If an allegation is longer, \
 preserve the core legal charge and all key figures (amounts, sections, periods); \
 condense only narrative repetition.
