@@ -595,7 +595,7 @@ _SINGLE_MAX_TOK = 16384   # max_tokens for docs that fit in one call
 
 _ISSUE_SYSTEM = (
     "You are a legal issues extractor for Indian tax proceedings. "
-    "Return ONLY valid JSON — no markdown, no explanation."
+    "Return ONLY valid JSON. Do not wrap the JSON in ``` blocks. You MUST use rich markdown (bolding, lists) inside the JSON string values."
 )
 
 _ISSUE_PROMPT = """\
@@ -609,10 +609,10 @@ ALREADY EXTRACTED ISSUES (do NOT re-extract — skip anything substantially simi
 {existing_issues}
 
 MANDATORY RULES:
-1. Extract VERBATIM — preserve exact wording.
+1. Extract VERBATIM but APPLY RICH MARKDOWN FORMATTING. Use bullet points (`- `), line breaks (`\n\n`), and proper spacing to structure long paragraphs into readable sections. Critical: Do NOT alter the original legal wording, factual details, or core phrasing — only apply cosmetic formatting.
 2. For readability in the chat interface, use **bold** for all section numbers, amounts (with currency symbols), and date ranges within the extracted text (e.g., 'The authority alleges short payment under **Section 73** of **₹10,500** for **July 2017**').
-3. Do NOT split. One issue = one allegation as framed by the authority.
-4. Do NOT merge. Separate numbered paragraphs or clearly different allegations = separate issues.
+3. Do NOT split into multiple array items if it's the same allegation. One issue = one allegation as framed by the authority, but use markdown to structure the text beautifully within that single issue.
+4. Do NOT merge. Separate numbered paragraphs or clearly different allegations = separate issues in the JSON array.
 5. Do NOT extract procedural text (reply-by dates, officer signatures, date headers, acknowledgments).
 6. Only extract substantive allegations requiring a reply.
 7. Per-issue size limit: keep each issue under 800 words. If an allegation is longer, \
@@ -622,11 +622,11 @@ condense only narrative repetition.
 the issue text.
 9. Return an empty list if this segment contains no new allegations.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON. Make sure to properly escape newlines as `\n` inside the JSON strings:
 {{
   "issues": [
-    "Full verbatim text of issue 1 (under 800 words)...",
-    "Full verbatim text of issue 2..."
+    "**Allegation 1:**\n\nExtracted verbatim text with **bolding** and\n- Bullet points if applicable...",
+    "**Allegation 2:**\n\nAnother beautifully formatted issue..."
   ]
 }}"""
 
@@ -647,11 +647,13 @@ Pay special attention to:
 - Any allegation not covered in the previously extracted list
 
 Extract ONLY the additional issues not already listed.
+Apply rich markdown formatting (bullet points, bolding, line breaks as `\n\n`) to make the text highly readable. Critical: Do NOT alter the original legal wording, factual details, or core phrasing — only apply cosmetic formatting.
+Make sure to properly escape newlines as `\n` inside the JSON strings.
 Per-issue size limit: 800 words.
 Return empty list if no additional issues found.
 
 Return ONLY valid JSON:
-{{"issues": ["Additional issue text..."]}}"""
+{{"issues": ["**Additional Issue:**\n\nFormatted text with bullet points and bolding..."]}}"""
 
 
 def _make_segments(text: str) -> List[str]:
