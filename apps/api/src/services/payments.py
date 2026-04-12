@@ -56,6 +56,16 @@ async def initialize_user_credits(user_id: int, db: AsyncSession):
     usage.draft_reply_balance = data["draft_credits"]
     usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=data["validity_days"])
     
+    # Log initial welcome credits
+    db.add(CreditLog(
+        user_id=user_id, amount=data["simple_credits"], credit_type="simple",
+        transaction_type="purchase", reference_id="welcome_package"
+    ))
+    db.add(CreditLog(
+        user_id=user_id, amount=data["draft_credits"], credit_type="draft",
+        transaction_type="purchase", reference_id="welcome_package"
+    ))
+    
     return usage
 
 async def assign_invoice_number(db: AsyncSession, transaction: PaymentTransaction):

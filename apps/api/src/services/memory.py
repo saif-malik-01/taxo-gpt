@@ -154,6 +154,10 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
             if user_usage.draft_reply_balance != -1:
                 user_usage.draft_reply_balance = max(0, (user_usage.draft_reply_balance or 0) - 1)
                 logger.info(f"Deducted 1 DRAFT credit for user {user_id}. Remaining: {user_usage.draft_reply_balance}")
+                db.add(CreditLog(
+                    user_id=user_id, amount=-1, credit_type="draft",
+                    transaction_type="usage", reference_id=session_id
+                ))
             else:
                 logger.info(f"User {user_id} has UNLIMITED DRAFT credits. Skipping deduction.")
         else:
@@ -161,6 +165,10 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
             if user_usage.simple_query_balance != -1:
                 user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 0) - 1)
                 logger.info(f"Deducted 1 SIMPLE credit for user {user_id}. Remaining: {user_usage.simple_query_balance}")
+                db.add(CreditLog(
+                    user_id=user_id, amount=-1, credit_type="simple",
+                    transaction_type="usage", reference_id=session_id
+                ))
             else:
                 logger.info(f"User {user_id} has UNLIMITED SIMPLE credits. Skipping deduction.")
         
