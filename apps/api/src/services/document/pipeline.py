@@ -434,6 +434,7 @@ def _build_summary_and_issues_header(active_case: dict) -> str:
         lines.append("")
     s = (active_case.get("summary") or "").strip()
     if s:
+        lines.append("**Case Summary:**")
         lines.append(s)
         lines.append("")
     issues = active_case.get("issues", [])
