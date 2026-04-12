@@ -1,8 +1,7 @@
-from apps.api.src.services.llm.bedrock import call_bedrock
+from apps.api.src.services.llm.bedrock import get_async_bedrock_client, _strip_thinking
 from apps.api.src.db.session import AsyncSessionLocal
 from apps.api.src.db.models.base import UserProfile
 from sqlalchemy import select
-from starlette.concurrency import run_in_threadpool
 import json
 import logging
 
@@ -55,10 +54,20 @@ Output Format (JSON only):
   "ongoing_goals": ["Enduring career/business goals. Example: 'Wants to specialize in SEZ consulting'"]
 }}"""
 
-            raw_output, usage = await run_in_threadpool(call_bedrock, extraction_prompt)
+            llm = await get_async_bedrock_client()
+            raw_output = await llm.call(
+                system_prompt="",
+                user_message=extraction_prompt,
+                max_tokens=1024,
+                temperature=0.0,
+                label="memory_update",
+            )
 
             if not raw_output or "NONE" in raw_output.upper():
                 return False
+
+            # strip Qwen3 thinking block before JSON parsing
+            raw_output = _strip_thinking(raw_output)
 
             # 3. Parse and Merge
             try:

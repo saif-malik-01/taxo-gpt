@@ -18,6 +18,7 @@ from sqlalchemy import text
 from apps.api.src.db.session import engine, get_redis
 from apps.api.src.services.chat.engine import get_pipeline
 from apps.api.src.services.document.issue_replier import set_pipeline
+from apps.api.src.services.llm.bedrock import close_async_bedrock_client
 from starlette.concurrency import run_in_threadpool
 
 # Environment Settings for Transformers Cache (from main.py)
@@ -124,7 +125,10 @@ async def shutdown_event():
     logger.info(f"Shutting down {settings.PROJECT_NAME}...")
     try:
         stop_scheduler()
-    except ImportError: pass
+    except ImportError:
+        pass
+    await close_async_bedrock_client()
+    logger.info("Async Bedrock client closed")
 
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")

@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple
 
-from apps.api.src.services.llm.bedrock import BedrockLLMClient
+from apps.api.src.services.llm.bedrock import AsyncBedrockLLMClient
 from apps.api.src.services.rag.models import (
     CitationResult, FinalResponse, IntentResult, SessionMessage, Stage2AResult, Stage2BResult,
 )
@@ -19,10 +19,10 @@ class LLMResponder:
     Orchestrates the LLM generation stage of the retrieval pipeline.
     """
 
-    def __init__(self, llm: BedrockLLMClient):
+    def __init__(self, llm: AsyncBedrockLLMClient):
         self._llm = llm
 
-    def generate_stream(
+    async def generate_stream(
         self,
         query: str,
         history: List[SessionMessage],
@@ -33,11 +33,11 @@ class LLMResponder:
         citation_res: CitationResult,
     ):
         """
-        Yields text chunks and then follows with metadata JSON block.
+        Async generator — yields text chunks then a metadata JSON block.
         """
         system, user = self._build_prompts(query, history, a2, b2, intent, top_chunks, citation_res)
-        
-        for chunk in self._llm.call_stream(system, user, label="stage6_stream"):
+
+        async for chunk in self._llm.call_stream(system, user, label="stage6_stream"):
             yield chunk
 
         # Metadata event

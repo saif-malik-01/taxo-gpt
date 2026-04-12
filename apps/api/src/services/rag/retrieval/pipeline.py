@@ -14,13 +14,12 @@ Flow:
 import os
 import logging
 from typing import List, Optional
-from starlette.concurrency import run_in_threadpool
 
 from qdrant_client import AsyncQdrantClient
 
 from apps.api.src.core.config import settings
 from apps.api.src.services.rag.pipeline.bm25_vectorizer import BM25Vectorizer
-from apps.api.src.services.llm.bedrock import BedrockLLMClient
+from apps.api.src.services.llm.bedrock import AsyncBedrockLLMClient, get_async_bedrock_client
 from apps.api.src.services.rag.retrieval.citation_lookup import CitationLookup
 from apps.api.src.services.rag.retrieval.extractor import (
     CombinedExtractor, Stage1Clarifier, build_bm25_keyword_document,
@@ -49,18 +48,24 @@ class RetrievalPipeline:
         )
 
         self._bm25      = BM25Vectorizer()
-        self._llm       = BedrockLLMClient()
+        self._llm: AsyncBedrockLLMClient = None  # set in setup()
 
-        self._clarifier  = Stage1Clarifier(self._llm)
-        self._extractor  = CombinedExtractor(self._llm)
+        self._clarifier  = None  # set in setup() after async client is ready
+        self._extractor  = None
         self._citation   = CitationLookup(self._qdrant)
         self._retrieval  = QdrantRetrieval(self._qdrant, self._bm25)
         self._scorer     = MetadataScorer()
         self._enricher   = CrossRefEnricher(self._qdrant)
-        self._responder  = LLMResponder(self._llm, self._qdrant)
+        self._responder  = None  # set in setup()
 
     async def setup(self):
         logger.info("Pipeline setup starting...")
+
+        # Initialise the async Bedrock client (singleton — shared across requests)
+        self._llm = await get_async_bedrock_client()
+        self._clarifier = Stage1Clarifier(self._llm)
+        self._extractor = CombinedExtractor(self._llm)
+        self._responder = LLMResponder(self._llm, self._qdrant)
 
         try:
             collections_list = await self._qdrant.get_collections()
@@ -105,14 +110,10 @@ class RetrievalPipeline:
         session_history: List[SessionMessage],
     ):
         # -- Stage 1 ---------------------------------------------------
-        final_query = await run_in_threadpool(
-            self._clarifier.clarify, user_query, session_history
-        )
+        final_query = await self._clarifier.clarify(user_query, session_history)
 
         # -- Stage 2 ---------------------------------------------------
-        stage2a, stage2b, intent = await run_in_threadpool(
-            self._extractor.extract, final_query
-        )
+        stage2a, stage2b, intent = await self._extractor.extract(final_query)
         keyword_doc = build_bm25_keyword_document(stage2a, stage2b)
 
         # -- Stage 3: Citation (Sequential) ----------------------------

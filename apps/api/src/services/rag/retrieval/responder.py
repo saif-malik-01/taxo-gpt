@@ -12,7 +12,7 @@ from qdrant_client.http import models as qmodels
 
 import asyncio
 from apps.api.src.core.config import settings
-from apps.api.src.services.llm.bedrock import BedrockLLMClient
+from apps.api.src.services.llm.bedrock import AsyncBedrockLLMClient
 from apps.api.src.services.rag.models import (
     CitationResult, FinalResponse, IntentResult,
     ScoredChunk, SessionMessage,
@@ -187,7 +187,7 @@ class CrossRefEnricher:
 
 class LLMResponder:
 
-    def __init__(self, llm: BedrockLLMClient, qdrant: Optional[AsyncQdrantClient] = None):
+    def __init__(self, llm: AsyncBedrockLLMClient, qdrant: Optional[AsyncQdrantClient] = None):
         self._llm = llm
         self._qdrant = qdrant
 
@@ -215,7 +215,7 @@ class LLMResponder:
             f"chunks={len(top_chunks)} cross_refs={len(cross_ref_chunks)} "
             f"insufficient={insufficient})"
         )
-        answer = self._llm.call(
+        answer = await self._llm.call(
             system_prompt=system_prompt,
             user_message=user_message,
             max_tokens=_MAX_TOKENS_RESP,
@@ -242,8 +242,8 @@ class LLMResponder:
         intent: IntentResult,
     ):
         """
-        Streaming generation — yields text chunks as they arrive from Bedrock.
-        Uses a thread pool bridge to avoid blocking the event loop during sync Bedrock calls.
+        Streaming generation — yields text chunks directly from Bedrock.
+        No thread bridge. No queue. No blocking. Pure async generator.
         """
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
@@ -260,38 +260,14 @@ class LLMResponder:
         )
         retrieved_docs = await _build_docs_list(top_chunks, cross_ref_chunks, citation_result, self._qdrant)
 
-        loop = asyncio.get_running_loop()
-        queue = asyncio.Queue(maxsize=128)
-
-        def _stream_to_queue():
-            try:
-                for chunk in self._llm.call_stream(
-                    system_prompt=system_prompt,
-                    user_message=user_message,
-                    max_tokens=_MAX_TOKENS_RESP,
-                    temperature=0.1,
-                    label="stage6_stream",
-                ):
-                    asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result(timeout=30)
-            except Exception as e:
-                logger.error(f"Bedrock stream bridge failed: {e}")
-                asyncio.run_coroutine_threadsafe(
-                    queue.put({"__error__": str(e)}), loop
-                ).result(timeout=5)
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(timeout=5)
-
-        loop.run_in_executor(None, _stream_to_queue)
-
         usage_data: dict = {}
-        while True:
-            chunk = await queue.get()
-            if chunk is None:
-                break
-
-            if isinstance(chunk, dict) and "__error__" in chunk:
-                break
-
+        async for chunk in self._llm.call_stream(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            max_tokens=_MAX_TOKENS_RESP,
+            temperature=0.1,
+            label="stage6_stream",
+        ):
             if isinstance(chunk, str) and chunk.startswith("\n\n__USAGE__"):
                 try:
                     usage_data = _json.loads(chunk[len("\n\n__USAGE__"):])

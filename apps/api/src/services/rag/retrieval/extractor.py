@@ -4,14 +4,15 @@ Stage 1  -  Query clarification
 Stage 2A  -  Regex extraction (mirrors indexing L3)
 Stage 2B  -  LLM field extraction (mirrors indexing L1)
 Stage 2C  -  Intent + score_weights + response_hierarchy
-2A, 2B, 2C run in parallel.
+2A, 2B, 2C run in parallel via asyncio.gather.
 """
 
 import re
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
-from apps.api.src.services.llm.bedrock import BedrockLLMClient
+from apps.api.src.services.llm.bedrock import AsyncBedrockLLMClient
 from apps.api.src.services.rag.models import IntentResult, SessionMessage, Stage2AResult, Stage2BResult
 from apps.api.src.services.rag.retrieval.regex_fallback import extract_fallback
 from apps.api.src.core.normalizer import universal_normalise, whitespace_split_normalise
@@ -33,17 +34,17 @@ Return ONLY valid JSON:
 
 
 class Stage1Clarifier:
-    def __init__(self, llm: BedrockLLMClient):
+    def __init__(self, llm: AsyncBedrockLLMClient):
         self._llm = llm
 
-    def clarify(self, query: str, history: List[SessionMessage]) -> str:
+    async def clarify(self, query: str, history: List[SessionMessage]) -> str:
         if not history:
             return query
         hist_text = "\n".join(
             f"[{i+1}] User: {m.user_query}\n    Assistant: {m.llm_response[:300]}"
             for i, m in enumerate(history[-2:])
         )
-        result = self._llm.call_json(
+        result = await self._llm.call_json(
             system_prompt=_S1_SYSTEM,
             user_message=f"History (last 2 turns):\n{hist_text}\n\nCurrent query: {query}",
             max_tokens=512,
@@ -145,14 +146,14 @@ decision_type: "in_favour_of_assessee"|"in_favour_of_revenue"|"remanded"|"dismis
 
 
 class Stage2BLLM:
-    def __init__(self, llm: BedrockLLMClient):
+    def __init__(self, llm: AsyncBedrockLLMClient):
         self._llm = llm
 
-    def extract(self, query: str) -> Stage2BResult:
-        raw = self._llm.call_json(
+    async def extract(self, query: str) -> Stage2BResult:
+        raw = await self._llm.call_json(
             system_prompt=_S2B_SYSTEM,
             user_message=f"Query: {query}",
-            max_tokens=2048,  # Raised from 1024 — stage2b has 20 fields; complex queries exceed 1024 tokens
+            max_tokens=4096,  # Qwen3 thinking tokens consume budget; 4096 prevents truncation
             label="stage2b",
         )
         if not raw:
@@ -252,11 +253,11 @@ _STANDARD_HIERARCHY = [
 
 
 class Stage2CIntent:
-    def __init__(self, llm: BedrockLLMClient):
+    def __init__(self, llm: AsyncBedrockLLMClient):
         self._llm = llm
 
-    def classify(self, query: str) -> IntentResult:
-        raw = self._llm.call_json(
+    async def classify(self, query: str) -> IntentResult:
+        raw = await self._llm.call_json(
             system_prompt=_S2C_SYSTEM,
             user_message=f"Query: {query}",
             max_tokens=512,
@@ -294,31 +295,38 @@ class Stage2CIntent:
 # -- Combined extractor --------------------------------------------------------
 
 class CombinedExtractor:
-    def __init__(self, llm: BedrockLLMClient):
+    def __init__(self, llm: AsyncBedrockLLMClient):
         self._regex  = Stage2ARegex()
         self._llm2b  = Stage2BLLM(llm)
         self._intent = Stage2CIntent(llm)
 
-    def extract(
+    async def extract(
         self, query: str
     ) -> Tuple[Stage2AResult, Stage2BResult, IntentResult]:
-        results: Dict[str, Any] = {}
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            futs = {
-                ex.submit(self._regex.extract, query):   "2a",
-                ex.submit(self._llm2b.extract, query):   "2b",
-                ex.submit(self._intent.classify, query): "2c",
-            }
-            for fut in as_completed(futs):
-                key = futs[fut]
-                try:
-                    results[key] = fut.result()
-                except Exception as e:
-                    logger.error(f"Stage {key} failed: {e}")
-        a = results.get("2a") or Stage2AResult([], [], None)
-        b = results.get("2b") or Stage2BResult()
-        c = results.get("2c") or _default_intent()
-        return a, b, c
+        """
+        Runs all three stages in parallel:
+          - Stage2A (regex) in a thread executor (CPU-bound)
+          - Stage2B (LLM extraction) as native async I/O
+          - Stage2C (intent) as native async I/O
+        Zero blocking on the event loop.
+        """
+        loop = asyncio.get_running_loop()
+        regex_res, llm2b_res, intent_res = await asyncio.gather(
+            loop.run_in_executor(None, self._regex.extract, query),
+            self._llm2b.extract(query),
+            self._intent.classify(query),
+            return_exceptions=True,
+        )
+        if isinstance(regex_res, Exception):
+            logger.error(f"Stage 2A failed: {regex_res}")
+            regex_res = Stage2AResult([], [], None)
+        if isinstance(llm2b_res, Exception):
+            logger.error(f"Stage 2B failed: {llm2b_res}")
+            llm2b_res = Stage2BResult()
+        if isinstance(intent_res, Exception):
+            logger.error(f"Stage 2C failed: {intent_res}")
+            intent_res = _default_intent()
+        return regex_res, llm2b_res, intent_res
 
 
 # -- BM25 query expansion dictionary ------------------------------------------

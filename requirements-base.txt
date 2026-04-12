@@ -4,6 +4,7 @@ pydantic
 python-jose[cryptography]
 python-multipart
 boto3
+aioboto3>=13.0.0
 python-dotenv
 sqlalchemy
 asyncpg
