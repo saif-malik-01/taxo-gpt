@@ -199,6 +199,7 @@ class LLMResponder:
         cross_ref_chunks: List[Dict[str, Any]],
         citation_result: Optional[CitationResult],
         intent: IntentResult,
+        profile_summary: Optional[str] = None,
     ) -> FinalResponse:
         """Non-streaming generation — returns complete FinalResponse."""
         insufficient = bool(
@@ -207,7 +208,7 @@ class LLMResponder:
         system_prompt = _build_system_prompt(intent.response_hierarchy, insufficient)
         user_message  = self._build_context(
             final_query, session_history, top_chunks,
-            cross_ref_chunks, citation_result
+            cross_ref_chunks, citation_result, profile_summary
         )
         logger.info(
             f"Stage 6: generating response "
@@ -240,6 +241,7 @@ class LLMResponder:
         cross_ref_chunks: List[Dict[str, Any]],
         citation_result: Optional[CitationResult],
         intent: IntentResult,
+        profile_summary: Optional[str] = None,
     ):
         """
         Streaming generation — yields text chunks directly from Bedrock.
@@ -251,7 +253,7 @@ class LLMResponder:
         system_prompt = _build_system_prompt(intent.response_hierarchy, insufficient)
         user_message  = self._build_context(
             final_query, session_history, top_chunks,
-            cross_ref_chunks, citation_result
+            cross_ref_chunks, citation_result, profile_summary
         )
         logger.info(
             f"Stage 6 stream: generating "
@@ -291,8 +293,14 @@ class LLMResponder:
         top_chunks: List[ScoredChunk],
         cross_refs: List[Dict],
         citation_result: Optional[CitationResult],
+        profile_summary: Optional[str] = None,
     ) -> str:
         parts = []
+
+        if profile_summary:
+            parts.append("=== USER PROFILE ===")
+            parts.append(profile_summary)
+            parts.append("")
 
         if history:
             parts.append("=== CONVERSATION HISTORY (for context only — use ONLY if the current query explicitly references a prior exchange; do not let history bias or anchor the current answer) ===")

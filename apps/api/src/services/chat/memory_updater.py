@@ -25,33 +25,26 @@ async def auto_update_profile(user_id: int, query: str, response: str):
             current_summary = profile.dynamic_summary or "No facts known yet."
 
             # 2. Extract ONLY explicit user attributes from the user's own message
-            extraction_prompt = f"""You are a background system that extracts PERMANENT, LONG-TERM user attributes from a message. 
+            extraction_prompt = f"""You are a memory editor for a user persona. Your job is to take the OLD profile, analyze the NEW message, and output a properly reconciled profile by extracting PERMANENT, LONG-TERM user attributes.
 
-Your goal is to extract ONLY facts that will still be true and useful 6 months from now.
-
-STRICT EXTRACTION RULES:
+STRICT RULES:
 1. ONLY extract information the user EXPLICITLY stated about themselves.
-2. ONLY extract: 
-   - Profession/Designation (e.g. "CA", "Advocate", "Business Owner")
-   - Industry/Sector (e.g. "Real Estate", "Exports", "E-commerce")
-   - Technical Profile (e.g. "Composition taxpayer", "SEZ unit")
-   - Permanent Preferences (e.g. "always give me sections first", "respond in Hindi")
-3. NEVER extract:
-   - Case names, party names, or legal citations.
-   - Specific questions, problems, or transient issues ("I have a notice today").
-   - Names of clients or temporary project details.
-   - Opinions or feelings that might change.
-4. "IF IN DOUBT, LEAVE IT OUT": If a fact seems temporary, specific to a single interaction, or ambiguous, do not extract it.
-5. If NO permanent long-term facts are explicitly stated, output exactly "NONE".
+2. RECONCILE outdated facts. If the new message contradicts the old profile (e.g., from "Unregistered" to "Registered"), REPLACE the old fact. Do not keep contradictions.
+3. NEVER extract temporary facts, specific questions, case names, or opinions that might change.
+4. If the new message contains NO new permanent facts, output the facts exactly as they were in the OLD profile.
+5. "IF IN DOUBT, LEAVE IT OUT": If a fact seems temporary, do not include it.
 
-User Message to Analyze:
+OLD User Profile (Current Facts):
+{current_summary}
+
+NEW User Message:
 {query}
 
 Output Format (JSON only):
 {{
   "user_preferences": ["Style/language preferences. Example: 'Prefers Hindi responses'"],
-  "facts": ["Self-identity facts. Example: 'CA by profession', 'Works in Exports'"],
-  "ongoing_goals": ["Enduring career/business goals. Example: 'Wants to specialize in SEZ consulting'"]
+  "facts": ["Current self-identity facts only. Example: 'Registered GST taxpayer'"],
+  "ongoing_goals": ["Enduring career/business goals."]
 }}"""
 
             llm = await get_async_bedrock_client()
@@ -79,38 +72,26 @@ Output Format (JSON only):
 
                 new_data = json.loads(json_str)
 
-                # Update Preferences (JSON)
+                # Update Preferences (JSON) - REPLACEMENT logic
                 current_preferences = profile.preferences or {}
                 new_prefs_list = new_data.get("user_preferences", [])
+                
+                # Replace tags entirely with reconciled list from LLM
+                current_preferences["extracted_tags"] = new_prefs_list
+                profile.preferences = current_preferences
 
-                if new_prefs_list:
-                    if "extracted_tags" not in current_preferences:
-                        current_preferences["extracted_tags"] = []
-                    for pref in new_prefs_list:
-                        if pref not in current_preferences["extracted_tags"]:
-                            current_preferences["extracted_tags"].append(pref)
-                    profile.preferences = current_preferences
-
-                # Update Dynamic Summary (Text)
+                # Update Dynamic Summary (Text) - REPLACEMENT logic
                 new_summary_items = []
                 for item in new_data.get("facts", []):
                     new_summary_items.append(f"- {item}")
                 for item in new_data.get("ongoing_goals", []):
                     new_summary_items.append(f"- Goal: {item}")
 
-                if new_summary_items:
-                    new_summary_text = "\n".join(new_summary_items)
-
-                    if current_summary == "No facts known yet." or not current_summary:
-                        updated_summary = new_summary_text
-                    else:
-                        final_lines = current_summary.split("\n")
-                        for line in new_summary_items:
-                            if line not in final_lines:
-                                final_lines.append(line)
-                        updated_summary = "\n".join(final_lines)
-
-                    profile.dynamic_summary = updated_summary.strip()
+                updated_summary = "\n".join(new_summary_items).strip()
+                if updated_summary:
+                    profile.dynamic_summary = updated_summary
+                elif current_summary != "No facts known yet.":
+                    pass # Don't overwrite with empty if nothing returned
 
                 from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(profile, "preferences")

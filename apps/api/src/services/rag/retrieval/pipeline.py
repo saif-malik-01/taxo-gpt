@@ -141,6 +141,7 @@ class RetrievalPipeline:
         chunks,
         citation_result,
         intent,
+        profile_summary: Optional[str] = None
     ):
         cross_refs = await self._enricher.enrich(chunks) if chunks else []
         async for chunk in self._responder.generate_stream(
@@ -150,6 +151,7 @@ class RetrievalPipeline:
             cross_ref_chunks=cross_refs,
             citation_result=citation_result if citation_result and citation_result.found else None,
             intent=intent,
+            profile_summary=profile_summary
         ):
             yield chunk
     

@@ -52,12 +52,12 @@ async def chat_stream(
 
     pipeline = await get_pipeline()
 
-    final_query = f"[User Profile: {profile_summary}]\n{query}" if profile_summary else query
+    final_query = query
     session_history = _map_history(history)
 
     staged = await pipeline.query_stages_1_to_5(final_query, session_history)
 
-    async for chunk in pipeline.query_stage_6_stream(*staged):
+    async for chunk in pipeline.query_stage_6_stream(*staged, profile_summary=profile_summary):
         if isinstance(chunk, str) and chunk.startswith("\n\n__META__"):
             try:
                 meta = json.loads(chunk.replace("\n\n__META__", ""))
