@@ -98,7 +98,11 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
     coupon = None
     
     if coupon_code:
-        res_c = await db.execute(select(Coupon).where(Coupon.code == coupon_code, Coupon.is_active == True))
+        res_c = await db.execute(
+            select(Coupon)
+            .options(joinedload(Coupon.package))
+            .where(Coupon.code == coupon_code, Coupon.is_active == True)
+        )
         coupon = res_c.scalars().first()
         
         if not coupon:
@@ -109,6 +113,8 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
             raise ValueError("Coupon is not valid yet")
         if coupon.valid_until and coupon.valid_until < now:
             raise ValueError("Coupon has expired")
+        if coupon.package_id and coupon.package_id != package.id:
+            raise ValueError(f"Coupon is only valid for package: {coupon.package.title if coupon.package else coupon.package_id}")
         if coupon.max_uses and coupon.current_uses >= coupon.max_uses:
             raise ValueError("Coupon maximum usage limit reached")
             
@@ -123,7 +129,9 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         order_id = f"free_{uuid.uuid4().hex}"
         transaction = PaymentTransaction(
             user_id=user_id, order_id=order_id, payment_id="free_activation",
-            amount=final_amount, package_id=package.id, draft_credits_added=package.draft_credits,
+            amount=final_amount, package_id=package.id, 
+            draft_credits_added=package.draft_credits,
+            simple_credits_added=package.simple_credits,
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="completed"
         )
         db.add(transaction)
@@ -135,7 +143,15 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         if not usage:
             usage = UserUsage(user_id=user_id); db.add(usage); await db.flush()
             
-        usage.draft_reply_balance += package.draft_credits
+        if package.draft_credits == -1:
+            usage.draft_reply_balance = -1
+        else:
+            usage.draft_reply_balance = -1 if usage.draft_reply_balance == -1 else (usage.draft_reply_balance or 0) + package.draft_credits
+            
+        if package.simple_credits == -1:
+            usage.simple_query_balance = -1
+        else:
+            usage.simple_query_balance = -1 if usage.simple_query_balance == -1 else (usage.simple_query_balance or 0) + package.simple_credits
         
         # Calculate expiration based on package validity (default 365)
         days = package.validity_days or 365
@@ -143,6 +159,10 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         
         db.add(CreditLog(
             user_id=user_id, amount=package.draft_credits, credit_type="draft",
+            transaction_type="purchase", reference_id=order_id
+        ))
+        db.add(CreditLog(
+            user_id=user_id, amount=package.simple_credits, credit_type="simple",
             transaction_type="purchase", reference_id=order_id
         ))
         
@@ -156,7 +176,9 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         razorpay_order = client.order.create(data=order_data)
         transaction = PaymentTransaction(
             user_id=user_id, order_id=razorpay_order['id'], amount=final_amount,
-            package_id=package.id, draft_credits_added=package.draft_credits,
+            package_id=package.id, 
+            draft_credits_added=package.draft_credits,
+            simple_credits_added=package.simple_credits,
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="pending"
         )
         db.add(transaction); await db.commit()
@@ -187,16 +209,29 @@ async def verify_payment(order_id: str, payment_id: str, signature: str, db: Asy
         if not usage:
             usage = UserUsage(user_id=transaction.user_id); db.add(usage); await db.flush()
             
-        usage.draft_reply_balance += transaction.draft_credits_added
-        
-        # Calculate expiration based on package validity (default 365)
-        days = 365
         if transaction.package:
-            days = transaction.package.validity_days or 365
+            # Update Draft Credits
+            if transaction.draft_credits_added == -1:
+                usage.draft_reply_balance = -1
+            else:
+                usage.draft_reply_balance = -1 if usage.draft_reply_balance == -1 else (usage.draft_reply_balance or 0) + (transaction.draft_credits_added or 0)
             
-        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=days)
+            # Update Simple Credits (Tax Intelligence)
+            if transaction.simple_credits_added == -1:
+                usage.simple_query_balance = -1
+            else:
+                usage.simple_query_balance = -1 if usage.simple_query_balance == -1 else (usage.simple_query_balance or 0) + (transaction.simple_credits_added or 0)
+
+            # Update Expiration
+            days = transaction.package.validity_days or 365
+            usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=days)
+
         db.add(CreditLog(
             user_id=transaction.user_id, amount=transaction.draft_credits_added, credit_type="draft",
+            transaction_type="purchase", reference_id=transaction.order_id
+        ))
+        db.add(CreditLog(
+            user_id=transaction.user_id, amount=transaction.simple_credits_added, credit_type="simple",
             transaction_type="purchase", reference_id=transaction.order_id
         ))
         
@@ -237,7 +272,8 @@ async def send_invoice_background(order_id: str):
                     "package_name": full_tx.package.title if full_tx.package else "Credit Pack",
                     "amount": full_tx.amount or 0,
                     "discount": full_tx.discount_amount or 0,
-                    "credits": full_tx.draft_credits_added or 0
+                    "draft_credits": full_tx.draft_credits_added or 0,
+                    "simple_credits": full_tx.simple_credits_added or 0
                 }
                 
                 pdf_bytes = InvoiceGenerator.generate_invoice_pdf(transaction_info)
@@ -256,7 +292,11 @@ async def validate_coupon_logic(coupon_code: str, package_name: str, db: AsyncSe
     """
     Validates a coupon against a package and returns calculation details.
     """
-    res_c = await db.execute(select(Coupon).where(Coupon.code == coupon_code, Coupon.is_active == True))
+    res_c = await db.execute(
+        select(Coupon)
+        .options(joinedload(Coupon.package))
+        .where(Coupon.code == coupon_code, Coupon.is_active == True)
+    )
     coupon = res_c.scalars().first()
     if not coupon: raise ValueError("Invalid or inactive coupon")
     
@@ -265,12 +305,16 @@ async def validate_coupon_logic(coupon_code: str, package_name: str, db: AsyncSe
         raise ValueError("Coupon is not valid yet")
     if coupon.valid_until and coupon.valid_until < now:
         raise ValueError("Coupon has expired")
-    if coupon.max_uses and coupon.current_uses >= coupon.max_uses:
-        raise ValueError("Coupon maximum usage limit reached")
     
     res_p = await db.execute(select(CreditPackage).where(CreditPackage.name == package_name, CreditPackage.is_active == True))
     pkg = res_p.scalars().first()
     if not pkg: raise ValueError("Invalid package name")
+
+    if coupon.package_id and coupon.package_id != pkg.id:
+        raise ValueError(f"Coupon is only valid for package: {coupon.package.title if coupon.package else coupon.package_id}")
+
+    if coupon.max_uses and coupon.current_uses >= coupon.max_uses:
+        raise ValueError("Coupon maximum usage limit reached")
     
     discount = 0
     if coupon.discount_type == 'fixed': discount = coupon.discount_value

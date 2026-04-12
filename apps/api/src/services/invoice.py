@@ -73,8 +73,20 @@ class InvoiceGenerator:
         # --- Table Body ---
         pdf.set_font("Helvetica", "", 10)
         package_title = transaction_data.get("package_name") or "Credit Package"
-        credits_count = transaction_data.get("credits") or 0
-        pdf.cell(110, 12, f" {package_title} ({credits_count} Credits)", border=1)
+        
+        draft_count = transaction_data.get("draft_credits") 
+        simple_count = transaction_data.get("simple_credits")
+        
+        def format_credit(val):
+            if val == -1: return "Unlimited"
+            return str(val or 0)
+
+        desc_parts = []
+        if draft_count: desc_parts.append(f"{format_credit(draft_count)} Draft")
+        if simple_count: desc_parts.append(f"{format_credit(simple_count)} Tax Intelligence")
+        
+        credit_str = ", ".join(desc_parts) if desc_parts else "0 Credits"
+        pdf.cell(110, 12, f" {package_title} ({credit_str})", border=1)
         pdf.cell(30, 12, " 1", border=1, align="C")
         
         amount_paise = transaction_data.get("amount") or 0

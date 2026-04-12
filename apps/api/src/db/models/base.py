@@ -124,6 +124,7 @@ class PaymentTransaction(Base):
     
     package_id = Column(Integer, ForeignKey("credit_packages.id"), nullable=True)
     draft_credits_added = Column(Integer)
+    simple_credits_added = Column(Integer, default=0)
     
     coupon_id = Column(Integer, ForeignKey("coupons.id"), nullable=True)
     discount_amount = Column(Integer, default=0) # In paise
@@ -147,9 +148,14 @@ class Coupon(Base):
     current_uses = Column(Integer, default=0)
     valid_from = Column(DateTime(timezone=True), nullable=True)
     valid_until = Column(DateTime(timezone=True), nullable=True)
+    
+    package_id = Column(Integer, ForeignKey("credit_packages.id"), nullable=True) # If null, coupon is global
+    
     is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    package = relationship("CreditPackage")
 
 
 class ChatMessage(Base):

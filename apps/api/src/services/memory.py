@@ -151,12 +151,18 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
     if force_deduct:
         if chat_mode == "draft":
             user_usage.draft_reply_used = (user_usage.draft_reply_used or 0) + 1
-            user_usage.draft_reply_balance = max(0, (user_usage.draft_reply_balance or 0) - 1)
-            logger.info(f"Deducted 1 DRAFT credit for user {user_id}. Remaining: {user_usage.draft_reply_balance}")
+            if user_usage.draft_reply_balance != -1:
+                user_usage.draft_reply_balance = max(0, (user_usage.draft_reply_balance or 0) - 1)
+                logger.info(f"Deducted 1 DRAFT credit for user {user_id}. Remaining: {user_usage.draft_reply_balance}")
+            else:
+                logger.info(f"User {user_id} has UNLIMITED DRAFT credits. Skipping deduction.")
         else:
             user_usage.simple_query_used = (user_usage.simple_query_used or 0) + 1
-            user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 0) - 1)
-            logger.info(f"Deducted 1 SIMPLE credit for user {user_id}. Remaining: {user_usage.simple_query_balance}")
+            if user_usage.simple_query_balance != -1:
+                user_usage.simple_query_balance = max(0, (user_usage.simple_query_balance or 0) - 1)
+                logger.info(f"Deducted 1 SIMPLE credit for user {user_id}. Remaining: {user_usage.simple_query_balance}")
+            else:
+                logger.info(f"User {user_id} has UNLIMITED SIMPLE credits. Skipping deduction.")
         
         # --- Low credit notification (Target: specifically 1 credit left) ---
         if user_usage.simple_query_balance == 1 and user_usage.user:
@@ -208,10 +214,12 @@ async def check_credits(user_id: int, session_id: str, db: AsyncSession = None, 
 
     if is_new_session:
         if chat_mode == "draft":
-            if (usage.draft_reply_balance or 0) <= 0:
+            balance = usage.draft_reply_balance or 0
+            if balance != -1 and balance <= 0:
                 return False, "Insufficient Draft Reply balance. Please upgrade your plan."
         else:
-            if (usage.simple_query_balance or 0) <= 0:
+            balance = usage.simple_query_balance or 0
+            if balance != -1 and balance <= 0:
                 return False, "Insufficient Tax Intelligence balance. Please upgrade your plan."
 
     # --- Guard 2: Monthly token abuse guard (lazy 30-day rolling window reset) ---

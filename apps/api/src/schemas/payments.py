@@ -39,12 +39,14 @@ class CouponCreate(BaseModel):
     max_uses: Optional[int] = None
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
+    package_id: Optional[int] = None
     is_active: Optional[bool] = True
 
 class CouponUpdate(BaseModel):
     is_active: Optional[bool] = None
     max_uses: Optional[int] = None
     valid_until: Optional[datetime] = None
+    package_id: Optional[int] = None
 
 class CouponValidateRequest(BaseModel):
     coupon_code: str
@@ -75,6 +77,7 @@ class CouponResponse(BaseModel):
     current_uses: int
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
+    package_id: Optional[int] = None
     is_active: bool
     created_at: datetime
 
@@ -101,6 +104,7 @@ class TransactionResponse(BaseModel):
     amount: Optional[int] = 0
     currency: Optional[str] = "INR"
     draft_credits_added: Optional[int] = 0
+    simple_credits_added: Optional[int] = 0
     discount_amount: Optional[int] = 0
     status: Optional[str] = "pending"
     created_at: Optional[datetime] = None
