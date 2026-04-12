@@ -43,7 +43,7 @@ NEW User Message:
 Output Format (JSON only):
 {{
   "user_preferences": ["Style/language preferences. Example: 'Prefers Hindi responses'"],
-  "facts": ["Current self-identity facts only. Example: 'Registered GST taxpayer'"],
+  "facts": ["Current self-identity facts only (e.g. Name, Profession, Business type). Example: 'Name is Rahul', 'Registered GST taxpayer'"],
   "ongoing_goals": ["Enduring career/business goals."]
 }}"""
 
