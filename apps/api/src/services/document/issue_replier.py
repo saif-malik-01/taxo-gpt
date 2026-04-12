@@ -210,9 +210,13 @@ You will be given:
 {mode_block}
 
 === OUTPUT FORMAT ===
-Write in formal legal language as paragraph-form prose (not bullet points).
-Cite sections as: 'Section X of the CGST Act, 2017' or 'Rule X of the CGST Rules, 2017'.
-Cite judgments as: '[Case Name] — [Court] — [Year] — [Citation if available]'.
+Use professional Markdown formatting:
+  1. Use **bold** for section numbers, act names, notification numbers, and case citations.
+  2. Use `### Issue X` headers (if not provided by the system).
+  3. Use double newlines `\n\n` between every paragraph to ensure proper rendering.
+  4. You MAY use bullet points for lists of conditions or specific requirements to improve readability.
+  5. Write in formal legal prose. Cite sections as: '**Section X of the CGST Act, 2017**' or '**Rule X of the CGST Rules, 2017**'.
+  6. Cite judgments as: '**[Case Name] — [Court] — [Year] — [Citation]**'.
 Do not add a subject line, salutation, or closing — only the substantive reply paragraphs."""
 
 _MODE_BLOCK_DEFENSIVE = """\
