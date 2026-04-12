@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 async def hydrate_sources(source_ids: List[str], qdrant: AsyncQdrantClient) -> List[Dict[str, Any]]:
     """
-    Fetches sources from Qdrant by ID and reconstructs full judgments if needed.
+    Fetches sources from Qdrant by ID.
     """
     if not source_ids:
         return []
@@ -71,7 +71,6 @@ async def hydrate_sources(source_ids: List[str], qdrant: AsyncQdrantClient) -> L
         )
         
         seen_identifiers = set()
-        judgment_tasks: List[tuple[int, Any]] = []
 
         for r in results:
             if not r.payload: continue
@@ -88,40 +87,14 @@ async def hydrate_sources(source_ids: List[str], qdrant: AsyncQdrantClient) -> L
             
             summary["chunk_id"] = str(r.id)
             
-            if is_judgment:
-                idx = len(hydrated_sources)
-                judgment_tasks.append((idx, _fetch_full_judgment(qdrant, payload)))
-            
-            if not is_judgment:
-                try:
-                    await redis.setex(
-                        f"hydrated_source:{r.id}", 86400, json.dumps(summary)
-                    )
-                except Exception:
-                    pass
+            try:
+                await redis.setex(
+                    f"hydrated_source:{r.id}", 86400, json.dumps(summary)
+                )
+            except Exception:
+                pass
 
             hydrated_sources.append(summary)
-            
-        if judgment_tasks:
-            idxs = [i for i, _ in judgment_tasks]
-            coros = [c for _, c in judgment_tasks]
-            full_judgments = await asyncio.gather(*coros, return_exceptions=True)
-            
-            for idx, full_data in zip(idxs, full_judgments):
-                if isinstance(full_data, Exception):
-                    logger.error(f"Judgment task error: {full_data}")
-                    full_data = None
-                if full_data:
-                    hydrated_sources[idx]["full_judgment"] = full_data
-                try:
-                    pt_id = hydrated_sources[idx]["chunk_id"]
-                    await redis.setex(
-                        f"hydrated_source:{pt_id}",
-                        86400,
-                        json.dumps(hydrated_sources[idx]),
-                    )
-                except Exception:
-                    pass
 
     except Exception as e:
         logger.error(f"Hydration error for IDs {ids_to_fetch}: {e}")

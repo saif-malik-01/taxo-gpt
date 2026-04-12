@@ -545,7 +545,6 @@ async def _build_docs_list(
     """
     docs = []
     seen_identifiers: set = set()
-    judgments_to_fetch = {}
 
     def _add(payload: Dict, label: str, score: float, chunk_id: str = None) -> None:
         ext = payload.get("ext") or {}
@@ -568,9 +567,6 @@ async def _build_docs_list(
         resolved_id = chunk_id or payload.get("_point_id") or payload.get("chunk_id") or payload.get("id")
         if resolved_id:
             summary_dict["chunk_id"] = str(resolved_id)
-        
-        if payload.get("chunk_type") == "judgment":
-            judgments_to_fetch[identifier] = payload
             
         docs.append(summary_dict)
 
@@ -583,25 +579,6 @@ async def _build_docs_list(
     for chunk in cross_refs:
         _add(chunk, "cross_reference", 0.0)
         
-    if qdrant and judgments_to_fetch:
-        tasks = [
-            _fetch_full_judgment(qdrant, payload)
-            for ident, payload in judgments_to_fetch.items()
-        ]
-        fetched_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for i, (ident, _) in enumerate(judgments_to_fetch.items()):
-            full_data = fetched_results[i]
-            if isinstance(full_data, Exception):
-                logger.error(f"Error fetching full judgment for {ident}: {full_data}")
-                continue
-                
-            if full_data:
-                for d in docs:
-                    if d.get("identifier") == ident:
-                        d["full_judgment"] = full_data
-                        break
-
     return docs
 
 async def _fetch_full_judgment(qdrant: AsyncQdrantClient, payload: Dict) -> Dict:

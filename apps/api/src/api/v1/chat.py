@@ -448,3 +448,55 @@ async def get_document_view_url(
         raise HTTPException(status_code=404, detail="Document not found or inaccessible")
     
     return {"url": url, "expires_in": 3600}
+
+@router.get("/chat/sources/{source_id}")
+async def get_source_by_id(
+    source_id: str,
+    user=Depends(auth_guard)
+):
+    """
+    Fetches a source chunk by its ID (point ID).
+    If the chunk is a judgment, it fully generates and returns the complete judgment.
+    """
+    import uuid
+    from apps.api.src.services.chat.engine import get_pipeline
+    from apps.api.src.core.config import settings
+    from apps.api.src.services.rag.retrieval.responder import _doc_summary, _fetch_full_judgment
+    
+    try:
+        uuid.UUID(source_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid source_id format. Must be a valid UUID.")
+
+    pipeline = await get_pipeline()
+    qdrant = pipeline._qdrant
+    
+    try:
+        res = await qdrant.retrieve(
+            collection_name=settings.QDRANT_COLLECTION,
+            ids=[source_id],
+            with_payload=True
+        )
+    except Exception as e:
+        logger.error(f"Error fetching source {source_id}: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching source")
+        
+    if not res or not res[0].payload:
+        raise HTTPException(status_code=404, detail="Source not found")
+        
+    payload = res[0].payload
+    
+    # Generate base summary dict
+    chunk_data = _doc_summary(payload, "retrieved", 0.0)
+    chunk_data["chunk_id"] = str(res[0].id)
+    
+    # Add full_judgment explicitly if applicable
+    if payload.get("chunk_type") == "judgment":
+        try:
+            full_judgment = await _fetch_full_judgment(qdrant, payload)
+            if full_judgment:
+                chunk_data["full_judgment"] = full_judgment
+        except Exception as e:
+            logger.error(f"Failed to fetch full judgment for {source_id}: {e}")
+            
+    return chunk_data
