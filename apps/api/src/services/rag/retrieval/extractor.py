@@ -210,6 +210,11 @@ Analyse the query and return:
             compliance, "what is", "explain", "define", "section X", "rule X",
             "meaning of", "applicability". DEFAULT to GENERAL when in doubt.
 
+   CHIT_CHAT: user just says hi, hello, thank you, or asks your name/identity.
+              WARNING: If the query has ANY GST/Tax question alongside a greeting (e.g., "Hi, what is the rate of GST on..."), DO NOT use CHIT_CHAT. Classify as the appropriate tax intent.
+
+   OUT_OF_SCOPE: completely unrelated topics (cooking, medical, coding, non-tax laws) OR malicious/harmful prompts.
+
 2. CONFIDENCE: 0-100.
    Be conservative  -  default to GENERAL if unsure. Set confidence < 70 if unclear.
 

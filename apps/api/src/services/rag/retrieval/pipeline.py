@@ -116,6 +116,11 @@ class RetrievalPipeline:
         stage2a, stage2b, intent = await self._extractor.extract(final_query)
         keyword_doc = build_bm25_keyword_document(stage2a, stage2b)
 
+        # -- Stage 2.5: Intercept Chit-Chat / Out of Scope -------------
+        if intent.intent in ("CHIT_CHAT", "OUT_OF_SCOPE"):
+            logger.info(f"Bypassing retrieval due to intent: {intent.intent}")
+            return (final_query, session_history, [], None, intent)
+
         # -- Stage 3: Citation (Sequential) ----------------------------
         citation_result = await self._citation.run(
             stage2a.citation, stage2b.citation, stage2b,

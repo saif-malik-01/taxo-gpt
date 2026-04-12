@@ -28,13 +28,18 @@ _TOP_CHUNKS_FOR_ENRICH = 5    # only inspect top-5 chunks for cross-refs
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
-def _build_system_prompt(hierarchy: List[str], insufficient: bool = False) -> str:
+def _build_system_prompt(hierarchy: List[str], insufficient: bool = False, intent_str: str = "GENERAL") -> str:
     """
     Builds a free-form system prompt.
     The hierarchy is used only to hint which types of material are in the
     context — the LLM is NOT forced into a fixed section structure.
     It answers the user query directly using whatever is in the retrieved context.
     """
+    if intent_str == "CHIT_CHAT":
+        return "You are an expert AI GST Assistant (Taxobuddy). The user has greeted you, asked your name, or engaged in small talk. Respond politely, briefly introduce yourself if necessary, and ask how you can help them with GST or Indian Tax Law today. Do not provide tax advice here."
+        
+    if intent_str == "OUT_OF_SCOPE":
+        return "You are an expert AI GST Assistant (Taxobuddy). The user has asked a question completely outside the scope of Indian Tax/GST, or asked for coding/medical/unrelated advice, or provided a malicious prompt. Politely but firmly decline to answer, stating clearly that you are exclusively programmed designed to assist only with Indian GST and Tax laws."
     # Map hierarchy keys to plain-language hints about what context is available
     _CONTENT_HINTS = {
         "act":                       "statutory provisions",
@@ -205,7 +210,7 @@ class LLMResponder:
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
         )
-        system_prompt = _build_system_prompt(intent.response_hierarchy, insufficient)
+        system_prompt = _build_system_prompt(intent.response_hierarchy, insufficient, intent.intent)
         user_message  = self._build_context(
             final_query, session_history, top_chunks,
             cross_ref_chunks, citation_result, profile_summary
@@ -250,7 +255,7 @@ class LLMResponder:
         insufficient = bool(
             top_chunks and max(c.score for c in top_chunks) < 0.005
         )
-        system_prompt = _build_system_prompt(intent.response_hierarchy, insufficient)
+        system_prompt = _build_system_prompt(intent.response_hierarchy, insufficient, intent.intent)
         user_message  = self._build_context(
             final_query, session_history, top_chunks,
             cross_ref_chunks, citation_result, profile_summary
