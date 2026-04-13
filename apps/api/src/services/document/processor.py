@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_DPI = int(os.getenv("NOVA_LITE_DPI", "150"))
+_DPI = int(os.getenv("NOVA_LITE_DPI", "300"))
 _MAX_PAGES_PER_DOC = 200
 
 _PAGE_EXTRACTION_PROMPT = (

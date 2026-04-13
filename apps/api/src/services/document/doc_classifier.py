@@ -262,10 +262,10 @@ def _get_entity_extractors():
     if _stage2a_regex is None:
         with _entity_extractor_lock:
             if _stage2a_regex is None:
-                from apps.api.src.services.rag.retrieval.extractor import Stage2ARegex, Stage2BLLM
+                from apps.api.src.services.rag.retrieval.extractor import Stage2ARegex, SyncStage2BLLM
                 _stage2a_regex = Stage2ARegex()
-                _stage2b_llm   = Stage2BLLM(_get_llm())
-                logger.info("Stage2ARegex + Stage2BLLM initialised for Step 2B")
+                _stage2b_llm   = SyncStage2BLLM(_get_llm())
+                logger.info("Stage2ARegex + SyncStage2BLLM initialised for Step 2B")
     return _stage2a_regex, _stage2b_llm
 
 

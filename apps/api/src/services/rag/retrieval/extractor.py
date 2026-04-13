@@ -186,6 +186,47 @@ class Stage2BLLM:
             return Stage2BResult()
 
 
+class SyncStage2BLLM:
+    def __init__(self, llm):
+        self._llm = llm
+
+    def extract(self, query: str) -> Stage2BResult:
+        raw = self._llm.call_json(
+            system_prompt=_S2B_SYSTEM,
+            user_message=f"Query: {query}",
+            max_tokens=4096,  # Qwen3 thinking tokens consume budget; 4096 prevents truncation
+            label="stage2b",
+        )
+        if not raw:
+            return Stage2BResult()
+        try:
+            return Stage2BResult(
+                sections      = _lst(raw.get("sections")),
+                rules         = _lst(raw.get("rules")),
+                notifications = _lst(raw.get("notifications")),
+                circulars     = _lst(raw.get("circulars")),
+                acts          = _lst(raw.get("acts")),
+                keywords      = _lst(raw.get("keywords")),
+                topics        = _lst(raw.get("topics")),
+                form_name     = _opt(raw.get("form_name")),
+                form_number   = _opt(raw.get("form_number")),
+                case_name     = _opt(raw.get("case_name")),
+                parties       = _lst(raw.get("parties")),
+                person_names  = _lst(raw.get("person_names")),
+                case_number   = _opt(raw.get("case_number")),
+                court         = _opt(raw.get("court")),
+                court_level   = _opt(raw.get("court_level")),
+                citation      = _normalise_citation(_opt(raw.get("citation"))),
+                decision_type = _opt(raw.get("decision_type")),
+                hsn_code      = _opt(raw.get("hsn_code")),
+                sac_code      = _opt(raw.get("sac_code")),
+                issued_by     = _opt(raw.get("issued_by")),
+            )
+        except Exception as e:
+            logger.error(f"Stage 2B (sync) build failed: {e}")
+            return Stage2BResult()
+
+
 # -- Stage 2C ------------------------------------------------------------------
 
 _S2C_SYSTEM = """You are an intent classifier for an Indian tax law chatbot.
