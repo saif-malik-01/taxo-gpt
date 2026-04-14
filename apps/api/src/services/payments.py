@@ -138,6 +138,13 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
     
     if not package:
         raise ValueError("Invalid or inactive package name")
+
+    # Fetch user to check onboarding status
+    user_res = await db.execute(select(User).where(User.id == user_id))
+    user = user_res.scalars().first()
+    
+    if package.is_default and user and user.onboarding_step == 2:
+        raise ValueError("This free package has already been claimed and is only available for first-time users.")
         
     final_amount = package.amount
     discount_amount = 0

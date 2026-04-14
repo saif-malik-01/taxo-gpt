@@ -1,7 +1,12 @@
 import uuid
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks, Response
+from fastapi.responses import StreamingResponse
+import io
+import openpyxl
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment, PatternFill
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, cast, Date, update
@@ -505,3 +510,97 @@ async def delete_coupon(coupon_id: int, admin_user=Depends(admin_guard), db: Asy
     await db.delete(coupon)
     await db.commit()
     return {"status": "deleted"}
+
+@router.get("/reports/mis/download")
+async def download_mis_report(
+    admin_user=Depends(admin_guard),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Generate and download an Excel MIS report of all users and their latest transaction details.
+    """
+    # Fetch all users with their usage and transactions
+    # We order transactions by created_at desc to easily pick the latest one
+    result = await db.execute(
+        select(User)
+        .options(
+            joinedload(User.usage),
+            joinedload(User.transactions).joinedload(PaymentTransaction.package)
+        )
+    )
+    users = result.unique().scalars().all()
+
+    # Create a new Workbook
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "User MIS Report"
+
+    # Define Columns
+    headers = [
+        "User Fullname", "Email", "Phone Number", "Referral Code", 
+        "User Created At", "Package Expiry", 
+        "Last Transaction Date", "Last Order ID", "Last Amount (INR)", 
+        "Last Package Name", "Last GSTIN"
+    ]
+
+    # Style header
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+    
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_num)
+        cell.value = header
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # Populate Data
+    for row_num, user in enumerate(users, 2):
+        # Find the latest completed transaction
+        completed_txns = sorted(
+            [t for t in user.transactions if t.status == "completed"],
+            key=lambda x: x.created_at,
+            reverse=True
+        )
+        last_txn = completed_txns[0] if completed_txns else None
+        
+        usage = user.usage
+        
+        data = [
+            user.full_name or "N/A",
+            user.email,
+            user.mobile_number or "N/A",
+            user.referral_code or "N/A",
+            user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else "N/A",
+            usage.credits_expire_at.strftime("%Y-%m-%d") if usage and usage.credits_expire_at else "N/A",
+            last_txn.created_at.strftime("%Y-%m-%d %H:%M") if last_txn else "N/A",
+            last_txn.order_id if last_txn else "N/A",
+            (last_txn.amount / 100) if last_txn else 0, # Convert paise to INR
+            last_txn.package.title if last_txn and last_txn.package else "N/A",
+            last_txn.user_gst_number if last_txn else (user.gst_number or "N/A")
+        ]
+        
+        for col_num, value in enumerate(data, 1):
+            ws.cell(row=row_num, column=col_num).value = value
+
+    # Auto-adjust column widths
+    for column_cells in ws.columns:
+        length = max(len(str(cell.value or "")) for cell in column_cells)
+        ws.column_dimensions[get_column_letter(column_cells[0].column)].width = length + 2
+
+    # Save to buffer
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    filename = f"MIS_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    headers = {
+        'Content-Disposition': f'attachment; filename="{filename}"'
+    }
+    
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers
+    )
