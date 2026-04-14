@@ -180,7 +180,7 @@ async def track_usage(user_id: int, session_id: str, db: AsyncSession = None, us
                     EmailService.send_low_credit_notification,
                     email=user_usage.user.email,
                     balance=1,
-                    credit_type="tax intelligence",
+                    credit_type="Query",
                     full_name=user_usage.user.full_name
                 )
                 logger.info(f"Low credit notification sent to user {user_id}")
@@ -224,11 +224,11 @@ async def check_credits(user_id: int, session_id: str, db: AsyncSession = None, 
         if chat_mode == "draft":
             balance = usage.draft_reply_balance or 0
             if balance != -1 and balance <= 0:
-                return False, "Insufficient Draft Reply balance. Please upgrade your plan."
+                return False, "Insufficient Draft balance. Please upgrade your plan."
         else:
             balance = usage.simple_query_balance or 0
             if balance != -1 and balance <= 0:
-                return False, "Insufficient Tax Intelligence balance. Please upgrade your plan."
+                return False, "Insufficient Query balance. Please upgrade your plan."
 
     # --- Guard 2: Monthly token abuse guard (lazy 30-day rolling window reset) ---
     now = datetime.now(timezone.utc)

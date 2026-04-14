@@ -97,7 +97,7 @@ class InvoiceGenerator:
 
         desc_parts = []
         if draft_count: desc_parts.append(f"{format_credit(draft_count)} Draft")
-        if simple_count: desc_parts.append(f"{format_credit(simple_count)} Tax Intelligence")
+        if simple_count: desc_parts.append(f"{format_credit(simple_count)} Query")
         
         credit_str = ", ".join(desc_parts) if desc_parts else ""
         full_desc = f"{package_title}"
@@ -121,23 +121,22 @@ class InvoiceGenerator:
         total_amount = amount_paise / 100
         
         # Reverse Calculation Logic:
-        # Since the amount paid is inclusive of 18% GST, we derive the taxable value
+        # We derive the taxable value from the total paid (which is 118% of the taxable value)
         taxable_value = total_amount / 1.18
         total_gst = total_amount - taxable_value
         
-        # For the description row price (base package before discount)
-        base_package_amount_paise = transaction_data.get("base_package_amount") or (amount_paise + discount_paise)
-        base_package_amount = (base_package_amount_paise / 100) / 1.18 if base_package_amount_paise > amount_paise else (base_package_amount_paise / 100)
+        # Gross Amount is the taxable value before any discount was subtracted
+        # (Assuming discount given was also inclusive of tax)
+        gross_amount = taxable_value + (discount_paise / 100 / 1.18)
 
-        pdf.cell(50, h, f" {base_package_amount:,.2f} ", border=1, align="R")
+        pdf.cell(50, h, f" {gross_amount:,.2f} ", border=1, align="R")
         pdf.set_xy(x, y + h) # Move to next line
         
         # --- Calculations ---
         pdf.ln(5)
         pdf.set_font("Helvetica", "B", 10)
         
-        # 1. Gross Amount (Taxable value before discount)
-        gross_amount = taxable_value + (discount_paise / 100 / 1.18)
+        # 1. Gross Amount 
         pdf.cell(140, 10, "Gross Amount ", border=0, align="R")
         pdf.cell(50, 10, f"INR {gross_amount:,.2f} ", border=1, align="R")
         pdf.ln()

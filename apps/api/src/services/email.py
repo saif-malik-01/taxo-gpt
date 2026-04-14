@@ -64,7 +64,7 @@ class EmailService:
                     <div class="brand">TaxoBuddy</div>
                     <div class="content">
                         <p>{name_greeting}</p>
-                        <p>Welcome to TaxoBuddy! We're excited to have you on board. To get started with professional tax intelligence, please verify your account by clicking the button below.</p>
+                        <p>Welcome to TaxoBuddy! We're excited to have you on board. To get started, please verify your account by clicking the button below.</p>
                         <div style="text-align: center;">
                             <a href="{verification_url}" class="button">Verify My Account</a>
                         </div>
@@ -154,7 +154,7 @@ class EmailService:
                         <p>If you have any questions or need further assistance, please don't hesitate to reach out to our support team.</p>
                     </div>
                     <div class="footer">
-                        © {datetime.now().year} TaxoBuddy Professional Tax Intelligence.<br>
+                        © {datetime.now().year} TaxoBuddy.<br>
                         This is an automated receipt for your recent transaction.
                     </div>
                 </div>
@@ -204,7 +204,7 @@ class EmailService:
                             <div class="balance-value">{balance}</div>
                         </div>
                         
-                        <p>To ensure uninterrupted access to TaxoBuddy's professional tax intelligence, we recommend topping up your account now.</p>
+                        <p>To ensure uninterrupted access to TaxoBuddy, we recommend topping up your account now.</p>
                         
                         <div style="text-align: center;">
                             <a href="{pricing_url}" class="button">Recharge Now</a>
@@ -213,7 +213,7 @@ class EmailService:
                         <p>If you recently made a purchase, please allow a few minutes for the credits to reflect in your account.</p>
                     </div>
                     <div class="footer">
-                        © {datetime.now().year} TaxoBuddy Professional Tax Intelligence.<br>
+                        © {datetime.now().year} TaxoBuddy<br>
                         This is an automated notification regarding your account balance.
                     </div>
                 </div>
@@ -246,7 +246,7 @@ class EmailService:
                     <div class="brand">TaxoBuddy</div>
                     <div class="content">
                         <p>{name_greeting}</p>
-                        <p>It's been a while since we last saw you on TaxoBuddy! We've been working hard to make our professional tax intelligence even more powerful and easier to use.</p>
+                        <p>It's been a while since we last saw you on TaxoBuddy! We've been working hard to make our platform even more powerful and easier to use.</p>
                         
                         <div class="feature-box">
                             <strong>What's waiting for you:</strong>
@@ -266,7 +266,7 @@ class EmailService:
                         <p>If you have any feedback on how we can improve, just reply to this email. We'd love to hear from you!</p>
                     </div>
                     <div class="footer">
-                        © {datetime.now().year} TaxoBuddy Professional Tax Intelligence.<br>
+                        © {datetime.now().year} TaxoBuddy<br>
                         You received this because you are a registered user of TaxoBuddy.
                     </div>
                 </div>
