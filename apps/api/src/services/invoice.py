@@ -158,7 +158,12 @@ class InvoiceGenerator:
             
         # 4. GST Breakdown
         gstin_to_check = str(user_gst).strip()
-        if gstin_to_check.startswith("06"):
+        user_state = (transaction_data.get("user_state") or "").strip().lower()
+        
+        # Haryana logic: if GSTIN starts with 06 OR if no valid GSTIN but state is Haryana
+        is_haryana = gstin_to_check.startswith("06") or (not gstin_to_check.startswith("06") and user_state == "haryana")
+
+        if is_haryana:
             half_gst = total_gst / 2
             pdf.cell(140, 10, "CGST (9%) ", border=0, align="R")
             pdf.cell(50, 10, f"INR {half_gst:,.2f} ", border=1, align="R")

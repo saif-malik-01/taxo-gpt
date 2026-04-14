@@ -357,7 +357,8 @@ async def send_invoice_background(order_id: str):
                     "base_package_amount": full_tx.package.amount if full_tx.package else 0,
                     "discount": full_tx.discount_amount or 0,
                     "draft_credits": full_tx.draft_credits_added or 0,
-                    "simple_credits": full_tx.simple_credits_added or 0
+                    "simple_credits": full_tx.simple_credits_added or 0,
+                    "user_state": full_tx.user.state if full_tx.user else None
                 }
                 
                 pdf_bytes = InvoiceGenerator.generate_invoice_pdf(transaction_info)

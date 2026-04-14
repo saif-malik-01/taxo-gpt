@@ -68,6 +68,9 @@ async def create_user_admin(payload: UserCreateAdmin, background_tasks: Backgrou
         referral_code=payload.referral_code,
         onboarding_step=2 if payload.package_id else 1
     )
+    if payload.max_sessions is not None:
+        new_user.max_sessions = payload.max_sessions
+        
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)

@@ -42,3 +42,4 @@ class UserCreateAdmin(BaseModel):
     referral_code: Optional[str] = None
     package_id: Optional[int] = None
     base_amount: Optional[int] = None # In Paise, exclusive of GST
+    max_sessions: Optional[int] = None
