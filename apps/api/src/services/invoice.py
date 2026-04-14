@@ -71,8 +71,9 @@ class InvoiceGenerator:
             pdf.cell(0, 6, f"GSTIN/UIN: {user_gst}", ln=True)
         if user_address:
             pdf.set_font("Helvetica", "", 10)
-            pdf.multi_cell(0, 6, f"Address: {user_address}")
-        pdf.ln(10)
+            # Remove "Address:" label and use constrained width for better wrapping block
+            pdf.multi_cell(100, 5, user_address)
+        pdf.ln(5)
         
         # --- Table Header ---
         pdf.set_fill_color(240, 240, 240)
