@@ -134,6 +134,7 @@ class EmailService:
                     .content {{ line-height: 1.6; color: #334155; }}
                     .amount-box {{ background: #f1f5f9; padding: 24px; border-radius: 14px; margin: 24px 0; border: 1px solid #e2e8f0; text-align: center; }}
                     .amount-value {{ font-size: 28px; font-weight: bold; color: #fb923c; }}
+                    .button {{ background: #fb923c; color: #ffffff !important; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; margin: 24px 0; text-align: center; }}
                     .footer {{ color: #64748b; font-size: 13px; margin-top: 32px; text-align: center; padding-top: 24px; border-top: 1px solid #e2e8f0; }}
                 </style>
             </head>
@@ -151,7 +152,24 @@ class EmailService:
                         </div>
                         
                         <p>We've attached your official tax invoice to this email for your records. Your purchased credits have been added to your account and are ready for use.</p>
-                        <p>If you have any questions or need further assistance, please don't hesitate to reach out to our support team.</p>
+                        
+                        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; margin: 24px 0;">
+                            <h3 style="margin-top: 0; color: #0f172a; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #e2e8f0; padding-bottom: 12px; margin-bottom: 16px;">Enjoy these premium features:</h3>
+                            <ul style="margin: 0; padding-left: 20px; line-height: 1.8; color: #475569; font-size: 14px;">
+                                <li><strong>0% Hallucination:</strong> Pure Logic Layer cross-checks against verified law.</li>
+                                <li><strong>Query & Draft Modes:</strong> Instant answers & professional drafts.</li>
+                                <li><strong>Real-Time Law Sync:</strong> Auto-updates latest circulars & judgements.</li>
+                                <li><strong>Case Law Intelligence:</strong> Access to 10,000+ HC & SC judgements.</li>
+                                <li><strong>Smart Regeneration:</strong> Refine drafts with adaptive AI tone matching.</li>
+                                <li><strong>Authority Citations:</strong> Click-to-verify sources for complete traceability.</li>
+                                <li><strong>Universal Export:</strong> Download findings as PDF, DOCX, and TXT.</li>
+                                <li><strong>Fortified Privacy:</strong> End-to-end encryption. Your data is never used for AI training.</li>
+                            </ul>
+                        </div>
+                        <div style="background: #fff7ed; padding: 24px; border-radius: 12px; margin-top: 32px; text-align: center;">
+                            <p style="margin-top: 0;">If you have any questions or need further assistance, please don't hesitate to reach out to our support team.</p>
+                            <a href="mailto:nikhil@taxo.online?subject=Support%20Request:%20Invoice%20{invoice_identifier}&body=Hi%20TaxoBuddy%20Support,%0A%0AI%20need%20help%20with%20my%20recent%20order%20{invoice_identifier}.%0A%0A" class="button" style="margin-bottom: 0;">Contact Support</a>
+                        </div>
                     </div>
                     <div class="footer">
                         © {datetime.now().year} TaxoBuddy.<br>
@@ -263,7 +281,10 @@ class EmailService:
                             <a href="{login_url}" class="button">Back to TaxoBuddy</a>
                         </div>
                         
-                        <p>If you have any feedback on how we can improve, just reply to this email. We'd love to hear from you!</p>
+                        <div style="background: #fff7ed; padding: 24px; border-radius: 12px; margin-top: 32px; text-align: center;">
+                            <p style="margin-top: 0;">If you have any feedback on how we can improve, we'd love to hear from you!</p>
+                            <a href="mailto:nikhil@taxo.online?subject=Feedback%20for%20TaxoBuddy&body=Hi%20TaxoBuddy%20Team,%0A%0AI%20wanted%20to%20share%20some%20feedback...%0A%0A" class="button" style="margin-bottom: 0; background: #475569;">Share Feedback</a>
+                        </div>
                     </div>
                     <div class="footer">
                         © {datetime.now().year} TaxoBuddy<br>
