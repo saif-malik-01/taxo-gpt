@@ -38,11 +38,15 @@ async def get_welcome_package_settings(db: AsyncSession):
         "validity_days": settings.DEFAULT_VALIDITY_DAYS
     }
 
-async def initialize_user_credits(user_id: int, db: AsyncSession):
+async def initialize_user_credits(user_id: int, db: AsyncSession, use_welcome_package: bool = False):
     """
-    Creates or updates UserUsage for a new user using the Welcome Package settings.
+    Creates or updates UserUsage for a new user.
+    If use_welcome_package is True, it applies default credits. Otherwise, starts at zero.
     """
-    data = await get_welcome_package_settings(db)
+    if use_welcome_package:
+        data = await get_welcome_package_settings(db)
+    else:
+        data = {"simple_credits": 0, "draft_credits": 0, "validity_days": 365}
     
     res = await db.execute(select(UserUsage).where(UserUsage.user_id == user_id))
     usage = res.scalars().first()
@@ -54,17 +58,21 @@ async def initialize_user_credits(user_id: int, db: AsyncSession):
         
     usage.simple_query_balance = data["simple_credits"]
     usage.draft_reply_balance = data["draft_credits"]
-    usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=data["validity_days"])
+    # If no validity set yet, set a default
+    if not usage.credits_expire_at:
+        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=data["validity_days"])
     
-    # Log initial welcome credits
-    db.add(CreditLog(
-        user_id=user_id, amount=data["simple_credits"], credit_type="simple",
-        transaction_type="purchase", reference_id="welcome_package"
-    ))
-    db.add(CreditLog(
-        user_id=user_id, amount=data["draft_credits"], credit_type="draft",
-        transaction_type="purchase", reference_id="welcome_package"
-    ))
+    # Log credits if any were added
+    if data["simple_credits"] > 0:
+        db.add(CreditLog(
+            user_id=user_id, amount=data["simple_credits"], credit_type="simple",
+            transaction_type="purchase", reference_id="welcome_package"
+        ))
+    if data["draft_credits"] > 0:
+        db.add(CreditLog(
+            user_id=user_id, amount=data["draft_credits"], credit_type="draft",
+            transaction_type="purchase", reference_id="welcome_package"
+        ))
     
     return usage
 
@@ -133,15 +141,24 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         elif coupon.discount_type == 'percentage':
             discount_amount = int(package.amount * (coupon.discount_value / 100))
             
-        final_amount = max(0, package.amount - discount_amount)
+        taxable_amount = max(0, package.amount - discount_amount)
+        gst_amount = taxable_amount * 0.18
+        
+        taxable_amount = round(taxable_amount, 2)
+        gst_amount = round(gst_amount, 2)
+        final_amount = round(taxable_amount + gst_amount, 2)
     
     if final_amount == 0:
         order_id = f"free_{uuid.uuid4().hex}"
+        res_user_gst = await db.execute(select(User.gst_number).where(User.id == user_id))
+        user_gst = res_user_gst.scalar()
+        
         transaction = PaymentTransaction(
             user_id=user_id, order_id=order_id, payment_id="free_activation",
             amount=final_amount, package_id=package.id, 
             draft_credits_added=package.draft_credits,
             simple_credits_added=package.simple_credits,
+            user_gst_number=user_gst,
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="completed"
         )
         db.add(transaction)
@@ -177,6 +194,12 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
         ))
         
         if coupon: coupon.current_uses += 1
+        
+        # Advance onboarding step
+        res_user = await db.execute(select(User).where(User.id == user_id))
+        user = res_user.scalars().first()
+        if user: user.onboarding_step = 2
+        
         await db.commit()
 
         return {"status": "success", "is_free": True, "order_id": order_id}
@@ -184,11 +207,15 @@ async def create_razorpay_order(user_id: int, package_name: str, coupon_code: st
     order_data = {"amount": final_amount, "currency": package.currency, "payment_capture": 1}
     try:
         razorpay_order = client.order.create(data=order_data)
+        res_user_gst = await db.execute(select(User.gst_number).where(User.id == user_id))
+        user_gst = res_user_gst.scalar()
+
         transaction = PaymentTransaction(
             user_id=user_id, order_id=razorpay_order['id'], amount=final_amount,
             package_id=package.id, 
             draft_credits_added=package.draft_credits,
             simple_credits_added=package.simple_credits,
+            user_gst_number=user_gst,
             coupon_id=coupon.id if coupon else None, discount_amount=discount_amount, status="pending"
         )
         db.add(transaction); await db.commit()
@@ -244,11 +271,15 @@ async def verify_payment(order_id: str, payment_id: str, signature: str, db: Asy
             user_id=transaction.user_id, amount=transaction.simple_credits_added, credit_type="simple",
             transaction_type="purchase", reference_id=transaction.order_id
         ))
-        
         if transaction.coupon_id:
             res_c = await db.execute(select(Coupon).where(Coupon.id == transaction.coupon_id))
             coupon = res_c.scalars().first()
             if coupon: coupon.current_uses += 1
+        
+        # Advance onboarding step
+        res_user = await db.execute(select(User).where(User.id == transaction.user_id))
+        user = res_user.scalars().first()
+        if user: user.onboarding_step = 2
         
         await db.commit()
         return True
@@ -279,8 +310,10 @@ async def send_invoice_background(order_id: str):
                     "date": full_tx.created_at or current_time,
                     "user_name": full_tx.user.full_name,
                     "user_email": full_tx.user.email,
+                    "user_gst": full_tx.user_gst_number or (full_tx.user.gst_number if full_tx.user else "N/A"),
                     "package_name": full_tx.package.title if full_tx.package else "Credit Pack",
                     "amount": full_tx.amount or 0,
+                    "base_package_amount": full_tx.package.amount if full_tx.package else 0,
                     "discount": full_tx.discount_amount or 0,
                     "draft_credits": full_tx.draft_credits_added or 0,
                     "simple_credits": full_tx.simple_credits_added or 0
@@ -330,4 +363,8 @@ async def validate_coupon_logic(coupon_code: str, package_name: str, db: AsyncSe
     if coupon.discount_type == 'fixed': discount = coupon.discount_value
     else: discount = int(pkg.amount * (coupon.discount_value / 100))
     
-    return {"valid": True, "discount_amount": discount, "final_amount": max(0, pkg.amount - discount)}
+    taxable_amount = max(0, pkg.amount - discount)
+    gst_amount = int(taxable_amount * 0.18)
+    final_amount = taxable_amount + gst_amount
+    
+    return {"valid": True, "discount_amount": discount, "taxable_amount": taxable_amount, "gst_amount": gst_amount, "final_amount": final_amount}

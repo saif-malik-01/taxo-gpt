@@ -24,6 +24,8 @@ class UserResponseAdmin(BaseModel):
     created_at: datetime
     google_id: Optional[str] = None
     facebook_id: Optional[str] = None
+    referral_code: Optional[str] = None
+    onboarding_step: Optional[int] = 1
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -37,3 +39,6 @@ class UserCreateAdmin(BaseModel):
     country: Optional[str] = None
     role: str = "user"
     is_verified: bool = True
+    referral_code: Optional[str] = None
+    package_id: Optional[int] = None
+    base_amount: Optional[int] = None # In Paise, exclusive of GST

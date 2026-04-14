@@ -116,7 +116,7 @@ async def google_login(payload: GoogleLoginRequest, request: Request, db: AsyncS
                 await db.refresh(user)
 
                 db.add(UserProfile(user_id=user.id))
-                await initialize_user_credits(user.id, db)
+                await initialize_user_credits(user.id, db, use_welcome_package=False)
                 await db.commit()
 
         # Always verify if social login was successful
@@ -181,7 +181,7 @@ async def facebook_login(payload: FacebookLoginRequest, request: Request, db: As
                 await db.commit()
                 await db.refresh(user)
                 db.add(UserProfile(user_id=user.id))
-                await initialize_user_credits(user.id, db)
+                await initialize_user_credits(user.id, db, use_welcome_package=False)
                 await db.commit()
 
         # Always verify if social login was successful
@@ -234,7 +234,7 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     await db.refresh(new_user)
 
     db.add(UserProfile(user_id=new_user.id))
-    await initialize_user_credits(new_user.id, db)
+    await initialize_user_credits(new_user.id, db, use_welcome_package=False)
     await db.commit()
 
     EmailService.send_verification_email(email=email, token=verification_token, full_name=payload.full_name)
@@ -383,7 +383,7 @@ async def get_me(user=Depends(auth_guard)):
             "user": {
                 "id": db_user.id, "email": db_user.email, "full_name": db_user.full_name,
                 "mobile_number": db_user.mobile_number, "state": db_user.state, "gst_number": db_user.gst_number,
-                "country": db_user.country, "role": db_user.role, 
+                "country": db_user.country, "role": db_user.role, "onboarding_step": db_user.onboarding_step,
                 "profile": {
                     "dynamic_summary": db_user.profile.dynamic_summary if db_user.profile else None,
                     "preferences": db_user.profile.preferences if db_user.profile else {}

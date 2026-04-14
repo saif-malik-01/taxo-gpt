@@ -1,6 +1,7 @@
+import uuid
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, cast, Date, update
@@ -15,8 +16,8 @@ from apps.api.src.schemas.payments import (
 from sqlalchemy.orm import joinedload
 from apps.api.src.schemas.user import UserResponseAdmin, UserCreateAdmin
 from apps.api.src.services.auth.utils import get_password_hash
-from apps.api.src.db.models.base import UserProfile, UserUsage, User, ChatSession, ChatMessage, CreditPackage, PaymentTransaction, Coupon
-from apps.api.src.services.payments import initialize_user_credits
+from apps.api.src.db.models.base import UserProfile, UserUsage, User, ChatSession, ChatMessage, CreditPackage, PaymentTransaction, Coupon, CreditLog
+from apps.api.src.services.payments import initialize_user_credits, assign_invoice_number, send_invoice_background
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -42,7 +43,7 @@ async def list_users(admin_user=Depends(admin_guard), db: AsyncSession = Depends
     return result.scalars().all()
 
 @router.post("/users", response_model=UserResponseAdmin)
-async def create_user_admin(payload: UserCreateAdmin, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
+async def create_user_admin(payload: UserCreateAdmin, background_tasks: BackgroundTasks, admin_user=Depends(admin_guard), db: AsyncSession = Depends(get_db)):
     email = payload.email.lower()
     # Check if exists
     result = await db.execute(select(User).where(func.lower(User.email) == email))
@@ -58,17 +59,75 @@ async def create_user_admin(payload: UserCreateAdmin, admin_user=Depends(admin_g
         gst_number=payload.gst_number,
         country=payload.country,
         role=payload.role,
-        is_verified=payload.is_verified
+        is_verified=payload.is_verified,
+        referral_code=payload.referral_code,
+        onboarding_step=2 if payload.package_id else 1
     )
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
 
-    # Initialize profile and credits using Welcome Package logic
+    # Initialize profile
     db.add(UserProfile(user_id=new_user.id))
-    await initialize_user_credits(new_user.id, db)
-    await db.commit()
     
+    # Initialize credits based on selection
+    order_id = None
+    if payload.package_id and payload.base_amount is not None:
+        # Fetch individual package details
+        pkg_res = await db.execute(select(CreditPackage).where(CreditPackage.id == payload.package_id))
+        pkg = pkg_res.scalars().first()
+        if not pkg:
+            raise HTTPException(status_code=400, detail="Invalid package ID")
+
+        # calculate final amount with GST (18%)
+        base_amount = payload.base_amount
+        gst_amount = round(base_amount * 0.18, 2)
+        total_amount = round(base_amount + gst_amount, 2)
+
+        # Create Payment Transaction (Admin Assigned)
+        order_id = f"admin_{uuid.uuid4().hex[:8]}"
+        transaction = PaymentTransaction(
+            user_id=new_user.id, order_id=order_id, payment_id="admin_assigned",
+            amount=int(total_amount), # Store in paise/cents
+            package_id=pkg.id, 
+            draft_credits_added=pkg.draft_credits,
+            simple_credits_added=pkg.simple_credits,
+            user_gst_number=payload.gst_number,
+            status="completed"
+        )
+        db.add(transaction)
+        await db.flush() # Get ID for invoice
+        await assign_invoice_number(db, transaction)
+
+        # Update Usage
+        usage = UserUsage(
+            user_id=new_user.id,
+            simple_query_balance=pkg.simple_credits,
+            draft_reply_balance=pkg.draft_credits,
+            credits_expire_at=datetime.now(timezone.utc) + timedelta(days=pkg.validity_days or 365)
+        )
+        db.add(usage)
+
+        # Log credits
+        db.add(CreditLog(
+            user_id=new_user.id, amount=pkg.simple_credits, credit_type="simple",
+            transaction_type="purchase", reference_id=order_id
+        ))
+        db.add(CreditLog(
+            user_id=new_user.id, amount=pkg.draft_credits, credit_type="draft",
+            transaction_type="purchase", reference_id=order_id
+        ))
+    else:
+        # Initialize with zero credits (Step 1)
+        await initialize_user_credits(new_user.id, db, use_welcome_package=False)
+    
+    await db.commit()
+    await db.refresh(new_user)
+    
+    # Send invoice email if a package was assigned
+    if payload.package_id and payload.base_amount is not None:
+        background_tasks.add_task(send_invoice_background, order_id=order_id)
+
     return new_user
 
 @router.get("/users/{user_id}", response_model=UserResponseAdmin)

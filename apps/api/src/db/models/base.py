@@ -26,6 +26,8 @@ class User(Base):
     reset_password_expires = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     reengagement_email_sent_at = Column(DateTime(timezone=True), nullable=True)
+    onboarding_step = Column(Integer, default=1) # 1: Registered, 2: Package Assigned
+    referral_code = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -68,8 +70,8 @@ class UserUsage(Base):
     user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
     
     # Balances (What is left to spend)
-    simple_query_balance = Column(Integer, default=1000000) 
-    draft_reply_balance = Column(Integer, default=3)
+    simple_query_balance = Column(Integer, default=0) 
+    draft_reply_balance = Column(Integer, default=0)
     
     # Lifetime usage (For analytics)
     simple_query_used = Column(Integer, default=0)
@@ -125,6 +127,7 @@ class PaymentTransaction(Base):
     package_id = Column(Integer, ForeignKey("credit_packages.id"), nullable=True)
     draft_credits_added = Column(Integer)
     simple_credits_added = Column(Integer, default=0)
+    user_gst_number = Column(String, nullable=True) # GST number at the time of transaction
     
     coupon_id = Column(Integer, ForeignKey("coupons.id"), nullable=True)
     discount_amount = Column(Integer, default=0) # In paise

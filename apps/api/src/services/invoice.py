@@ -91,7 +91,13 @@ class InvoiceGenerator:
         
         amount_paise = transaction_data.get("amount") or 0
         discount_paise = transaction_data.get("discount") or 0
-        base_amount = (amount_paise + discount_paise) / 100
+        
+        # Extract base package amount, fallback to old math for backward compatibility
+        base_package_amount_paise = transaction_data.get("base_package_amount")
+        if not base_package_amount_paise:
+            base_package_amount_paise = amount_paise + discount_paise
+            
+        base_amount = base_package_amount_paise / 100
         pdf.cell(50, 12, f" {base_amount:,.2f} ", border=1, align="R")
         pdf.ln()
         
@@ -101,6 +107,7 @@ class InvoiceGenerator:
         pdf.cell(50, 10, f"INR {base_amount:,.2f} ", border=1, align="R")
         pdf.ln()
         
+        taxable_amount_paise = base_package_amount_paise
         if discount_paise > 0:
             pdf.set_text_color(200, 0, 0)
             discount_amount = discount_paise / 100
@@ -108,6 +115,20 @@ class InvoiceGenerator:
             pdf.cell(50, 10, f"- INR {discount_amount:,.2f} ", border=1, align="R")
             pdf.ln()
             pdf.set_text_color(0, 0, 0)
+            
+        taxable_amount_paise -= discount_paise
+        if discount_paise > 0 or base_package_amount_paise != amount_paise:
+            taxable_amount = taxable_amount_paise / 100
+            pdf.cell(140, 10, "Taxable Value ", border=0, align="R")
+            pdf.cell(50, 10, f"INR {taxable_amount:,.2f} ", border=1, align="R")
+            pdf.ln()
+            
+        gst_amount_paise = amount_paise - taxable_amount_paise
+        if gst_amount_paise > 0:
+            gst_amount = gst_amount_paise / 100
+            pdf.cell(140, 10, "IGST (18%) ", border=0, align="R")
+            pdf.cell(50, 10, f"INR {gst_amount:,.2f} ", border=1, align="R")
+            pdf.ln()
             
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_fill_color(251, 146, 60)
