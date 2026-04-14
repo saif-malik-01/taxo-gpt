@@ -538,9 +538,9 @@ async def download_mis_report(
     # Define Columns
     headers = [
         "User Fullname", "Email", "Phone Number", "Referral Code", 
-        "User Created At", "Package Expiry", 
+        "User Created At", "Last Login At", "Package Expiry", 
         "Last Transaction Date", "Last Order ID", "Last Amount (INR)", 
-        "Last Package Name", "Last GSTIN"
+        "Last Package Name", "Last GSTIN", "Queries Used", "Drafts Used"
     ]
 
     # Style header
@@ -572,12 +572,15 @@ async def download_mis_report(
             user.mobile_number or "N/A",
             user.referral_code or "N/A",
             user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else "N/A",
+            user.last_login_at.strftime("%Y-%m-%d %H:%M") if user.last_login_at else "N/A",
             usage.credits_expire_at.strftime("%Y-%m-%d") if usage and usage.credits_expire_at else "N/A",
             last_txn.created_at.strftime("%Y-%m-%d %H:%M") if last_txn else "N/A",
             last_txn.order_id if last_txn else "N/A",
             (last_txn.amount / 100) if last_txn else 0, # Convert paise to INR
             last_txn.package.title if last_txn and last_txn.package else "N/A",
-            last_txn.user_gst_number if last_txn else (user.gst_number or "N/A")
+            last_txn.user_gst_number if last_txn else (user.gst_number or "N/A"),
+            usage.simple_query_used if usage else 0,
+            usage.draft_reply_used if usage else 0
         ]
         
         for col_num, value in enumerate(data, 1):

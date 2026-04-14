@@ -22,7 +22,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 _MAX_CROSS_REFS        = 2    # max cross-ref chunks injected into final answer
-_MAX_TOKENS_RESP       = 4096
+_MAX_TOKENS_RESP       = 8000
 _TOP_CHUNKS_FOR_ENRICH = 5    # only inspect top-5 chunks for cross-refs
 
 
