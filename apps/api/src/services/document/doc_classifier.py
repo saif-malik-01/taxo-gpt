@@ -625,8 +625,8 @@ the issue text.
 Return ONLY valid JSON. Make sure to properly escape newlines as `\n` inside the JSON strings:
 {{
   "issues": [
-    "**Allegation 1:**\n\nExtracted verbatim text with **bolding** and\n- Bullet points if applicable...",
-    "**Allegation 2:**\n\nAnother beautifully formatted issue..."
+    "Extracted verbatim text with **bolding** and\n- Bullet points if applicable...",
+    "Another beautifully formatted issue..."
   ]
 }}"""
 
@@ -653,7 +653,7 @@ Per-issue size limit: 800 words.
 Return empty list if no additional issues found.
 
 Return ONLY valid JSON:
-{{"issues": ["**Additional Issue:**\n\nFormatted text with bullet points and bolding..."]}}"""
+{{"issues": ["Formatted text with bullet points and bolding..."]}}"""
 
 
 def _make_segments(text: str) -> List[str]:
