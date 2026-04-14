@@ -13,6 +13,7 @@ from apps.api.src.api.v1.auth import router as auth_router
 from apps.api.src.api.v1.chat import router as chat_router
 from apps.api.src.api.v1.payments import router as payments_router
 from apps.api.src.api.v1.admin import router as admin_router
+from apps.api.src.api.v1.gst import router as gst_router
 from apps.api.src.services.jobs.scheduler import start_scheduler, stop_scheduler
 from sqlalchemy import text
 from apps.api.src.db.session import engine, get_redis
@@ -134,6 +135,7 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(payments_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
+app.include_router(gst_router, prefix="/api/v1")
 
 @app.get("/api/v1/health")
 async def health_check():

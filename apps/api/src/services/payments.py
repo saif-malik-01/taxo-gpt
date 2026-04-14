@@ -11,6 +11,7 @@ from apps.api.src.db.models.base import PaymentTransaction, UserUsage, CreditPac
 from apps.api.src.db.session import AsyncSessionLocal
 from apps.api.src.services.email import EmailService
 from apps.api.src.services.invoice import InvoiceGenerator
+from apps.api.src.services.gst import GSTService
 
 logger = logging.getLogger(__name__)
 
@@ -303,14 +304,20 @@ async def send_invoice_background(order_id: str):
             if full_tx and full_tx.user:
                 current_time = datetime.now(timezone.utc)
                 
+                user_gst = full_tx.user_gst_number or (full_tx.user.gst_number if full_tx.user else None)
+                gst_details = None
+                if user_gst and user_gst != "N/A":
+                    gst_details = await GSTService.verify_gstin(user_gst)
+
                 transaction_info = {
                     "order_id": full_tx.order_id,
                     "invoice_number": full_tx.invoice_number or full_tx.order_id, # Fallback
                     "payment_id": full_tx.payment_id or "N/A",
                     "date": full_tx.created_at or current_time,
-                    "user_name": full_tx.user.full_name,
+                    "user_name": gst_details["legal_name"] if gst_details else full_tx.user.full_name,
                     "user_email": full_tx.user.email,
-                    "user_gst": full_tx.user_gst_number or (full_tx.user.gst_number if full_tx.user else "N/A"),
+                    "user_gst": user_gst or "N/A",
+                    "user_address": gst_details["address"] if gst_details else None,
                     "package_name": full_tx.package.title if full_tx.package else "Credit Pack",
                     "amount": full_tx.amount or 0,
                     "base_package_amount": full_tx.package.amount if full_tx.package else 0,

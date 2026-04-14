@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     # Frontend Configuration
     FRONTEND_URL: str = ""
 
+    # TaxoCredit API Configuration
+    TAXO_API_KEY: str = ""
+
     # FUP (Fair Usage Policy) Configurations
     GLOBAL_MONTHLY_TOKEN_LIMIT: int = 1000000
     SESSION_TOKEN_LIMIT_DRAFT: int = 60000   
