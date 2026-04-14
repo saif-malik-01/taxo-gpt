@@ -81,29 +81,56 @@ async def assign_invoice_number(db: AsyncSession, transaction: PaymentTransactio
     """
     Generates and assigns an invoice number following the TB/YY-YY/NNN pattern.
     Resets NNN for each financial year (April - March).
+    Robust against race conditions using MAX and savepoint retries.
     """
+    if transaction.invoice_number:
+        return transaction.invoice_number
+
     now = datetime.now(timezone.utc)
-    # Financial Year Logic (India)
+    # Financial Year Logic (India: April to March)
     if now.month >= 4:
-        fy_start = now.year
-        fy_end = now.year + 1
+        fy_start, fy_end = now.year, now.year + 1
     else:
-        fy_start = now.year - 1
-        fy_end = now.year
+        fy_start, fy_end = now.year - 1, now.year
     
     fy_str = f"{str(fy_start)[2:]}-{str(fy_end)[2:]}"
     prefix = f"TB/{fy_str}/"
     
-    # Query count of completed transactions with same FY prefix
+    # 1. Get the current maximum suffix for this FY
     res = await db.execute(
-        select(func.count(PaymentTransaction.id))
+        select(PaymentTransaction.invoice_number)
         .where(PaymentTransaction.invoice_number.like(f"{prefix}%"))
+        .order_by(PaymentTransaction.invoice_number.desc())
+        .limit(1)
     )
-    count = res.scalar() or 0
-    next_number = f"{prefix}{str(count + 1).zfill(3)}"
+    last_invoice = res.scalar()
     
-    transaction.invoice_number = next_number
-    return next_number
+    next_num = 1
+    if last_invoice:
+        try:
+            next_num = int(last_invoice.split('/')[-1]) + 1
+        except (ValueError, IndexError):
+            # Fallback to count if parsing fails
+            res_c = await db.execute(
+                select(func.count(PaymentTransaction.id))
+                .where(PaymentTransaction.invoice_number.like(f"{prefix}%"))
+            )
+            next_num = (res_c.scalar() or 0) + 1
+
+    # 2. Attempt to assign with retry on collision
+    for _ in range(10):  # Try up to 10 times
+        next_number = f"{prefix}{str(next_num).zfill(3)}"
+        transaction.invoice_number = next_number
+        try:
+            # Use a savepoint to safely catch unique constraint violations
+            async with db.begin_nested():
+                await db.flush()
+                return next_number
+        except Exception:
+            # If flushed failed (likely duplicate key), increment and try again
+            next_num += 1
+            
+    return transaction.invoice_number
 
 async def create_razorpay_order(user_id: int, package_name: str, coupon_code: str | None, db: AsyncSession):
     res = await db.execute(select(CreditPackage).where(CreditPackage.name == package_name, CreditPackage.is_active == True))
