@@ -25,28 +25,6 @@ def verify_token(token: str, expected_type: str = "access"):
             
         return payload
     except ExpiredSignatureError:
-        # For Access tokens, we might want to attempt cleanup if the session is dead
-        if expected_type == "access":
-            try:
-                dead_payload = jwt.decode(
-                    token,
-                    settings.JWT_SECRET_KEY,
-                    algorithms=[settings.JWT_ALGORITHM],
-                    options={"verify_exp": False}
-                )
-                user_id = dead_payload.get("id")
-                session_id = dead_payload.get("session_id")
-
-                if user_id and session_id:
-                    from apps.api.src.db.session import remove_session
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            asyncio.ensure_future(remove_session(user_id, session_id))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
         return None
     except JWTError:
         return None
