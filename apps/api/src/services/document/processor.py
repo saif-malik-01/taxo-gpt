@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_DPI = int(os.getenv("NOVA_LITE_DPI", "300"))
+_DPI = int(os.getenv("NOVA_LITE_DPI", "150"))
 _MAX_PAGES_PER_DOC = 200
 
 _PAGE_EXTRACTION_PROMPT = (
@@ -71,9 +71,12 @@ def _get_nova_client():
                     max_pool_connections=MAX_CONCURRENT_PAGES + 10,
                     retries={"max_attempts": 0, "mode": "standard"},  # we handle retries manually
                 )
+                from apps.api.src.core.config import settings
                 _nova_client = boto3.client(
                     "bedrock-runtime",
-                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                    region_name=settings.AWS_REGION or os.getenv("AWS_REGION", "us-east-1"),
                     config=cfg,
                 )
                 logger.info(

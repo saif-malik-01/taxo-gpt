@@ -267,7 +267,35 @@ async def ask_gst_stream_draft(
                         snap_ref[0] = snapshot
                         active_case = get_active_case(snapshot)
                         
-                        # If any new document is still "pending", wait
+                        # If extraction complete, handle it
+                        if snapshot.get("worker_status") == "text_extracted":
+                            
+                            extracted_docs = snapshot.pop("extracted_docs", [])
+                            if extracted_docs:
+                                yield _event_msg("Classifying documents and fetching entities...")
+                                # --- Step 2 & 3: Intelligence & Routing ---
+                                res_q_worker = "Please process these legal documents and identify case facts."
+                                doc_analyses, entity_cache = await _run_step2(extracted_docs, res_q_worker, snapshot)
+                                snapshot.setdefault("legal_entities_cache", {}).update(entity_cache)
+                                
+                                active_case = get_active_case(snapshot)
+                                routing_plan = []
+                                for doc, analysis in zip(extracted_docs, doc_analyses):
+                                    route = determine_route(analysis, active_case)
+                                    routing_plan.append({"filename": doc["filename"], "analysis": analysis, "route": route})
+                                
+                                yield _event_msg("Applying case routing...")
+                                await _apply_routing(routing_plan, extracted_docs, snapshot, session_id)
+                                
+                                yield _event_msg("Extracting granular case issues...")
+                                await _extract_all_issues(routing_plan, snapshot, session_id)
+                            
+                            # Finalize local modifications to snapshot state
+                            snapshot["worker_status"] = "completed"
+                            await set_doc_context(session_id, snapshot)
+                            break
+                            
+                        # Safety fallback for already completed jobs or errors
                         if snapshot.get("worker_status") == "completed":
                             break
                             
@@ -279,9 +307,9 @@ async def ask_gst_stream_draft(
                     yield _event_msg("An error occurred while tracking document analysis. Please try again.")
                     return
                 
-                # Update local snap ref for Step 2
+                # CRITICAL: Re-fetch active_case because _apply_routing may have created a new one
                 active_case = get_active_case(snapshot)
-                logger.info(f"Worker complete for session {session_id}. Active case ID: {snapshot.get('active_case_id')}, Docs: {len(active_case.get('docs', []) if active_case else [])}, Issues: {len(active_case.get('issues', []) if active_case else [])}")
+                logger.info(f"Worker & Intelligence complete for session {session_id}. Active case ID: {snapshot.get('active_case_id')}")
                 yield _event_msg("Drafting")
 
             # --- Step 2: Determine & Execute Intent ---

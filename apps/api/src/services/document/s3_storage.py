@@ -50,6 +50,8 @@ async def upload_document_to_s3(
     unique_prefix = uuid.uuid4().hex[:8]
     s3_key = f"docs/{user_id}/{session_id}/{unique_prefix}_{filename}"
     
+    import time
+    start_t = time.time()
     try:
         # We use upload_fileobj for efficient streaming
         s3.upload_fileobj(
@@ -58,7 +60,8 @@ async def upload_document_to_s3(
             s3_key,
             ExtraArgs={"ContentType": "application/pdf"} if filename.lower().endswith(".pdf") else {}
         )
-        logger.info(f"Successfully uploaded {filename} to S3 bucket {settings.AWS_S3_BUCKET}")
+        duration = time.time() - start_t
+        logger.info(f"Successfully uploaded {filename} to S3 bucket {settings.AWS_S3_BUCKET} in {duration:.2f}s")
         return s3_key
     except Exception as e:
         logger.error(f"S3 Upload Error: {e}")

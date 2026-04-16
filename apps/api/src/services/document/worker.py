@@ -57,10 +57,15 @@ async def _process_task(payload: dict):
         ext = doc.get("ext", ".pdf")
         
         # 1. Download from S3 to Temp
+        import time
+        start_dl = time.time()
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             logger.info(f"Downloading {s3_key} to {tmp.name}")
             s3_client.download_fileobj(settings.AWS_S3_BUCKET, s3_key, tmp)
             tmp_path = tmp.name
+        
+        duration_dl = time.time() - start_dl
+        logger.info(f"Download complete for {filename} in {duration_dl:.2f}s")
         
         try:
             # 2. Extract Text (Poppler + Bedrock Nova Lite)
@@ -89,26 +94,14 @@ async def _process_task(payload: dict):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    # ── Step 2 & 3: Intelligence & Routing ─────────────────────────────────────
-    # This runs within the worker to save API cycles
-    res_q = "Please process these legal documents and identify case facts."
-    doc_analyses, entity_cache = await _run_step2(extracted_docs, res_q, snapshot)
-    snapshot.setdefault("legal_entities_cache", {}).update(entity_cache)
-    
-    active_case = get_active_case(snapshot)
-    routing_plan = []
-    for doc, analysis in zip(extracted_docs, doc_analyses):
-        route = determine_route(analysis, active_case)
-        routing_plan.append({"filename": doc["filename"], "analysis": analysis, "route": route})
-    
-    await _apply_routing(routing_plan, extracted_docs, snapshot, session_id)
-    await _extract_all_issues(routing_plan, snapshot, session_id)
-    
+    # Pass the raw extracted documents back via the snapshot
+    snapshot["extracted_docs"] = extracted_docs
+
     # ── Finalize & Commit ────────────────────────────────────────────────────────
     # Updates BOTH Redis and Postgres Snapshot
-    snapshot["worker_status"] = "completed"
+    snapshot["worker_status"] = "text_extracted"
     await set_doc_context(session_id, snapshot)
-    logger.info(f"Successfully committed extraction for session {session_id}.")
+    logger.info(f"Successfully committed text extraction for session {session_id}.")
 
 
 async def worker_loop():
