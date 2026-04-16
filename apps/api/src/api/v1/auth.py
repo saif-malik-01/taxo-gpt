@@ -54,7 +54,7 @@ def set_refresh_cookie(response: Response, refresh_token: str):
         httponly=True,
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
         expires=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
-        samesite="lax",
+        samesite="none",
         secure=settings.ENVIRONMENT.lower() in ["prod", "production"],  # False in dev (HTTP), True in prod (HTTPS)
         domain=settings.COOKIE_DOMAIN if settings.COOKIE_DOMAIN else None
     )

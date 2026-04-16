@@ -153,7 +153,7 @@ def _extract_upload_hints(filename: str, user_message: str) -> List[str]:
         hints.append("msg:reference")
     if any(k in msg_lower for k in ("defend", "defensive", "protection", "protect")):
         hints.append("msg:defensive")
-    if any(k in msg_lower for k in ("in favour", "in favor", "department side", "revenue side")):
+    if any(k in msg_lower for k in ("department side", "revenue side", "department perspective", "favor of department", "favour of department")):
         hints.append("msg:in_favour")
     if any(k in msg_lower for k in ("different case", "new case", "other matter", "different client", "another notice")):
         hints.append("msg:new_case")

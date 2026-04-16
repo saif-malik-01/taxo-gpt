@@ -72,7 +72,7 @@ Intent options (pick the single best match):
   draft_direct          — "prepare reply" / "draft reply" / "reply to this" — mode clear from context
   confirm_mode          — user confirming defensive or in-favour mode
                           defensive signals: "defence", "defensive", "protect", "assessee side", "yes" when awaiting mode
-                          in_favour signals: "in favour", "department side", "revenue is right", "support the notice"
+                          in_favour signals: "department side", "revenue is right", "support the notice", "department perspective"
   explain_issues        — user wants plain-language explanation of one or more issues
                           signals: "explain issue", "what does issue mean", "what is issue", "clarify issue",
                                    "explain these issues", "first explain me", "understand issue"
