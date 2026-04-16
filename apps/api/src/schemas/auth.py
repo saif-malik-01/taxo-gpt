@@ -26,6 +26,8 @@ class RegisterRequest(BaseModel):
     gst_number: Optional[str] = None
     country: Optional[str] = None
     role: str = "user"
+    temp_uid: Optional[str] = None # For real-time WebSocket bridging linking
+
 
 class RegisterResponse(BaseModel):
     message: str
@@ -33,6 +35,7 @@ class RegisterResponse(BaseModel):
 
 class VerifyEmailRequest(BaseModel):
     token: str
+    temp_uid: Optional[str] = None # For real-time WebSocket bridging
 
 class ResendVerificationRequest(BaseModel):
     email: str

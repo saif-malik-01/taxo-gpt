@@ -22,6 +22,13 @@ class User(Base):
     max_sessions = Column(Integer, default=1)  # Dynamic session limit
     is_verified = Column(Boolean, default=False)
     verification_token = Column(String, unique=True, index=True, nullable=True)
+    
+    # --- Security & Lockout ---
+    failed_login_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime(timezone=True), nullable=True)
+    is_locked = Column(Boolean, default=False)
+    csrf_nonce = Column(String, nullable=True) # Used for CSRF token validation
+    
     reset_password_token = Column(String, unique=True, index=True, nullable=True)
     reset_password_expires = Column(DateTime(timezone=True), nullable=True)
     last_login_at = Column(DateTime(timezone=True), nullable=True)

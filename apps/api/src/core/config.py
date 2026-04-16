@@ -14,7 +14,11 @@ class Settings(BaseSettings):
     # JWT
     JWT_SECRET_KEY: str = "supersecretkey"
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15      # Short-lived
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7         # Long-lived in Cookies
+    CSRF_SECRET_KEY: str = "csrf-super-secret" # Used for Header-based CSRF
+    ENVIRONMENT: str = "dev"                   # Set to "prod" in production
+    COOKIE_DOMAIN: str | None = None           # e.g., ".taxobuddy.ai"
     
     # Email Configuration for Feedback Reports
     SMTP_SERVER: str = "smtp.gmail.com"

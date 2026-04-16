@@ -1,5 +1,4 @@
 import os
-import asyncio
 import logging
 import time
 from fastapi import FastAPI, Request
@@ -21,6 +20,8 @@ from apps.api.src.services.chat.engine import get_pipeline
 from apps.api.src.services.document.issue_replier import set_pipeline
 from apps.api.src.services.llm.bedrock import close_async_bedrock_client
 from starlette.concurrency import run_in_threadpool
+from fastapi import WebSocket, WebSocketDisconnect
+from apps.api.src.services.auth.ws_manager import manager
 
 # Environment Settings for Transformers Cache (from main.py)
 os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
@@ -29,7 +30,7 @@ os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), '..', '.hf_cache
 # Initialize FastAPI App
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="3.1.0",
+    version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -136,6 +137,31 @@ app.include_router(chat_router, prefix="/api/v1")
 app.include_router(payments_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
 app.include_router(gst_router, prefix="/api/v1")
+
+# --- WebSocket Hub ---
+@app.websocket("/ws/auth")
+async def websocket_auth_endpoint(websocket: WebSocket, session_id: str = None, temp_uid: str = None):
+    """
+    Handles two modes:
+    1. session_id: Active logged-in session (for eviction notifications)
+    2. temp_uid: Anonymous tab waiting for email verification
+    """
+    if session_id:
+        await manager.connect_session(session_id, websocket)
+        try:
+            while True:
+                await websocket.receive_text() # Keep-alive
+        except WebSocketDisconnect:
+            manager.disconnect_session(session_id, websocket)
+    elif temp_uid:
+        await manager.connect_verification(temp_uid, websocket)
+        try:
+            while True:
+                await websocket.receive_text() # Keep-alive
+        except WebSocketDisconnect:
+            manager.disconnect_verification(temp_uid, websocket)
+    else:
+        await websocket.close(code=4000)
 
 @app.get("/api/v1/health")
 async def health_check():
