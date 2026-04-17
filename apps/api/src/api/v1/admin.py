@@ -40,6 +40,7 @@ class UserUpdateAdmin(BaseModel):
 class UserUsageUpdateAdmin(BaseModel):
     simple_query_balance: Optional[int] = None
     draft_reply_balance: Optional[int] = None
+    expiration_days: Optional[int] = None
     reset_monthly_tokens: Optional[bool] = False
 
 @router.get("/users", response_model=List[UserResponseAdmin])
@@ -64,7 +65,7 @@ async def create_user_admin(payload: UserCreateAdmin, background_tasks: Backgrou
         gst_number=payload.gst_number,
         country=payload.country,
         role=payload.role,
-        is_verified=payload.is_verified,
+        is_verified=True,
         referral_code=payload.referral_code,
         onboarding_step=2 if payload.package_id else 1
     )
@@ -80,7 +81,7 @@ async def create_user_admin(payload: UserCreateAdmin, background_tasks: Backgrou
     
     # Initialize credits based on selection
     order_id = None
-    if payload.package_id and payload.base_amount is not None:
+    if payload.package_id:
         # Fetch individual package details
         pkg_res = await db.execute(select(CreditPackage).where(CreditPackage.id == payload.package_id))
         pkg = pkg_res.scalars().first()
@@ -88,15 +89,16 @@ async def create_user_admin(payload: UserCreateAdmin, background_tasks: Backgrou
             raise HTTPException(status_code=400, detail="Invalid package ID")
 
         # calculate final amount with GST (18%)
-        base_amount = payload.base_amount
-        gst_amount = round(base_amount * 0.18, 2)
-        total_amount = round(base_amount + gst_amount, 2)
+        # Priority: payload.base_amount -> pkg.amount -> 0
+        final_base_amount = payload.base_amount if payload.base_amount is not None else (pkg.amount or 0)
+        gst_amount = round(final_base_amount * 0.18, 2)
+        total_amount = round(final_base_amount + gst_amount, 2)
 
         # Create Payment Transaction (Admin Assigned)
         order_id = f"admin_{uuid.uuid4().hex[:8]}"
         transaction = PaymentTransaction(
             user_id=new_user.id, order_id=order_id, payment_id="admin_assigned",
-            amount=int(total_amount), # Store in paise/cents
+            amount=int(round(total_amount)), # Store in paise/cents, rounded properly
             package_id=pkg.id, 
             draft_credits_added=pkg.draft_credits,
             simple_credits_added=pkg.simple_credits,
@@ -108,23 +110,26 @@ async def create_user_admin(payload: UserCreateAdmin, background_tasks: Backgrou
         await assign_invoice_number(db, transaction)
 
         # Update Usage
+        days_to_add = payload.expiration_days if payload.expiration_days is not None else (pkg.validity_days or 365)
         usage = UserUsage(
             user_id=new_user.id,
             simple_query_balance=pkg.simple_credits,
             draft_reply_balance=pkg.draft_credits,
-            credits_expire_at=datetime.now(timezone.utc) + timedelta(days=pkg.validity_days or 365)
+            credits_expire_at=datetime.now(timezone.utc) + timedelta(days=days_to_add)
         )
         db.add(usage)
 
-        # Log credits
-        db.add(CreditLog(
-            user_id=new_user.id, amount=pkg.simple_credits, credit_type="simple",
-            transaction_type="purchase", reference_id=order_id
-        ))
-        db.add(CreditLog(
-            user_id=new_user.id, amount=pkg.draft_credits, credit_type="draft",
-            transaction_type="purchase", reference_id=order_id
-        ))
+        # Log credits only if > 0
+        if pkg.simple_credits > 0:
+            db.add(CreditLog(
+                user_id=new_user.id, amount=pkg.simple_credits, credit_type="simple",
+                transaction_type="purchase", reference_id=order_id
+            ))
+        if pkg.draft_credits > 0:
+            db.add(CreditLog(
+                user_id=new_user.id, amount=pkg.draft_credits, credit_type="draft",
+                transaction_type="purchase", reference_id=order_id
+            ))
     else:
         # Initialize with zero credits (Step 1)
         await initialize_user_credits(new_user.id, db, use_welcome_package=False)
@@ -133,7 +138,7 @@ async def create_user_admin(payload: UserCreateAdmin, background_tasks: Backgrou
     await db.refresh(new_user)
     
     # Send invoice email if a package was assigned
-    if payload.package_id and payload.base_amount is not None:
+    if payload.package_id:
         background_tasks.add_task(send_invoice_background, order_id=order_id)
 
     return new_user
@@ -224,6 +229,8 @@ async def update_user_usage(
         usage.simple_query_balance = payload.simple_query_balance
     if payload.draft_reply_balance is not None:
         usage.draft_reply_balance = payload.draft_reply_balance
+    if payload.expiration_days is not None:
+        usage.credits_expire_at = datetime.now(timezone.utc) + timedelta(days=payload.expiration_days)
     if payload.reset_monthly_tokens:
         usage.monthly_tokens_used = 0
         usage.monthly_reset_date = datetime.now(timezone.utc)
