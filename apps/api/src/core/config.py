@@ -211,7 +211,7 @@ DEFINITION_CHUNK_TYPES = SECTION_CHUNK_TYPES + RULE_CHUNK_TYPES
 # Maps response hierarchy labels to their chunk_types.
 # Position 9 "others" captures everything not in positions 1–8.
 HIERARCHY_CHUNK_MAP = {
-    "act":                        SECTION_CHUNK_TYPES,
+    "act":                        SECTION_CHUNK_TYPES + ["financial_budget"],
     "rules":                      RULE_CHUNK_TYPES,
     "notification_circular_faq":  ["notification", "circular", "faq"],
     "case_scenario_illustration": ["case_scenario", "case_study"],
@@ -250,4 +250,5 @@ ALL_CHUNK_TYPES = [
     "sac_code",
     "analytical_review",
     "solved_query",
+    "financial_budget",
 ]

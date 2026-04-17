@@ -720,6 +720,30 @@ class QdrantRetrieval:
                 limit=15, label=f"s1_sac_notif_circ_{code}"
             )
 
+        # -- Budget & Amendment Lookups (Always-On) --
+        # We search the budget pool for both direct matches (Sec 37 of Budget)
+        # and indirect matches (Budget amending Sec 13B).
+        if stage2b.sections:
+            for sec in stage2b.sections:
+                num = _bare_number(sec)
+                if num:
+                    # Is this a budget section?
+                    results += await self._scroll(
+                        [qmodels.FieldCondition(key="ext.finance_act_section",
+                                                match=qmodels.MatchValue(value=num)),
+                         qmodels.FieldCondition(key="chunk_type",
+                                                match=qmodels.MatchValue(value="financial_budget"))],
+                        limit=5, label=f"s1_budget_sec_{num}"
+                    )
+                    # Does the budget amend this section?
+                    results += await self._scroll(
+                        [qmodels.FieldCondition(key="ext.amends_section",
+                                                match=qmodels.MatchValue(value=num)),
+                         qmodels.FieldCondition(key="chunk_type",
+                                                match=qmodels.MatchValue(value="financial_budget"))],
+                        limit=5, label=f"s1_budget_amend_{num}"
+                    )
+
         return results
 
     # -- Scroll 2 - cross-reference match -----------------------------
@@ -964,6 +988,7 @@ async def ensure_text_indexes(qdrant: AsyncQdrantClient):
     fields = [
         "ext.case_name", "ext.petitioner", "ext.respondent",
         "ext.case_number", "ext.sections_in_dispute", "keywords",
+        "ext.finance_act_section",
     ]
     for field in fields:
         try:
@@ -986,6 +1011,8 @@ async def ensure_text_indexes(qdrant: AsyncQdrantClient):
     keyword_fields = [
         "chunk_type",
         "ext.citation",
+        "ext.finance_act_section",
+        "ext.amends_section",
         "ext.section_number",
         "ext.rule_number_full",
         "ext.notification_number",
@@ -1035,6 +1062,10 @@ def _match_depth_boost(payload: Dict, query_tokens: List[str]) -> float:
         xref_tokens = set(_parse_judgment_xrefs(xrefs))
     else:
         xref_tokens = set(_parse_clean_xrefs(xrefs))
+        if chunk_type == "financial_budget":
+            sec_num = str((payload.get("ext") or {}).get("finance_act_section") or "").lower()
+            if sec_num:
+                xref_tokens.add(f"finance_act_section_{sec_num}")
 
     kw_text = " ".join(str(k).lower() for k in (payload.get("keywords") or []))
 
@@ -1123,6 +1154,16 @@ def _get_query_legal_tokens(stage2b: Stage2BResult) -> List[str]:
         if m:
             num = re.sub(r"[/\-]", "_", m.group(1))
             tokens.append(f"circular_{num}")
+    
+    # Budget section tokens
+    q_norm = str(stage2b.citation or "").lower()
+    is_budget = "budget" in q_norm or "finance act" in q_norm or "finance bill" in q_norm
+    if is_budget:
+        for s in stage2b.sections:
+            num = _bare_number(s)
+            if num:
+                tokens.append(f"finance_act_section_{num.lower()}")
+
     return tokens
 
 

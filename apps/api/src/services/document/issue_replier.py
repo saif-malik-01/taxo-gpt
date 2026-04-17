@@ -126,10 +126,9 @@ def _rerank_for_mode(chunks: list, mode: str) -> list:
         MODE_DEFENSIVE: "in_favour_of_assessee",
         MODE_IN_FAVOUR: "in_favour_of_department",
     }
-    if mode not in preferred:
-        return chunks
-
-    want = preferred[mode]
+    # Default to defensive if mode is None or unknown
+    actual_mode = mode if mode in preferred else MODE_DEFENSIVE
+    want = preferred[actual_mode]
 
     for chunk in chunks:
         payload = getattr(chunk, "payload", None) or {}
@@ -246,8 +245,9 @@ Your reply must:
 
 def _build_system_prompt(mode: str) -> str:
     """Single system prompt with mode block inserted at call time (spec §3.1)."""
+    # Default to defensive if mode is None or unknown
     mode_block = (
-        _MODE_BLOCK_DEFENSIVE if mode == MODE_DEFENSIVE else _MODE_BLOCK_IN_FAVOUR
+        _MODE_BLOCK_IN_FAVOUR if mode == MODE_IN_FAVOUR else _MODE_BLOCK_DEFENSIVE
     )
     return _SYSTEM_BASE.format(mode_block=mode_block)
 

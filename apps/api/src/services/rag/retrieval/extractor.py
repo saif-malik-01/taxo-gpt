@@ -267,7 +267,8 @@ Analyse the query and return:
    chunk_type values: judgment, cgst_section, igst_section, cgst_rule,
    igst_rule, gstat_rule, notification, circular, faq, gst_form,
    hsn_code, sac_code, case_scenario, illustration, analytical_review,
-   article, contemporary_issue, draft_reply, council_decision, solved_query
+   article, contemporary_issue, draft_reply, council_decision, solved_query,
+   financial_budget
 
 4. RESPONSE_HIERARCHY: order for LLM answer.
    STANDARD (use unless user explicitly asks for specific type):
@@ -276,6 +277,7 @@ Analyse the query and return:
     "analytical_review", "summary"]
 
    Reorder ONLY if user explicitly requests:
+   "give me budget"      ->  act (financial_budget) to position 1
    "give me judgement"  ->  judgment to position 1
    "give me rate"       ->  notification_circular_faq to position 1
    "show me form"       ->  rules to position 1

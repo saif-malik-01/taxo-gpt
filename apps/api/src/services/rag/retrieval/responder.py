@@ -419,6 +419,19 @@ def _format_chunk(chunk: Dict, label: str = "", pinned: bool = False) -> str:
             if text:
                 lines.append(f"Text:\n{text}")
 
+    elif chunk_type == "financial_budget":
+        lines.append(
+            f"Act: {ext.get('act', '')} | Section: {ext.get('finance_act_section', 'N/A')} "
+            f"(Chapter {ext.get('chapter', '')}: {ext.get('chapter_title', '')})"
+        )
+        amends_act = ext.get("amends_act")
+        amends_sec = ext.get("amends_section")
+        if amends_act:
+            lines.append(f"Amends: {amends_act} {f'Section {amends_sec}' if amends_sec else ''}")
+        text = str(chunk.get("text") or "").strip()
+        if text:
+            lines.append(f"Text:\n{text}")
+
     elif chunk_type == "notification":
         # Source: already carries full identity from parent_doc
         # e.g. "Notification No.26/2017 – Central Tax"
@@ -653,7 +666,8 @@ def _doc_summary(payload: Dict, label: str, score: float) -> Dict:
             ext.get("citation") or ext.get("section_number") or
             ext.get("rule_number_full") or ext.get("notification_number") or
             ext.get("circular_number") or ext.get("form_name") or
-            ext.get("hsn_code") or ext.get("sac_code") or ""
+            ext.get("hsn_code") or ext.get("sac_code") or 
+            ext.get("finance_act_section") or ""
         ),
         "summary":    str(payload.get("summary") or "")[:200],
     }

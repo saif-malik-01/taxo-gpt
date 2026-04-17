@@ -506,7 +506,7 @@ async def _handle_show_summary(active_case: dict, session_id: str, user_id: int)
     yield _emit({"type": "completion", "session_id": session_id, "message_id": asst.id})
 
 async def _handle_draft_issues(active_case: dict, issues_to_draft: List[dict], session_id: str, user_id: int, question: str, background_tasks: BackgroundTasks, snapshot: dict, skip_confirmation: bool = False) -> AsyncGenerator[str, None]:
-    mode = active_case.get("mode", MODE_DEFENSIVE)
+    mode = active_case.get("mode") or MODE_DEFENSIVE
     # Direct drafting — no confirmation gate
     active_case["state"] = "drafting"
     hdr = f"Drafting {len(issues_to_draft)} Issue(s)...\n\n"
