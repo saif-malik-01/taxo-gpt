@@ -169,8 +169,15 @@ def ingest_chunk_task(
             for idx, part in enumerate(order_parts, start=2):
                 ord_chunk = copy.deepcopy(chunk)
                 
+                # Ensure chunk_id is a valid UUID for use as a namespace
+                try:
+                    namespace = uuid.UUID(chunk_id)
+                except ValueError:
+                    # If it's a slug or numeric ID, hash it into a UUID first
+                    namespace = uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id)
+
                 # Use uuid5 to generate a stable, pure UUID for each part
-                part_uuid = str(uuid.uuid5(uuid.UUID(chunk_id), f"order-part-{idx}"))
+                part_uuid = str(uuid.uuid5(namespace, f"order-part-{idx}"))
                 ord_chunk["id"] = part_uuid
                 
                 ord_chunk["chunk_index"] = idx
