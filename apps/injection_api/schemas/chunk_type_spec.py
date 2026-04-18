@@ -276,9 +276,9 @@ JUDGMENT_SPEC: dict[str, Any] = {
             "path": "ext.case_id",
             "label": "Case ID",
             "type": "text",
-            "required": True,
+            "required": False,
             "placeholder": "e.g. 544007",
-            "hint": "Unique ID from source CSV — used for deduplication",
+            "hint": "Unique ID from source CSV (Optional)",
         },
         {
             "path": "ext.title",
